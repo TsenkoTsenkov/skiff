@@ -1,5 +1,6 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+use std::io::Write as _;
 use skiff::{AppOptions, SkiffApp};
 
 const USAGE: &str = "\
@@ -28,11 +29,12 @@ fn parse_args() -> Result<AppOptions, String> {
             "--view" => opts.view = Some(args.next().ok_or("--view needs a value")?),
             "--light" => opts.light = true,
             "-h" | "--help" => {
-                println!("{USAGE}");
+                // (Errors ignored: `skiff --help | head` closes the pipe early.)
+                let _ = writeln!(std::io::stdout(), "{USAGE}");
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("skiff {}", env!("CARGO_PKG_VERSION"));
+                let _ = writeln!(std::io::stdout(), "skiff {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
