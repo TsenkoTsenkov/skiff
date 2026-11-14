@@ -37,6 +37,9 @@ fn parse_args() -> Result<AppOptions, String> {
                 let _ = writeln!(std::io::stdout(), "skiff {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
+            // (What the macOS launcher may add when the app is opened
+            // from the Finder.)
+            psn if psn.starts_with("-psn_") => {}
             other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
         }
     }
@@ -45,6 +48,8 @@ fn parse_args() -> Result<AppOptions, String> {
 
 fn main() -> eframe::Result<()> {
     skiff::app::mark_process_start();
+    #[cfg(target_os = "macos")]
+    skiff::shell_env::adopt_shell_path();
     let opts = match parse_args() {
         Ok(o) => o,
         Err(e) => {

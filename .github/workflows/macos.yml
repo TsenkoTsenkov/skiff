@@ -1,0 +1,50 @@
+# Builds Skiff for Apple Silicon on GitHub's own Macs and offers the disk
+# image for download: as an artifact of every run, and attached to a release
+# when a tag like v0.1.0 is pushed.
+name: macOS build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Skiff.app and disk image (Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+      - name: Build
+        run: hack/macos-app.sh --dmg
+      - name: The binary starts
+        run: target/release/Skiff.app/Contents/MacOS/Skiff --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Skiff-macos-arm64
+          path: target/release/Skiff-*.dmg
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/release/Skiff-*.dmg \
+            --title "Skiff $GITHUB_REF_NAME" \
+            --notes "Skiff for Apple Silicon Macs. The app is not notarized by Apple: after copying it to Applications, allow it once under System Settings > Privacy & Security (Open Anyway), or run: xattr -dr com.apple.quarantine /Applications/Skiff.app"
+
+  tests:
+    name: Unit tests on macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable
+      # (The tests that need a cluster or a GPU skip themselves or are left out.)
+      - name: Tests
+        run: cargo test -p skiff-core --lib -p skiff-term --lib -p skiff --lib

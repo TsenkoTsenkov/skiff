@@ -130,11 +130,24 @@ hack/macos-app.sh --install
 ```
 
 builds the app and puts `Skiff.app` into `/Applications`; without `--install`
-it stays in `target/release/`. Started from the Finder or the Dock, the app
-runs through a login shell so that the credential helpers your kubeconfig
-calls (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`, …) are found.
+it stays in `target/release/`, and `--dmg` also makes a disk image.
 `cargo build --release` and `./target/release/skiff` from a terminal work
 as on Linux.
+
+Without a Mac toolchain at hand, GitHub can build it: the workflow in
+`.github/workflows/macos.yml` produces the disk image on an Apple Silicon
+runner for every push to `main` (as an artifact of the run) and attaches it
+to a release when a tag such as `v0.1.0` is pushed. Such a downloaded copy is
+not notarized by Apple, so the first launch has to be allowed once: System
+Settings → Privacy & Security → Open Anyway, or
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Skiff.app
+```
+
+Opened from the Finder or the Dock, the app asks your login shell for its
+`PATH`, so that the credential helpers your kubeconfig calls (`aws`,
+`gke-gcloud-auth-plugin`, `kubelogin`, …) are found.
 
 The code compiles for Apple Silicon (checked by cross-compiling everything
 up to the link step), but it has not been run on a Mac yet.

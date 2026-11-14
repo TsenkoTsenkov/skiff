@@ -6,6 +6,7 @@ pub mod dock;
 pub mod overview;
 pub mod palette;
 pub mod shell;
+pub mod shell_env;
 pub mod table_view;
 pub mod theme;
 pub mod widgets;

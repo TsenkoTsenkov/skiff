@@ -3,10 +3,21 @@
 #
 #   hack/macos-app.sh             builds target/release/Skiff.app
 #   hack/macos-app.sh --install   and copies it to /Applications
+#   hack/macos-app.sh --dmg       and makes a disk image of it next to it
 #
 # Needs Rust (https://rustup.rs) and the Xcode command line tools
 # (xcode-select --install). Nothing else.
 set -euo pipefail
+
+install=0
+dmg=0
+for arg in "$@"; do
+  case "$arg" in
+    --install) install=1 ;;
+    --dmg) dmg=1 ;;
+    *) echo "unknown option: $arg (known: --install, --dmg)" >&2; exit 2 ;;
+  esac
+done
 
 if [ "$(uname -s)" != Darwin ]; then
   echo "This script is for macOS; on Linux run: cargo build --release" >&2
@@ -28,17 +39,7 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 app=target/release/Skiff.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/skiff "$app/Contents/MacOS/skiff"
-
-# An app started from the Finder or the Dock does not get the shell's PATH,
-# and the credential helpers a kubeconfig calls (aws, gke-gcloud-auth-plugin,
-# kubelogin, ...) usually live only there. A login shell knows it.
-cat > "$app/Contents/MacOS/Skiff" <<'LAUNCHER'
-#!/bin/zsh -l
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
-exec "${0:A:h}/skiff" "$@"
-LAUNCHER
-chmod +x "$app/Contents/MacOS/Skiff"
+cp target/release/skiff "$app/Contents/MacOS/Skiff"
 
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -59,11 +60,28 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# An ad-hoc signature (no Apple developer account involved). Apple Silicon
+# refuses to run code that has none; this is not notarization, so a copy
+# that was downloaded still has to be allowed once on first launch.
+codesign --force --deep --sign - "$app" || echo "warning: could not sign $app" >&2
+
 echo "Built $app"
-if [ "${1:-}" = "--install" ]; then
+
+if [ "$dmg" = 1 ]; then
+  image="target/release/Skiff-${version}-$(uname -m).dmg"
+  stage=$(mktemp -d)
+  cp -R "$app" "$stage/Skiff.app"
+  ln -s /Applications "$stage/Applications"
+  rm -f "$image"
+  hdiutil create -volname Skiff -srcfolder "$stage" -ov -format UDZO "$image" >/dev/null
+  rm -rf "$stage"
+  echo "Built $image"
+fi
+
+if [ "$install" = 1 ]; then
   rm -rf /Applications/Skiff.app
   cp -R "$app" /Applications/Skiff.app
   echo "Installed /Applications/Skiff.app"
-else
+elif [ "$dmg" = 0 ]; then
   echo "Run it with:  open $app      (or copy it to /Applications)"
 fi
