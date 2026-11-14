@@ -788,7 +788,15 @@ impl SkiffApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let open_palette = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
+        // In a shell, Ctrl+K belongs to the shell ("delete to the end of the
+        // line"); the palette is on Ctrl+Shift+K there. (On macOS it is
+        // Cmd+K everywhere: the shell never sees Cmd.)
+        let in_shell = self.terminal_focused && ctx.os() != egui::os::OperatingSystem::Mac;
+        let open_palette = if in_shell {
+            KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::K)
+        } else {
+            KeyboardShortcut::new(Modifiers::COMMAND, Key::K)
+        };
         if ctx.input_mut(|i| i.consume_shortcut(&open_palette)) && self.dialog.is_none() {
             self.palette = match self.palette {
                 Some(_) => None,

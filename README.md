@@ -61,6 +61,9 @@ hardware have not been measured yet.
   (server-side apply, any number of documents)
 - Pod and workload logs: follow, multi-pod merge, filter, timestamps, wrap,
   previous container, level colouring
+- A shell in any container: a real terminal emulator in the dock (colours,
+  full-screen programs such as `vi` and `top`, 10,000 lines of scrollback,
+  mouse selection, copy and paste, resizing with the dock)
 - Port forwarding for pods and services, with a list of active forwards
 - Scale, rollout restart, cordon / uncordon, suspend / resume cron jobs,
   delete (optionally forced)
@@ -124,11 +127,19 @@ macOS and Windows need nothing extra.
 
 Right-click a row for its actions.
 
+In a shell, keys go to the shell (including `Esc`, `Tab` and `Ctrl+K`).
+`Ctrl+Shift+C` copies the selection and `Ctrl+Shift+V` (or `Ctrl+V`) pastes;
+on macOS `Cmd+C` / `Cmd+V`. From a shell the command palette is on
+`Ctrl+Shift+K` (`Cmd+K` on macOS). Click outside the terminal to give the
+keyboard back to the rest of the app.
+
 ## Layout
 
 ```
 crates/skiff-core   Kubernetes data layer: sessions, the list/watch engine,
                     logs, exec, port-forward, object operations. No UI code.
+crates/skiff-term   The terminal widget used for shells (egui +
+                    alacritty's terminal emulation; no PTY, no networking).
 crates/skiff        The egui application.
 hack/               Local test clusters (kwok) and seed data for development.
 ```
@@ -174,9 +185,6 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 
 ## Not there yet
 
-- A shell inside a container: the exec backend and the dock tab exist, but
-  the terminal widget is a separate crate that is not part of this tree yet
-  (the tab is behind the `terminal` build feature and says so)
 - Helm releases
 - Node drain, cron job trigger, bulk actions on multiple rows
 - Merging your YAML edits into a newer version of the object: when it

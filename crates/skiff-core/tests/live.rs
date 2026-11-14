@@ -252,3 +252,36 @@ fn refresh_relists_and_recovers() {
     assert_eq!(after.state, LoadState::Live);
     assert!(after.rows.len() + 3 >= before.rows.len(), "rows lost on refresh: {} -> {}", before.rows.len(), after.rows.len());
 }
+
+/// A process that prints without end must not fill our memory when nobody
+/// drains its output: reading pauses at a cap and resumes when drained.
+#[test]
+fn undrained_shell_output_is_capped() {
+    let Some(kc) = kubeconfig() else { return };
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("KUBECONFIG", &kc) };
+    let core = Core::new(Notifier::noop()).unwrap();
+    let session = connected(&core, "demo");
+    let (ns, pod) = some_running_pod(&session);
+    let containers = session.pod_containers(&ns, &pod);
+    wait_for("containers", Duration::from_secs(10), || containers.is_done());
+    let container = containers.take().unwrap().unwrap().remove(0).name;
+    let before = held_open("exec");
+
+    let flood = session.exec(&ns, &pod, &container, vec!["sh".into(), "-c".into(), "yes skiff-flood".into()]);
+    wait_for("flood", Duration::from_secs(15), || flood.state() == ExecState::Running);
+    // Nobody is reading. Give it time to produce far more than the cap.
+    std::thread::sleep(Duration::from_secs(4));
+    let cap = 4 * 1024 * 1024;
+    let first = flood.take_output().len();
+    assert!(first <= cap + 64 * 1024, "{first} bytes were buffered: the cap does not hold");
+    if first < cap {
+        eprintln!("note: only {first} bytes arrived in 4 s; the cap was not reached on this machine");
+    }
+    // Draining lets it continue.
+    wait_for("more output after draining", Duration::from_secs(5), || !flood.take_output().is_empty());
+    // And a paused session still closes.
+    std::thread::sleep(Duration::from_millis(500));
+    flood.close();
+    wait_for("server-side exec to close", Duration::from_secs(5), || held_open("exec") <= before);
+}

@@ -431,6 +431,16 @@ impl Dock {
         self.open = true;
     }
 
+    /// What the first shell tab's terminal currently shows, whether or not
+    /// that tab is in front (for tests and diagnostics).
+    #[cfg(feature = "terminal")]
+    pub fn shell_screen(&self) -> Option<String> {
+        self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Shell(s) => Some(s.screen_text()),
+            _ => None,
+        })
+    }
+
     pub fn close_for_context(&mut self, context: &str) {
         self.tabs.retain(|t| t.context != context);
         self.active = self.active.min(self.tabs.len().saturating_sub(1));

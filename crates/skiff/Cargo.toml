@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 skiff-core = { path = "../skiff-core" }
+skiff-term = { path = "../skiff-term", optional = true }
 eframe = { version = "0.37", features = ["persistence"] }
 egui = "0.37"
 egui_extras = { version = "0.37", features = ["syntect"] }
@@ -26,6 +27,6 @@ base64 = "0.22"
 egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }
 
 [features]
-default = []
-# Embedded terminal for exec sessions (needs the skiff-term crate).
-terminal = []
+default = ["terminal"]
+# Embedded terminal for shells inside containers.
+terminal = ["dep:skiff-term"]

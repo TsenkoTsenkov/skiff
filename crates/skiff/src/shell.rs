@@ -83,6 +83,23 @@ impl ShellTab {
                 }
             }
         }
+        // Output is consumed on every frame, shown or not: the terminal
+        // keeps a bounded scrollback, the raw byte queue does not.
+        #[cfg(feature = "terminal")]
+        if let Some(exec) = &self.exec {
+            let bytes = exec.take_output();
+            if !bytes.is_empty() {
+                self.term.feed(&bytes);
+            }
+        }
+    }
+
+    /// The text currently on the terminal's screen, one line per row (for
+    /// tests and diagnostics).
+    #[cfg(feature = "terminal")]
+    pub fn screen_text(&self) -> String {
+        let (_, rows) = self.term.size();
+        (0..usize::from(rows)).map(|r| self.term.row_text(r)).collect::<Vec<_>>().join("\n")
     }
 
     /// Draws the tab; returns whether the terminal has keyboard focus.
@@ -143,10 +160,6 @@ impl ShellTab {
 
     #[cfg(feature = "terminal")]
     fn terminal(&mut self, ui: &mut Ui, pal: &Palette, exec: &Arc<ExecSession>) -> bool {
-        let bytes = exec.take_output();
-        if !bytes.is_empty() {
-            self.term.feed(&bytes);
-        }
         let style = term_style(pal);
         let out = self.term.ui(ui, &style);
         if !out.input.is_empty() {
@@ -193,5 +206,6 @@ fn term_style(pal: &Palette) -> skiff_term::TermStyle {
         cursor: pal.accent,
         selection_bg: pal.selected,
         ansi: ansi.map(c),
+        ligatures: false,
     }
 }

@@ -20,10 +20,18 @@ pub enum ExecState {
     Failed(String),
 }
 
+/// Output waiting to be drained is capped: beyond this the task stops
+/// reading, and the remote process blocks on its output like on any slow
+/// terminal, instead of filling our memory (`yes`, `cat` of a huge file, a
+/// window nobody is looking at).
+const MAX_PENDING_OUTPUT: usize = 4 * 1024 * 1024;
+
 /// State shared with the background task. The task holds only this, never
 /// the `ExecSession` handle, so dropping the handle ends the remote process.
 struct Shared {
     output: Mutex<Vec<u8>>,
+    /// Signalled when `output` was drained.
+    drained: Notify,
     state: Mutex<ExecState>,
 }
 
@@ -55,7 +63,11 @@ impl ExecSession {
 
     /// Removes and returns everything the process printed since last call.
     pub fn take_output(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.shared.output.lock())
+        let bytes = std::mem::take(&mut *self.shared.output.lock());
+        if !bytes.is_empty() {
+            self.shared.drained.notify_one();
+        }
+        bytes
     }
 
     pub fn state(&self) -> ExecState {
@@ -157,7 +169,9 @@ async fn drive(
                 proc.abort();
                 return Ok("closed".into());
             }
-            n = stdout.read(&mut buf) => {
+            // Reading pauses while too much output is waiting to be drained.
+            _ = shared.drained.notified(), if shared.output.lock().len() >= MAX_PENDING_OUTPUT => {}
+            n = stdout.read(&mut buf), if shared.output.lock().len() < MAX_PENDING_OUTPUT => {
                 match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
@@ -204,7 +218,11 @@ pub(crate) fn open(
 ) -> Arc<ExecSession> {
     let (in_tx, in_rx) = mpsc::unbounded_channel();
     let (rs_tx, rs_rx) = mpsc::unbounded_channel();
-    let shared = Arc::new(Shared { output: Mutex::new(Vec::new()), state: Mutex::new(ExecState::Connecting) });
+    let shared = Arc::new(Shared {
+        output: Mutex::new(Vec::new()),
+        drained: Notify::new(),
+        state: Mutex::new(ExecState::Connecting),
+    });
     let closing = Arc::new(Notify::new());
     let session = Arc::new(ExecSession {
         namespace: namespace.into(),

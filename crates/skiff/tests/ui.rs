@@ -750,3 +750,66 @@ fn yaml_editor_follows_or_flags_changes_on_the_server() {
     h.step();
     let _ = kubectl(&["-n", ns, "delete", "cm", name, "--ignore-not-found"]);
 }
+
+#[cfg(feature = "terminal")]
+#[test]
+fn shell_runs_commands_in_a_container() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    h.get_by_label("alertmanager-0").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    h.get_by_label("Shell").click();
+    settle(&mut h, "shell to connect", |h| has_label(h, "connected"));
+    let screen = |h: &Harness<'static, SkiffApp>| h.state().dock.shell_screen().unwrap_or_default();
+    let shows = |h: &Harness<'static, SkiffApp>, line: &str| screen(h).lines().any(|l| l.trim() == line);
+
+    // The new shell has the keyboard: type a command and read its output.
+    assert!(h.get_by_label("Terminal").is_focused(), "a new shell takes the keyboard");
+    h.get_by_label("Terminal").type_text("echo skiff-$((6*7))");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "command output", |h| shows(h, "skiff-42"));
+    shot(&mut h, "28_shell");
+
+    // Keys typed into the shell are not also shortcuts of the app: "j"
+    // would move the table selection, Esc would close the detail panel,
+    // and Ctrl+K is the shell's own.
+    let before = h.state().selected_row();
+    h.get_by_label("Terminal").type_text("j");
+    h.key_press(egui::Key::Escape);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    steps(&mut h, 3);
+    assert_eq!(h.state().selected_row(), before);
+    assert!(h.state().detail.is_some(), "Esc went to the shell, not to the panel");
+    assert!(h.state().palette.is_none(), "Ctrl+K went to the shell");
+    if h.ctx.os() != egui::os::OperatingSystem::Mac {
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::K);
+        steps(&mut h, 3);
+        assert!(h.state().palette.is_some(), "Ctrl+Shift+K opens the palette from a shell");
+        h.key_press(egui::Key::Escape);
+        steps(&mut h, 3);
+        assert!(h.state().palette.is_none());
+    }
+    // Clear the half-typed line (Ctrl+U), then print something after a
+    // delay, while another dock tab is in front.
+    h.get_by_label("Terminal").click();
+    steps(&mut h, 2);
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::U);
+    h.get_by_label("Terminal").type_text("sleep 1; echo late-$((40+2))");
+    h.key_press(egui::Key::Enter);
+    steps(&mut h, 2);
+    h.get_by_label("Logs").click();
+    settle(&mut h, "log lines", |h| has_label_containing(h, "streaming"));
+    assert!(h.query_by_label("Terminal").is_none(), "the logs tab is in front");
+    settle(&mut h, "output while hidden", |h| shows(h, "late-42"));
+
+    // Leaving the shell ends the session.
+    h.get_all_by_label_contains("alertmanager-0").find(|n| n.rect().top() > 400.0).expect("the shell's tab").click();
+    settle(&mut h, "shell tab in front", |h| h.query_by_label("Terminal").is_some());
+    h.get_by_label("Terminal").click();
+    steps(&mut h, 2);
+    h.get_by_label("Terminal").type_text("exit");
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "shell to end", |h| has_label(h, "ended"));
+    shot(&mut h, "29_shell_ended");
+}
