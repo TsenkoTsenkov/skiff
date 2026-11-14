@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: shop, labels: {team: storefront, env: prod, "kubernetes.io/metadata.name": shop}, annotations: {owner: "storefront@example.com"}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: payments, labels: {team: payments, env: prod, pci: "true"}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: monitoring, labels: {team: sre, env: prod}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: data, labels: {team: data-platform, env: prod}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: batch, labels: {team: data-platform, env: prod}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: platform, labels: {team: platform, env: prod}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: incidents, labels: {team: sre, env: staging, purpose: "broken-things-for-ui-testing"}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: team-a, labels: {team: team-a, env: dev}}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: team-b, labels: {team: team-b, env: dev}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: team-a-quota, namespace: team-a}
+spec:
+  hard: {requests.cpu: "4", requests.memory: 8Gi, limits.cpu: "8", limits.memory: 16Gi, pods: "20", persistentvolumeclaims: "5", configmaps: "30"}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata: {name: team-b-quota, namespace: team-b}
+spec:
+  hard: {requests.cpu: "2", requests.memory: 4Gi, pods: "10", services.loadbalancers: "1"}
+---
+apiVersion: v1
+kind: LimitRange
+metadata: {name: defaults, namespace: team-a}
+spec:
+  limits:
+  - type: Container
+    default: {cpu: 500m, memory: 256Mi}
+    defaultRequest: {cpu: 50m, memory: 64Mi}
+    max: {cpu: "2", memory: 2Gi}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: business-critical}
+value: 100000
+description: "Revenue-impacting workloads"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: batch-low}
+value: 100
+preemptionPolicy: Never
+description: "Best-effort batch jobs"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+  annotations: {storageclass.kubernetes.io/is-default-class: "true"}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: fast-ssd}
+provisioner: ebs.csi.example.com
+parameters: {type: gp3, iops: "6000", encrypted: "true"}
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: slow-hdd}
+provisioner: ebs.csi.example.com
+parameters: {type: st1}
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete

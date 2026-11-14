@@ -1,0 +1,31 @@
+[package]
+name = "skiff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A fast, native Kubernetes cluster browser"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "skiff"
+path = "src/main.rs"
+
+[dependencies]
+skiff-core = { path = "../skiff-core" }
+eframe = { version = "0.37", features = ["persistence"] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["syntect"] }
+egui_material_icons = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }
+
+[features]
+default = []
+# Embedded terminal for exec sessions (needs the skiff-term crate).
+terminal = []

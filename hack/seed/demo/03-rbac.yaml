@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: web, namespace: shop}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: api, namespace: shop}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: prometheus, namespace: monitoring}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: ci-deployer, namespace: platform}
+imagePullSecrets: [{name: registry-cred}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: batch-runner, namespace: batch}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: config-reader, namespace: shop}
+rules:
+- {apiGroups: [""], resources: [configmaps, secrets], verbs: [get, list, watch]}
+- {apiGroups: [""], resources: [pods, pods/log], verbs: [get, list]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: web-config-reader, namespace: shop}
+subjects:
+- {kind: ServiceAccount, name: web, namespace: shop}
+- {kind: User, name: alice@example.com, apiGroup: rbac.authorization.k8s.io}
+roleRef: {kind: Role, name: config-reader, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: deployer, namespace: platform}
+rules:
+- {apiGroups: [apps], resources: [deployments, statefulsets], verbs: [get, list, watch, create, update, patch]}
+- {apiGroups: [batch], resources: [jobs, cronjobs], verbs: ["*"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ci-deployer, namespace: platform}
+subjects: [{kind: ServiceAccount, name: ci-deployer, namespace: platform}]
+roleRef: {kind: Role, name: deployer, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: prometheus-scraper}
+rules:
+- {apiGroups: [""], resources: [nodes, nodes/metrics, services, endpoints, pods], verbs: [get, list, watch]}
+- {apiGroups: [networking.k8s.io], resources: [ingresses], verbs: [get, list, watch]}
+- {nonResourceURLs: [/metrics], verbs: [get]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: prometheus-scraper}
+subjects: [{kind: ServiceAccount, name: prometheus, namespace: monitoring}]
+roleRef: {kind: ClusterRole, name: prometheus-scraper, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: namespace-viewer, labels: {rbac.authorization.k8s.io/aggregate-to-view: "true"}}
+rules:
+- {apiGroups: [""], resources: [namespaces], verbs: [get, list, watch]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: skiff-crd-admin}
+rules:
+- {apiGroups: [stack.skiff.dev, pki.skiff.dev, ops.skiff.dev], resources: ["*"], verbs: ["*"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: sre-team-crd-admin}
+subjects: [{kind: Group, name: sre, apiGroup: rbac.authorization.k8s.io}]
+roleRef: {kind: ClusterRole, name: skiff-crd-admin, apiGroup: rbac.authorization.k8s.io}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: batch-runner, namespace: incidents}

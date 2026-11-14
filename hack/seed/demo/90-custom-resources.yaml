@@ -1,0 +1,198 @@
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: orders-db, namespace: shop, labels: {engine: postgres}}
+spec:
+  engine: postgres
+  version: "16.2"
+  replicas: 3
+  storage: 50Gi
+  backup: {enabled: true, schedule: "0 2 * * *"}
+status:
+  phase: Running
+  ready: true
+  endpoint: orders-db.shop.svc.cluster.local:5432
+---
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: sessions-cache, namespace: shop, labels: {engine: redis}}
+spec:
+  engine: redis
+  version: "7.2"
+  replicas: 3
+  storage: 2Gi
+  backup: {enabled: false, schedule: "0 2 * * *"}
+status:
+  phase: Running
+  ready: true
+  endpoint: sessions-cache.shop.svc.cluster.local:6379
+---
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: catalog-db, namespace: shop, labels: {engine: mysql}}
+spec:
+  engine: mysql
+  version: "8.0.36"
+  replicas: 2
+  storage: 100Gi
+  backup: {enabled: true, schedule: "0 2 * * *"}
+status:
+  phase: Running
+  ready: true
+  endpoint: catalog-db.shop.svc.cluster.local:3306
+---
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: events-store, namespace: data, labels: {engine: mongodb}}
+spec:
+  engine: mongodb
+  version: "7.0"
+  replicas: 3
+  storage: 500Gi
+  backup: {enabled: true, schedule: "0 2 * * *"}
+status:
+  phase: Degraded
+  ready: false
+  endpoint: events-store.data.svc.cluster.local:27017
+---
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: ledger-db, namespace: payments, labels: {engine: postgres}}
+spec:
+  engine: postgres
+  version: "15.6"
+  replicas: 2
+  storage: 200Gi
+  backup: {enabled: true, schedule: "0 2 * * *"}
+status:
+  phase: Provisioning
+  ready: false
+  endpoint: ledger-db.payments.svc.cluster.local:5432
+---
+apiVersion: stack.skiff.dev/v1
+kind: Database
+metadata: {name: scratch-pg, namespace: team-a, labels: {engine: postgres}}
+spec:
+  engine: postgres
+  version: "16.2"
+  replicas: 1
+  storage: 5Gi
+  backup: {enabled: true, schedule: "0 2 * * *"}
+status:
+  phase: Running
+  ready: true
+  endpoint: scratch-pg.team-a.svc.cluster.local:5432
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: shop-tls, namespace: shop}
+spec:
+  commonName: "shop.example.com"
+  dnsNames: ["shop.example.com", "www.shop.example.com"]
+  secretName: shop-tls-secret
+  issuerRef: {name: letsencrypt-prod, kind: ClusterIssuer}
+status:
+  notAfter: "2027-06-02T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: api-tls, namespace: shop}
+spec:
+  commonName: "api.shop.example.com"
+  dnsNames: ["api.shop.example.com"]
+  secretName: api-tls-secret
+  issuerRef: {name: letsencrypt-prod, kind: ClusterIssuer}
+status:
+  notAfter: "2026-12-29T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: grafana-tls, namespace: monitoring}
+spec:
+  commonName: "grafana.example.com"
+  dnsNames: ["grafana.example.com"]
+  secretName: grafana-tls-secret
+  issuerRef: {name: internal-ca, kind: ClusterIssuer}
+status:
+  notAfter: "2027-09-30T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: gateway-mtls, namespace: payments}
+spec:
+  commonName: "gateway.payments.svc"
+  dnsNames: ["gateway.payments.svc", "gateway.payments.svc.cluster.local"]
+  secretName: gateway-mtls-secret
+  issuerRef: {name: internal-ca, kind: ClusterIssuer}
+status:
+  notAfter: "2026-11-26T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: legacy-tls, namespace: payments}
+spec:
+  commonName: "legacy.example.com"
+  dnsNames: ["legacy.example.com"]
+  secretName: legacy-tls-secret
+  issuerRef: {name: letsencrypt-prod, kind: ClusterIssuer}
+status:
+  notAfter: "2026-11-11T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "False", reason: Expired, message: "Certificate has expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: wildcard, namespace: platform}
+spec:
+  commonName: "*.example.com"
+  dnsNames: ["*.example.com", "example.com"]
+  secretName: wildcard-secret
+  issuerRef: {name: letsencrypt-prod, kind: ClusterIssuer}
+status:
+  notAfter: "2027-01-13T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: pki.skiff.dev/v1
+kind: Certificate
+metadata: {name: demo-tls, namespace: team-b}
+spec:
+  commonName: "demo.example.com"
+  dnsNames: ["demo.example.com"]
+  secretName: demo-tls-secret
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}
+status:
+  notAfter: "2027-02-11T00:00:00Z"
+  conditions:
+  - {type: Ready, status: "True", reason: Ready, message: "Certificate is up to date and has not expired"}
+---
+apiVersion: ops.skiff.dev/v1alpha1
+kind: BackupPolicy
+metadata: {name: nightly-all}
+spec: {schedule: "0 1 * * *", retentionDays: 14, target: "s3://backups/nightly"}
+status: {lastRunTime: "2026-11-13T21:00:00Z", lastResult: Succeeded}
+---
+apiVersion: ops.skiff.dev/v1alpha1
+kind: BackupPolicy
+metadata: {name: hourly-wal}
+spec: {schedule: "0 * * * *", retentionDays: 2, target: "s3://backups/wal"}
+status: {lastRunTime: "2026-11-13T14:00:00Z", lastResult: Succeeded}
+---
+apiVersion: ops.skiff.dev/v1alpha1
+kind: BackupPolicy
+metadata: {name: weekly-archive}
+spec: {schedule: "0 3 * * 0", retentionDays: 90, target: "gcs://cold-archive/weekly"}
+status: {lastRunTime: "2026-11-13T07:00:00Z", lastResult: Failed}
+---
+apiVersion: ops.skiff.dev/v1alpha1
+kind: BackupPolicy
+metadata: {name: monthly-compliance}
+spec: {schedule: "0 4 1 * *", retentionDays: 2555, target: "s3://compliance/monthly"}
+status: {lastRunTime: "2026-11-13T00:00:00Z", lastResult: Succeeded}

@@ -1,0 +1,164 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-shop-redis-0
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-shop-redis-0}
+  claimRef: {namespace: shop, name: data-redis-0}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-shop-redis-1
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-shop-redis-1}
+  claimRef: {namespace: shop, name: data-redis-1}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-shop-redis-2
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 2Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-shop-redis-2}
+  claimRef: {namespace: shop, name: data-redis-2}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-shop-postgres-0
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 50Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fast-ssd
+  hostPath: {path: /mnt/data/pv-shop-postgres-0}
+  claimRef: {namespace: shop, name: data-postgres-0}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-shop-postgres-1
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 50Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fast-ssd
+  hostPath: {path: /mnt/data/pv-shop-postgres-1}
+  claimRef: {namespace: shop, name: data-postgres-1}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-monitoring-prometheus-0
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 100Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-monitoring-prometheus-0}
+  claimRef: {namespace: monitoring, name: data-prometheus-0}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-data-kafka-0
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 200Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-data-kafka-0}
+  claimRef: {namespace: data, name: data-kafka-0}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-data-kafka-1
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 200Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-data-kafka-1}
+  claimRef: {namespace: data, name: data-kafka-1}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-data-kafka-2
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 200Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-data-kafka-2}
+  claimRef: {namespace: data, name: data-kafka-2}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-team-a-scratch
+  labels: {app.kubernetes.io/managed-by: skiff-seed}
+spec:
+  capacity: {storage: 5Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath: {path: /mnt/data/pv-team-a-scratch}
+  claimRef: {namespace: team-a, name: scratch}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: pv-archive-available}
+spec:
+  capacity: {storage: 10Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: slow-hdd
+  hostPath: {path: /mnt/data/archive}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: scratch, namespace: team-a}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources: {requests: {storage: 5Gi}}
+  volumeName: pv-team-a-scratch
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: uploads-archive, namespace: shop, annotations: {note: "requests more than any PV offers -> stays Pending"}}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: slow-hdd
+  resources: {requests: {storage: 100Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: media-cache, namespace: shop}
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: fast-ssd
+  resources: {requests: {storage: 20Gi}}

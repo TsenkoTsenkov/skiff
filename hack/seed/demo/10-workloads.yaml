@@ -1,0 +1,1403 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: coredns, namespace: kube-system, labels: {app: "coredns", app.kubernetes.io/name: "coredns", app.kubernetes.io/part-of: "kube-system", k8s-app: "kube-dns"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: coredns}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "coredns", app.kubernetes.io/name: "coredns", app.kubernetes.io/part-of: "kube-system", k8s-app: "kube-dns"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "8m", kwok.x-k8s.io/usage-memory: "28Mi"}
+    spec:
+      tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}]
+      containers:
+      - name: coredns
+        image: registry.k8s.io/coredns/coredns:v1.11.3
+        ports: [{name: http, containerPort: 53}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: kube-proxy, namespace: kube-system, labels: {app: "kube-proxy", app.kubernetes.io/name: "kube-proxy"}}
+spec:
+  selector: {matchLabels: {app: kube-proxy}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "kube-proxy", app.kubernetes.io/name: "kube-proxy"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "4m", kwok.x-k8s.io/usage-memory: "22Mi"}
+    spec:
+      hostNetwork: false
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: kube-proxy
+        image: registry.k8s.io/kube-proxy:v1.37.2
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: web-config, namespace: shop}
+data:
+  nginx.conf: |
+    worker_processes auto;
+    events { worker_connections 1024; }
+    http {
+      upstream api { server api:8080; }
+      server {
+        listen 80;
+        location /api/ { proxy_pass http://api; }
+        location / { root /usr/share/nginx/html; }
+      }
+    }
+  LOG_LEVEL: |
+    info
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: api-config, namespace: shop}
+data:
+  application.yaml: |
+    server:
+      port: 8080
+    database:
+      host: postgres-0.postgres-headless
+      pool: 20
+    cache:
+      host: redis-0.redis-headless
+      ttl: 300s
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: feature-flags, namespace: shop}
+data:
+  flags.json: |
+    {
+      "newCheckout": true,
+      "recommendations": true,
+      "darkMode": false,
+      "betaSearch": {"enabled": true, "percent": 25}
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: db-credentials, namespace: shop}
+type: Opaque
+stringData:
+  username: 'shop_app'
+  password: 's3cr3t-not-real'
+  host: 'postgres-0.postgres-headless'
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: api-token, namespace: shop}
+type: Opaque
+stringData:
+  token: 'tok_live_0123456789abcdef'
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: registry-cred, namespace: shop}
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: '{"auths":{"registry.example.com":{"username":"ci","password":"x","auth":"Y2k6eA=="}}}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop, labels: {app: "web", app.kubernetes.io/name: "web", app.kubernetes.io/part-of: "shop", tier: "frontend"}}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: web}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "web", app.kubernetes.io/name: "web", app.kubernetes.io/part-of: "shop", tier: "frontend"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "70m", kwok.x-k8s.io/usage-memory: "90Mi"}
+    spec:
+      serviceAccountName: web
+      priorityClassName: business-critical
+      initContainers:
+      - {name: init-wait, image: busybox:1.36, command: [sh, -c, 'echo waiting for deps; sleep 1']}
+      containers:
+      - name: web
+        image: nginx:1.25-alpine
+        ports: [{name: http, containerPort: 80}]
+        env:
+        - {name: API_URL, value: "http://api:8080"}
+        resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 400m, memory: 256Mi}}
+        volumeMounts:
+        - {name: cfg, mountPath: /etc/nginx/conf.d, readOnly: true}
+      volumes:
+      - {name: cfg, configMap: {name: web-config}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: shop, labels: {app: "api", app.kubernetes.io/name: "api", app.kubernetes.io/part-of: "shop", tier: "backend"}}
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: api}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "api", app.kubernetes.io/name: "api", app.kubernetes.io/part-of: "shop", tier: "backend"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "150m", kwok.x-k8s.io/usage-memory: "180Mi"}
+    spec:
+      serviceAccountName: api
+      containers:
+      - name: api
+        image: registry.example.com/shop/api:2.14.1
+        ports: [{name: http, containerPort: 8080}]
+        env:
+        - {name: DB_HOST, value: "postgres-0.postgres-headless"}
+        resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {cpu: 800m, memory: 512Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cart, namespace: shop, labels: {app: "cart", app.kubernetes.io/name: "cart", app.kubernetes.io/part-of: "shop", tier: "backend"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: cart}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "cart", app.kubernetes.io/name: "cart", app.kubernetes.io/part-of: "shop", tier: "backend"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "20m", kwok.x-k8s.io/usage-memory: "70Mi"}
+    spec:
+      containers:
+      - name: cart
+        image: registry.example.com/shop/cart:1.8.0
+        ports: [{name: http, containerPort: 8081}]
+        resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 400m, memory: 256Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: recommender, namespace: shop, labels: {app: "recommender", app.kubernetes.io/name: "recommender", app.kubernetes.io/part-of: "shop", tier: "ml"}}
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: recommender}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "recommender", app.kubernetes.io/name: "recommender", app.kubernetes.io/part-of: "shop", tier: "ml"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "350m", kwok.x-k8s.io/usage-memory: "1500Mi"}
+    spec:
+      nodeSelector: {accelerator: nvidia-a100}
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers:
+      - name: recommender
+        image: registry.example.com/shop/recommender-gpu:0.9.3
+        ports: [{name: http, containerPort: 9000}]
+        resources: {requests: {cpu: 500m, memory: 2Gi, nvidia.com/gpu: 1}, limits: {cpu: 2000m, memory: 4096Mi, nvidia.com/gpu: 1}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: redis, namespace: shop, labels: {app: "redis", app.kubernetes.io/name: "redis", app.kubernetes.io/part-of: "shop"}}
+spec:
+  replicas: 3
+  serviceName: redis-headless
+  podManagementPolicy: OrderedReady
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata:
+      labels: {app: "redis", app.kubernetes.io/name: "redis", app.kubernetes.io/part-of: "shop"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "10m", kwok.x-k8s.io/usage-memory: "30Mi"}
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        ports: [{name: http, containerPort: 6379}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: standard
+      resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis-headless, namespace: shop, labels: {app: redis}}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: redis}
+  ports:
+  - {name: http, port: 6379, targetPort: 6379, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres, namespace: shop, labels: {app: "postgres", app.kubernetes.io/name: "postgres", app.kubernetes.io/part-of: "shop"}}
+spec:
+  replicas: 2
+  serviceName: postgres-headless
+  podManagementPolicy: OrderedReady
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata:
+      labels: {app: "postgres", app.kubernetes.io/name: "postgres", app.kubernetes.io/part-of: "shop"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "120m", kwok.x-k8s.io/usage-memory: "400Mi"}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16.2
+        ports: [{name: http, containerPort: 5432}]
+        resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {cpu: 1000m, memory: 1024Mi}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: fast-ssd
+      resources: {requests: {storage: 50Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres-headless, namespace: shop, labels: {app: postgres}}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: postgres}
+  ports:
+  - {name: http, port: 5432, targetPort: 5432, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: shop, labels: {app: web}}
+spec:
+  type: ClusterIP
+  selector: {app: web}
+  ports:
+  - {name: http, port: 80, targetPort: 80, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api, namespace: shop, labels: {app: api}}
+spec:
+  type: ClusterIP
+  selector: {app: api}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cart, namespace: shop, labels: {app: cart}}
+spec:
+  type: ClusterIP
+  selector: {app: cart}
+  ports:
+  - {name: http, port: 8081, targetPort: 8081, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web-lb, namespace: shop, labels: {app: web}}
+spec:
+  type: LoadBalancer
+  selector: {app: web}
+  ports:
+  - {name: http, port: 443, targetPort: 80, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api-nodeport, namespace: shop, labels: {app: api}}
+spec:
+  type: NodePort
+  selector: {app: api}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP, nodePort: 30080}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: recommender, namespace: shop, labels: {app: recommender}}
+spec:
+  type: ClusterIP
+  selector: {app: recommender}
+  ports:
+  - {name: http, port: 9000, targetPort: 9000, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: external-payments, namespace: shop}
+spec: {type: ExternalName, externalName: api.payments-provider.example.com}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: web, namespace: shop}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: web}
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - {type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: api, namespace: shop}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+  minReplicas: 4
+  maxReplicas: 12
+  metrics:
+  - {type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}}
+  - {type: Resource, resource: {name: memory, target: {type: Utilization, averageUtilization: 80}}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: web-pdb, namespace: shop}
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: web}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  namespace: shop
+  annotations: {nginx.ingress.kubernetes.io/proxy-body-size: "10m", cert-manager.io/cluster-issuer: "letsencrypt-prod"}
+spec:
+  ingressClassName: nginx
+  tls:
+  - {hosts: [shop.example.com], secretName: shop-tls-secret}
+  rules:
+  - host: shop.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}
+  - host: api.shop.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: api, port: {number: 8080}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-ingress, namespace: shop}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-web-to-api, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: api}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: web}}}]
+    ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-api-to-db, namespace: shop}
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: api}}}]
+    ports: [{protocol: TCP, port: 5432}]
+  egress:
+  - to: [{namespaceSelector: {matchLabels: {team: data-platform}}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gateway, namespace: payments, labels: {app: "gateway", app.kubernetes.io/name: "gateway", app.kubernetes.io/part-of: "payments"}}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: gateway}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "gateway", app.kubernetes.io/name: "gateway", app.kubernetes.io/part-of: "payments"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "180m", kwok.x-k8s.io/usage-memory: "200Mi"}
+    spec:
+      priorityClassName: business-critical
+      containers:
+      - name: gateway
+        image: registry.example.com/payments/gateway:5.2.0
+        ports: [{name: http, containerPort: 8443}]
+        resources: {requests: {cpu: 250m, memory: 256Mi}, limits: {cpu: 1000m, memory: 512Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: notifier, namespace: payments, labels: {app: "notifier", app.kubernetes.io/name: "notifier", app.kubernetes.io/part-of: "payments"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: notifier}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "notifier", app.kubernetes.io/name: "notifier", app.kubernetes.io/part-of: "payments"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "12m", kwok.x-k8s.io/usage-memory: "50Mi"}
+    spec:
+      containers:
+      - name: notifier
+        image: registry.example.com/payments/notifier:1.1.4
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: fraud-detector, namespace: payments, labels: {app: "fraud-detector", app.kubernetes.io/name: "fraud-detector", app.kubernetes.io/part-of: "payments"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: fraud-detector}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "fraud-detector", app.kubernetes.io/name: "fraud-detector", app.kubernetes.io/part-of: "payments", sim.skiff.dev/state: "crashloop"}
+      annotations: {sim.skiff.dev/restarts: "14"}
+    spec:
+      containers:
+      - name: fraud-detector
+        image: registry.example.com/payments/fraud:3.0.0-rc1
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: gateway, namespace: payments, labels: {app: gateway}}
+spec:
+  type: ClusterIP
+  selector: {app: gateway}
+  ports:
+  - {name: http, port: 8443, targetPort: 8443, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ledger, namespace: payments, labels: {app: ledger}}
+spec:
+  type: ClusterIP
+  selector: {app: ledger}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: fraud-detector, namespace: payments, labels: {app: fraud-detector}}
+spec:
+  type: ClusterIP
+  selector: {app: fraud-detector}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: gateway, namespace: payments}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: gateway}
+  minReplicas: 3
+  maxReplicas: 8
+  metrics:
+  - {type: Resource, resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: stripe-keys, namespace: payments}
+type: Opaque
+stringData:
+  secret_key: 'sk_test_not_real'
+  webhook_secret: 'whsec_not_real'
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: gateway-mtls-secret, namespace: payments}
+type: Opaque
+stringData:
+  tls.crt: '-----BEGIN CERTIFICATE----- MIIBplaceholder -----END CERTIFICATE-----'
+  tls.key: '-----BEGIN PRIVATE KEY----- MIIBplaceholder -----END PRIVATE KEY-----'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: gateway-config, namespace: payments}
+data:
+  routes.yaml: |
+    routes:
+      - path: /charge
+        upstream: ledger:8080
+      - path: /refund
+        upstream: ledger:8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: pci-isolation, namespace: payments}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from: [{namespaceSelector: {matchLabels: {team: storefront}}}]
+  egress:
+  - to: [{namespaceSelector: {}}]
+    ports: [{protocol: TCP, port: 443}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: prometheus-config, namespace: monitoring}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs: [{role: pod}]
+      - job_name: nodes
+        kubernetes_sd_configs: [{role: node}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-dashboards, namespace: monitoring}
+data:
+  cluster-overview.json: |
+    {"title":"Cluster Overview","panels":[]}
+  node-detail.json: |
+    {"title":"Node Detail","panels":[]}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: prometheus, namespace: monitoring, labels: {app: "prometheus", app.kubernetes.io/name: "prometheus", app.kubernetes.io/part-of: "monitoring"}}
+spec:
+  replicas: 1
+  serviceName: prometheus-headless
+  podManagementPolicy: OrderedReady
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata:
+      labels: {app: "prometheus", app.kubernetes.io/name: "prometheus", app.kubernetes.io/part-of: "monitoring"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "300m", kwok.x-k8s.io/usage-memory: "900Mi"}
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: quay.io/prometheus/prometheus:v2.53.0
+        ports: [{name: http, containerPort: 9090}]
+        resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: 2000m, memory: 2048Mi}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: standard
+      resources: {requests: {storage: 100Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus-headless, namespace: monitoring, labels: {app: prometheus}}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: prometheus}
+  ports:
+  - {name: http, port: 9090, targetPort: 9090, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: alertmanager, namespace: monitoring, labels: {app: "alertmanager", app.kubernetes.io/name: "alertmanager", app.kubernetes.io/part-of: "monitoring"}}
+spec:
+  replicas: 2
+  serviceName: alertmanager-headless
+  podManagementPolicy: OrderedReady
+  selector: {matchLabels: {app: alertmanager}}
+  template:
+    metadata:
+      labels: {app: "alertmanager", app.kubernetes.io/name: "alertmanager", app.kubernetes.io/part-of: "monitoring"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "5m", kwok.x-k8s.io/usage-memory: "25Mi"}
+    spec:
+      containers:
+      - name: alertmanager
+        image: quay.io/prometheus/alertmanager:v0.27.0
+        ports: [{name: http, containerPort: 9093}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+
+---
+apiVersion: v1
+kind: Service
+metadata: {name: alertmanager-headless, namespace: monitoring, labels: {app: alertmanager}}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: alertmanager}
+  ports:
+  - {name: http, port: 9093, targetPort: 9093, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grafana, namespace: monitoring, labels: {app: "grafana", app.kubernetes.io/name: "grafana", app.kubernetes.io/part-of: "monitoring"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: grafana}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "grafana", app.kubernetes.io/name: "grafana", app.kubernetes.io/part-of: "monitoring"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "40m", kwok.x-k8s.io/usage-memory: "180Mi"}
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.1.0
+        ports: [{name: http, containerPort: 3000}]
+        resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: 400m, memory: 512Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: kube-state-metrics, namespace: monitoring, labels: {app: "kube-state-metrics", app.kubernetes.io/name: "kube-state-metrics", app.kubernetes.io/part-of: "monitoring"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: kube-state-metrics}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "kube-state-metrics", app.kubernetes.io/name: "kube-state-metrics", app.kubernetes.io/part-of: "monitoring"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "15m", kwok.x-k8s.io/usage-memory: "60Mi"}
+    spec:
+      containers:
+      - name: kube-state-metrics
+        image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: node-exporter, namespace: monitoring, labels: {app: "node-exporter", app.kubernetes.io/name: "node-exporter"}}
+spec:
+  selector: {matchLabels: {app: node-exporter}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "node-exporter", app.kubernetes.io/name: "node-exporter"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "6m", kwok.x-k8s.io/usage-memory: "20Mi"}
+    spec:
+      hostNetwork: false
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: node-exporter
+        image: quay.io/prometheus/node-exporter:v1.8.1
+        ports: [{name: http, containerPort: 9100}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: monitoring, labels: {app: prometheus}}
+spec:
+  type: ClusterIP
+  selector: {app: prometheus}
+  ports:
+  - {name: http, port: 9090, targetPort: 9090, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: alertmanager, namespace: monitoring, labels: {app: alertmanager}}
+spec:
+  type: ClusterIP
+  selector: {app: alertmanager}
+  ports:
+  - {name: http, port: 9093, targetPort: 9093, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grafana, namespace: monitoring, labels: {app: grafana}}
+spec:
+  type: ClusterIP
+  selector: {app: grafana}
+  ports:
+  - {name: http, port: 3000, targetPort: 3000, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kube-state-metrics, namespace: monitoring, labels: {app: kube-state-metrics}}
+spec:
+  type: ClusterIP
+  selector: {app: kube-state-metrics}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  ingressClassName: nginx
+  tls:
+  - {hosts: [grafana.example.com], secretName: grafana-tls-secret}
+  rules:
+  - host: grafana.example.com
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: grafana, port: {number: 3000}}}}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: grafana-admin, namespace: monitoring}
+type: Opaque
+stringData:
+  admin-user: 'admin'
+  admin-password: 'not-a-real-password'
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: kafka, namespace: data, labels: {app: "kafka", app.kubernetes.io/name: "kafka", app.kubernetes.io/part-of: "data"}}
+spec:
+  replicas: 3
+  serviceName: kafka-headless
+  podManagementPolicy: OrderedReady
+  selector: {matchLabels: {app: kafka}}
+  template:
+    metadata:
+      labels: {app: "kafka", app.kubernetes.io/name: "kafka", app.kubernetes.io/part-of: "data"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "250m", kwok.x-k8s.io/usage-memory: "1600Mi"}
+    spec:
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.6.1
+        ports: [{name: http, containerPort: 9092}]
+        resources: {requests: {cpu: 500m, memory: 2Gi}, limits: {cpu: 2000m, memory: 4096Mi}}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: standard
+      resources: {requests: {storage: 200Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kafka-headless, namespace: data, labels: {app: kafka}}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector: {app: kafka}
+  ports:
+  - {name: http, port: 9092, targetPort: 9092, protocol: TCP}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: schema-registry, namespace: data, labels: {app: "schema-registry", app.kubernetes.io/name: "schema-registry", app.kubernetes.io/part-of: "data"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: schema-registry}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "schema-registry", app.kubernetes.io/name: "schema-registry", app.kubernetes.io/part-of: "data"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "30m", kwok.x-k8s.io/usage-memory: "350Mi"}
+    spec:
+      containers:
+      - name: schema-registry
+        image: confluentinc/cp-schema-registry:7.6.1
+        ports: [{name: http, containerPort: 8081}]
+        resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {cpu: 400m, memory: 1024Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: analytics-spark, namespace: data, labels: {app: "analytics-spark", app.kubernetes.io/name: "analytics-spark", app.kubernetes.io/part-of: "data"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: analytics-spark}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "analytics-spark", app.kubernetes.io/name: "analytics-spark", app.kubernetes.io/part-of: "data"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "1500m", kwok.x-k8s.io/usage-memory: "12Gi"}
+    spec:
+      nodeSelector: {workload: memory}
+      tolerations: [{key: dedicated, operator: Equal, value: analytics, effect: NoSchedule}]
+      containers:
+      - name: analytics-spark
+        image: registry.example.com/data/spark-thrift:3.5.1
+        ports: [{name: http, containerPort: 10000}]
+        resources: {requests: {cpu: 2, memory: 16Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: etl-worker, namespace: data, labels: {app: "etl-worker", app.kubernetes.io/name: "etl-worker", app.kubernetes.io/part-of: "data"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: etl-worker}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "etl-worker", app.kubernetes.io/name: "etl-worker", app.kubernetes.io/part-of: "data", sim.skiff.dev/state: "oomkilled"}
+      annotations: {sim.skiff.dev/restarts: "31"}
+    spec:
+      containers:
+      - name: etl-worker
+        image: registry.example.com/data/etl:4.2.0
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kafka, namespace: data, labels: {app: kafka}}
+spec:
+  type: ClusterIP
+  selector: {app: kafka}
+  ports:
+  - {name: http, port: 9092, targetPort: 9092, protocol: TCP}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: schema-registry, namespace: data, labels: {app: schema-registry}}
+spec:
+  type: ClusterIP
+  selector: {app: schema-registry}
+  ports:
+  - {name: http, port: 8081, targetPort: 8081, protocol: TCP}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: kafka-topics, namespace: data}
+data:
+  topics.txt: |
+    orders
+    payments
+    clickstream
+    inventory-updates
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: nightly-backup, namespace: batch, labels: {app: nightly-backup}}
+spec:
+  schedule: "*/2 * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata: {labels: {app: nightly-backup}}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: batch-runner
+          containers:
+          - {name: main, image: registry.example.com/ops/backup:1.4.0, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: hourly-report, namespace: batch, labels: {app: hourly-report}}
+spec:
+  schedule: "*/5 * * * *"
+  suspend: false
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata: {labels: {app: hourly-report}}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: batch-runner
+          containers:
+          - {name: main, image: registry.example.com/data/report:2.0.1, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: weekly-cleanup, namespace: batch, labels: {app: weekly-cleanup}}
+spec:
+  schedule: "0 3 * * 0"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata: {labels: {app: weekly-cleanup}}
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: batch-runner
+          containers:
+          - {name: main, image: busybox:1.36, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: db-migrate-20261101, namespace: batch, labels: {app: db-migrate-20261101}}
+spec:
+  backoffLimit: 3
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: {app: "db-migrate-20261101", job-name: "db-migrate-20261101"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: batch-runner
+      containers:
+      - {name: main, image: registry.example.com/ops/migrate:7.3.0, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: index-rebuild, namespace: batch, labels: {app: index-rebuild}}
+spec:
+  backoffLimit: 3
+  completions: 6
+  parallelism: 3
+  template:
+    metadata:
+      labels: {app: "index-rebuild", job-name: "index-rebuild"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: batch-runner
+      containers:
+      - {name: main, image: registry.example.com/search/indexer:2.2.0, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: data-import-running, namespace: batch, labels: {app: data-import-running}}
+spec:
+  backoffLimit: 3
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: {app: "data-import-running", job-name: "data-import-running", sim.skiff.dev/no-complete: "true"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: batch-runner
+      containers:
+      - {name: main, image: registry.example.com/data/import:1.0.0, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ingress-nginx-controller, namespace: platform, labels: {app: "ingress-nginx-controller", app.kubernetes.io/name: "ingress-nginx-controller", app.kubernetes.io/part-of: "platform", app.kubernetes.io/component: "controller"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: ingress-nginx-controller}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "ingress-nginx-controller", app.kubernetes.io/name: "ingress-nginx-controller", app.kubernetes.io/part-of: "platform", app.kubernetes.io/component: "controller"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "45m", kwok.x-k8s.io/usage-memory: "150Mi"}
+    spec:
+      containers:
+      - name: ingress-nginx-controller
+        image: registry.k8s.io/ingress-nginx/controller:v1.11.1
+        ports: [{name: http, containerPort: 80}]
+        resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 400m, memory: 256Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cert-manager, namespace: platform, labels: {app: "cert-manager", app.kubernetes.io/name: "cert-manager", app.kubernetes.io/part-of: "platform"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: cert-manager}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "cert-manager", app.kubernetes.io/name: "cert-manager", app.kubernetes.io/part-of: "platform"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "8m", kwok.x-k8s.io/usage-memory: "45Mi"}
+    spec:
+      containers:
+      - name: cert-manager
+        image: quay.io/jetstack/cert-manager-controller:v1.15.0
+        ports: [{name: http, containerPort: 9402}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cert-manager-webhook, namespace: platform, labels: {app: "cert-manager-webhook", app.kubernetes.io/name: "cert-manager-webhook", app.kubernetes.io/part-of: "platform"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: cert-manager-webhook}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "cert-manager-webhook", app.kubernetes.io/name: "cert-manager-webhook", app.kubernetes.io/part-of: "platform"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "4m", kwok.x-k8s.io/usage-memory: "20Mi"}
+    spec:
+      containers:
+      - name: cert-manager-webhook
+        image: quay.io/jetstack/cert-manager-webhook:v1.15.0
+        ports: [{name: http, containerPort: 10250}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: fluent-bit, namespace: platform, labels: {app: "fluent-bit", app.kubernetes.io/name: "fluent-bit"}}
+spec:
+  selector: {matchLabels: {app: fluent-bit}}
+  updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "fluent-bit", app.kubernetes.io/name: "fluent-bit"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "25m", kwok.x-k8s.io/usage-memory: "60Mi"}
+    spec:
+      hostNetwork: false
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:3.1.0
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ingress-nginx-controller, namespace: platform, labels: {app: ingress-nginx-controller}}
+spec:
+  type: ClusterIP
+  selector: {app: ingress-nginx-controller}
+  ports:
+  - {name: http, port: 80, targetPort: 80, protocol: TCP}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: registry-cred, namespace: platform}
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: '{"auths":{"registry.example.com":{"username":"ci","password":"x","auth":"Y2k6eA=="}}}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: cluster-info, namespace: platform}
+data:
+  region: |
+    us-east-1
+  cluster: |
+    demo
+  environment: |
+    production
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ghost-image, namespace: incidents, labels: {app: "ghost-image", app.kubernetes.io/name: "ghost-image", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: ghost-image}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "ghost-image", app.kubernetes.io/name: "ghost-image", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "imagepull"}
+    spec:
+      containers:
+      - name: ghost-image
+        image: registry.example.com/missing/app:v9.9.9
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: registry-denied, namespace: incidents, labels: {app: "registry-denied", app.kubernetes.io/name: "registry-denied", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: registry-denied}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "registry-denied", app.kubernetes.io/name: "registry-denied", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "errimagepull"}
+    spec:
+      containers:
+      - name: registry-denied
+        image: private.registry.example.com/secret/app:1.0
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: crashy, namespace: incidents, labels: {app: "crashy", app.kubernetes.io/name: "crashy", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: crashy}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "crashy", app.kubernetes.io/name: "crashy", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "crashloop"}
+      annotations: {sim.skiff.dev/restarts: "23"}
+    spec:
+      containers:
+      - name: crashy
+        image: registry.example.com/incidents/crashy:1.0
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: oom-service, namespace: incidents, labels: {app: "oom-service", app.kubernetes.io/name: "oom-service", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: oom-service}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "oom-service", app.kubernetes.io/name: "oom-service", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "oomkilled"}
+    spec:
+      containers:
+      - name: oom-service
+        image: registry.example.com/incidents/leaky:2.1
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: bad-config, namespace: incidents, labels: {app: "bad-config", app.kubernetes.io/name: "bad-config", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: bad-config}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "bad-config", app.kubernetes.io/name: "bad-config", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "configerror"}
+    spec:
+      containers:
+      - name: bad-config
+        image: registry.example.com/incidents/needs-secret:1.3
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: unready-svc, namespace: incidents, labels: {app: "unready-svc", app.kubernetes.io/name: "unready-svc", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: unready-svc}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "unready-svc", app.kubernetes.io/name: "unready-svc", app.kubernetes.io/part-of: "incidents", sim.skiff.dev/state: "notready"}
+    spec:
+      containers:
+      - name: unready-svc
+        image: registry.example.com/incidents/flaky:0.4
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pending-gpu, namespace: incidents, labels: {app: "pending-gpu", app.kubernetes.io/name: "pending-gpu", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: pending-gpu}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "pending-gpu", app.kubernetes.io/name: "pending-gpu", app.kubernetes.io/part-of: "incidents"}
+    spec:
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers:
+      - name: pending-gpu
+        image: registry.example.com/ml/trainer:1.0
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 1, memory: 4Gi, nvidia.com/gpu: 8}, limits: {cpu: 4000m, memory: 8192Mi, nvidia.com/gpu: 8}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pending-affinity, namespace: incidents, labels: {app: "pending-affinity", app.kubernetes.io/name: "pending-affinity", app.kubernetes.io/part-of: "incidents"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: pending-affinity}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "pending-affinity", app.kubernetes.io/name: "pending-affinity", app.kubernetes.io/part-of: "incidents"}
+    spec:
+      nodeSelector: {disktype: nvme-raid}
+      containers:
+      - name: pending-affinity
+        image: nginx:1.25
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 400m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data-claim, namespace: incidents}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: nonexistent-class
+  resources: {requests: {storage: 10Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pvc-stuck, namespace: incidents, labels: {app: pvc-stuck}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: pvc-stuck}}
+  template:
+    metadata: {labels: {app: pvc-stuck}}
+    spec:
+      containers:
+      - {name: app, image: nginx:1.25, volumeMounts: [{name: data, mountPath: /data}]}
+      volumes:
+      - {name: data, persistentVolumeClaim: {claimName: data-claim}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: report-always-fails, namespace: incidents, labels: {app: report-always-fails}}
+spec:
+  backoffLimit: 3
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: {app: "report-always-fails", job-name: "report-always-fails", sim.skiff.dev/state: "error"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: batch-runner
+      containers:
+      - {name: main, image: registry.example.com/data/report:2.0.1, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: ok-job, namespace: incidents, labels: {app: ok-job}}
+spec:
+  backoffLimit: 3
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: {app: "ok-job", job-name: "ok-job"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: batch-runner
+      containers:
+      - {name: main, image: busybox:1.36, command: [sh, -c, "run-task"], resources: {requests: {cpu: 100m, memory: 128Mi}}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: debug-shell, namespace: incidents, labels: {app: debug-shell, purpose: debug}}
+spec:
+  containers:
+  - {name: shell, image: busybox:1.36, command: [sleep, "3600"], resources: {requests: {cpu: 10m, memory: 16Mi}}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: multi-container, namespace: incidents, labels: {app: multi-container}}
+spec:
+  initContainers:
+  - {name: init-db, image: busybox:1.36, command: [sh, -c, "echo init"]}
+  containers:
+  - {name: app, image: nginx:1.25, resources: {requests: {cpu: 50m, memory: 64Mi}}}
+  - {name: sidecar-proxy, image: envoyproxy/envoy:v1.30, resources: {requests: {cpu: 50m, memory: 64Mi}}}
+  - {name: log-agent, image: fluent/fluent-bit:3.1.0, resources: {requests: {cpu: 10m, memory: 32Mi}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: notebook, namespace: team-a, labels: {app: "notebook", app.kubernetes.io/name: "notebook", app.kubernetes.io/part-of: "team-a"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: notebook}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "notebook", app.kubernetes.io/name: "notebook", app.kubernetes.io/part-of: "team-a"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "200m", kwok.x-k8s.io/usage-memory: "700Mi"}
+    spec:
+      containers:
+      - name: notebook
+        image: jupyter/base-notebook:2024-06
+        ports: [{name: http, containerPort: 8888}]
+        resources: {requests: {cpu: 500m, memory: 1Gi}, limits: {cpu: 2000m, memory: 2048Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api-dev, namespace: team-a, labels: {app: "api-dev", app.kubernetes.io/name: "api-dev", app.kubernetes.io/part-of: "team-a"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: api-dev}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "api-dev", app.kubernetes.io/name: "api-dev", app.kubernetes.io/part-of: "team-a"}
+      annotations: {kwok.x-k8s.io/usage-cpu: "25m", kwok.x-k8s.io/usage-memory: "80Mi"}
+    spec:
+      containers:
+      - name: api-dev
+        image: registry.example.com/team-a/api:dev
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis-dev, namespace: team-a, labels: {app: "redis-dev", app.kubernetes.io/name: "redis-dev", app.kubernetes.io/part-of: "team-a"}}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: redis-dev}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "redis-dev", app.kubernetes.io/name: "redis-dev", app.kubernetes.io/part-of: "team-a"}
+    spec:
+      containers:
+      - name: redis-dev
+        image: redis:7.2-alpine
+        ports: [{name: http, containerPort: 6379}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api-dev, namespace: team-a, labels: {app: api-dev}}
+spec:
+  type: ClusterIP
+  selector: {app: api-dev}
+  ports:
+  - {name: http, port: 8080, targetPort: 8080, protocol: TCP}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: settings, namespace: team-a}
+data:
+  DEBUG: |
+    true
+  REGION: |
+    eu-west-1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: demo-app, namespace: team-b, labels: {app: "demo-app", app.kubernetes.io/name: "demo-app", app.kubernetes.io/part-of: "team-b"}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: demo-app}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: "demo-app", app.kubernetes.io/name: "demo-app", app.kubernetes.io/part-of: "team-b"}
+    spec:
+      containers:
+      - name: demo-app
+        image: nginx:1.25-alpine
+        ports: [{name: http, containerPort: 80}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: demo-app-lb, namespace: team-b, labels: {app: demo-app}}
+spec:
+  type: LoadBalancer
+  selector: {app: demo-app}
+  ports:
+  - {name: http, port: 80, targetPort: 80, protocol: TCP}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: settings, namespace: team-b}
+data:
+  DEBUG: |
+    false

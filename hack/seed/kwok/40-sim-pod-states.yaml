@@ -1,0 +1,496 @@
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-crashloop
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'crashloop'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: BackOff
+      message: "Back-off restarting failed container"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "7" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        lastState:
+          terminated:
+            exitCode: 1
+            reason: Error
+            startedAt: {{ $now | Quote }}
+            finishedAt: {{ $now | Quote }}
+        state:
+          waiting:
+            reason: CrashLoopBackOff
+            message: "back-off 5m0s restarting failed container"
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Running
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-oomkilled
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'oomkilled'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: BackOff
+      message: "Back-off restarting failed container (OOMKilled)"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "12" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        lastState:
+          terminated:
+            exitCode: 137
+            reason: OOMKilled
+            startedAt: {{ $now | Quote }}
+            finishedAt: {{ $now | Quote }}
+        state:
+          waiting:
+            reason: CrashLoopBackOff
+            message: "back-off 5m0s restarting failed container"
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Running
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-imagepull
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'imagepull'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: Failed
+      message: "Failed to pull image: rpc error - code = NotFound desc = manifest unknown"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "0" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        state:
+          waiting:
+            reason: ImagePullBackOff
+            message: "Back-off pulling image"
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Pending
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-errimagepull
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'errimagepull'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: Failed
+      message: "Error ErrImagePull - pull access denied, repository does not exist or may require authorization"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "0" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        state:
+          waiting:
+            reason: ErrImagePull
+            message: "pull access denied, repository does not exist or may require authorization"
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Pending
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-configerror
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'configerror'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: Failed
+      message: "Error - couldn't find key DATABASE_URL in Secret"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "0" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        state:
+          waiting:
+            reason: CreateContainerConfigError
+            message: "secret \"app-secrets\" not found"
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Pending
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-error
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'error'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: Failed
+      message: "Container exited with a non-zero status"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "0" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: PodFailed
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: PodFailed
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: false
+        restartCount: {{ $restarts }}
+        state:
+          terminated:
+            exitCode: 1
+            reason: Error
+            message: "task failed: upstream returned 503"
+            startedAt: {{ $now | Quote }}
+            finishedAt: {{ $now | Quote }}
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Failed
+      startTime: {{ $now | Quote }}
+---
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: sim-pod-notready
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Pod
+  selector:
+    matchExpressions:
+    - key: '.metadata.labels["sim.skiff.dev/state"]'
+      operator: 'In'
+      values:
+      - 'notready'
+    - key: '.metadata.deletionTimestamp'
+      operator: 'DoesNotExist'
+    - key: '.status.phase'
+      operator: 'In'
+      values:
+      - 'Pending'
+    - key: '.status.conditions.[] | select( .type == "Initialized" ) | .status'
+      operator: 'In'
+      values:
+      - 'True'
+    - key: '.status.containerStatuses.[].state.waiting.reason'
+      operator: 'In'
+      values:
+      - 'ContainerCreating'
+      - 'PodInitializing'
+  weight: 10000
+  delay:
+    durationMilliseconds: 1500
+    jitterDurationMilliseconds: 3000
+  next:
+    event:
+      type: Warning
+      reason: Unhealthy
+      message: "Readiness probe failed: HTTP probe failed with statuscode: 503"
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $restarts := or ( index ( or .metadata.annotations dict ) "sim.skiff.dev/restarts" ) "0" }}
+      conditions:
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: Ready
+      - lastProbeTime: null
+        lastTransitionTime: {{ $now | Quote }}
+        status: "False"
+        reason: ContainersNotReady
+        type: ContainersReady
+      containerStatuses:
+      {{ range $index, $item := .spec.containers }}
+      - image: {{ $item.image | Quote }}
+        name: {{ $item.name | Quote }}
+        ready: false
+        started: true
+        restartCount: {{ $restarts }}
+        state:
+          running:
+            startedAt: {{ $now | Quote }}
+      {{ end }}
+      hostIP: {{ NodeIPWith .spec.nodeName | Quote }}
+      podIP: {{ PodIPWith .spec.nodeName ( or .spec.hostNetwork false ) ( or .metadata.uid "" ) ( or .metadata.name "" ) ( or .metadata.namespace "" ) | Quote }}
+      phase: Running
+      startTime: {{ $now | Quote }}

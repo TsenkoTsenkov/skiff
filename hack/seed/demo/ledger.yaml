@@ -1,0 +1,19 @@
+# payments/ledger: applied twice by seed/demo.sh. v1 rolls out healthy; v2 (bad image) gets stuck mid-rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ledger, namespace: payments, labels: {app: ledger, app.kubernetes.io/name: ledger}}
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector: {matchLabels: {app: ledger}}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  template:
+    metadata:
+      labels: {app: ledger, app.kubernetes.io/name: ledger@STATELABEL@}
+      annotations: {kwok.x-k8s.io/usage-cpu: 90m, kwok.x-k8s.io/usage-memory: 300Mi}
+    spec:
+      containers:
+      - name: ledger
+        image: registry.example.com/payments/ledger:@VERSION@
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 200m, memory: 256Mi}, limits: {cpu: 800m, memory: 512Mi}}
