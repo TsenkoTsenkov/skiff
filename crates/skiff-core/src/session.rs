@@ -31,8 +31,8 @@ const IDLE_EVICT_SECS: i64 = 180;
 /// The same, while the UI is not painting at all (hidden or minimised).
 const HIDDEN_EVICT_SECS: i64 = 900;
 const METRICS_INTERVAL: Duration = Duration::from_secs(15);
-/// Upper bound for one-shot requests (get, apply, delete, ...).
-const JOB_TIMEOUT: Duration = Duration::from_secs(45);
+/// Upper bound for one-shot requests (get, delete, scale, ...).
+const JOB_TIMEOUT: Duration = ops::REQUEST_TIMEOUT;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextInfo {
@@ -602,15 +602,27 @@ impl Session {
         T: Send + 'static,
         F: Future<Output = Result<T, String>> + Send,
     {
+        self.job_within(Some(JOB_TIMEOUT), f)
+    }
+
+    /// `limit: None` is for work that bounds each of its requests itself.
+    fn job_within<T, F>(&self, limit: Option<Duration>, f: impl FnOnce(Client) -> F + Send + 'static) -> Job<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, String>> + Send,
+    {
         let job = Job::new();
         let (j, notify, client) = (job.clone(), self.notify.clone(), self.client());
         self.handle.spawn(async move {
             let res = match client.await {
                 // One-shot requests never hang forever: a stalled server
                 // must not leave a dialog or a spinner waiting indefinitely.
-                Ok(c) => match tokio::time::timeout(JOB_TIMEOUT, f(c)).await {
-                    Ok(res) => res,
-                    Err(_) => Err(format!("no response from the API server within {} s", JOB_TIMEOUT.as_secs())),
+                Ok(c) => match limit {
+                    Some(limit) => match tokio::time::timeout(limit, f(c)).await {
+                        Ok(res) => res,
+                        Err(_) => Err(format!("no response from the API server within {} s", limit.as_secs())),
+                    },
+                    None => f(c).await,
                 },
                 Err(e) => Err(e),
             };
@@ -632,7 +644,9 @@ impl Session {
 
     pub fn apply_manifest(&self, yaml: String) -> Job<Vec<String>> {
         let discovered = self.discovered();
-        self.job(move |c| async move { ops::apply_manifest(&c, &discovered, &yaml).await })
+        // A manifest can hold hundreds of documents: each request has its
+        // own time limit rather than the whole job.
+        self.job_within(None, move |c| async move { ops::apply_manifest(&c, &discovered, &yaml).await })
     }
 
     pub fn delete_object(&self, key: &ResourceKey, ns: &str, name: &str, force: bool) -> Job<()> {

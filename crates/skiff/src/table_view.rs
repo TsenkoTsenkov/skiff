@@ -32,6 +32,8 @@ pub struct TableUi {
     /// state) changes.
     pub scroll_y: f32,
     pub last_cols: usize,
+    /// uid of the row the open context menu was opened on.
+    pub menu_uid: Option<Box<str>>,
 }
 
 /// A column as displayed: either from the snapshot or computed in the UI.
@@ -119,7 +121,9 @@ fn droppability(c: &DCol, snap: &Snapshot) -> u8 {
 /// Columns to draw, in order. When `available` is too narrow for all of
 /// them (e.g. the detail panel is open) the least important ones are left
 /// out instead of clipping the table.
-pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
+/// The columns ticked in the column chooser, before any are dropped for
+/// lack of space. Never empty for a table that has columns.
+pub fn chosen_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics) -> Vec<DCol> {
     let mut out = Vec::with_capacity(snap.columns.len() + 2);
     let pod_metrics = key.is("", "pods") && metrics.available;
     let shown = |title: &str| tui.col_visible.get(title).copied().unwrap_or(true);
@@ -136,6 +140,17 @@ pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metric
             out.push(DCol::Real(i));
         }
     }
+    if out.is_empty() && !snap.columns.is_empty() {
+        // A remembered choice can hide everything (the chooser itself keeps
+        // the last column ticked): a table always shows something.
+        let name = snap.columns.iter().position(|c| c.source == ColSource::Name);
+        out.push(DCol::Real(name.unwrap_or(0)));
+    }
+    out
+}
+
+pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
+    let mut out = chosen_columns(key, snap, tui, metrics);
     const GAP: f32 = 8.0;
     let mut total: f32 = out.iter().map(|c| dcol_width(c, snap).0 + GAP).sum();
     while total > available {
@@ -440,6 +455,10 @@ pub fn show(
 ) -> TableOutput {
     let snap = &cache.snap;
     let mut out = TableOutput::default();
+    if cols.is_empty() {
+        // (A row without cells is not something the table widget can draw.)
+        return out;
+    }
     let (sort_title, sort_desc) = effective_sort(snap, tui);
     let mut clicked_header: Option<String> = None;
     let selected_uid = tui.selected.clone();
@@ -447,6 +466,14 @@ pub fn show(
     let is_nodes = key.is("", "nodes");
 
     ui.spacing_mut().item_spacing.y = 0.0;
+    // No elastic overscroll: besides being out of place in a data table, it
+    // misfires when a scroll position is carried over (below) into stored
+    // state that still remembers a shorter list, and the table then coasts
+    // away from the row that was just opened.
+    ui.spacing_mut().scroll.kinetic.rubber_band = false;
+    // The context menu belongs to a row position; rows can move under it.
+    let mut menu_uid = tui.menu_uid.take();
+    let mut menu_open = false;
     let mut builder = TableBuilder::new(ui)
         // One stored state per column count, so widths the user dragged
         // survive the detail panel opening and closing (which changes how
@@ -587,8 +614,22 @@ pub fn show(
                 if resp.clicked() {
                     out.clicked = Some(row.clone());
                 }
+                if resp.secondary_clicked() {
+                    menu_uid = Some(row.uid.clone());
+                }
                 resp.context_menu(|ui| {
+                    menu_open = true;
+                    // Opened on another object that has since moved away
+                    // from this position (rows were added or removed above
+                    // it): never act on whatever took its place.
+                    if *menu_uid.get_or_insert_with(|| row.uid.clone()) != row.uid {
+                        ui.close();
+                        return;
+                    }
                     ui.set_min_width(170.0);
+                    ui.set_max_width(260.0);
+                    ui.add(egui::Label::new(RichText::new(&*row.name).color(pal.muted).size(12.0)).truncate());
+                    ui.separator();
                     for (action, ic, label) in &menu_items {
                         if matches!(action, RowAction::Delete) {
                             ui.separator();
@@ -605,6 +646,7 @@ pub fn show(
         });
 
     tui.scroll_y = scroll.state.clamped_offset().y;
+    tui.menu_uid = menu_uid.filter(|_| menu_open);
 
     if let Some(title) = clicked_header {
         tui.sort = Some(if title.eq_ignore_ascii_case(&sort_title) {

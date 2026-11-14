@@ -40,13 +40,15 @@ struct EditState {
     /// The YAML the edit started from. "Modified" means different from
     /// this, not from the live object, which keeps changing underneath.
     base: String,
+    /// resourceVersion of the object `base` was taken from.
+    base_rv: String,
     job: Option<Job<ObjectData>>,
     error: Option<String>,
 }
 
 impl EditState {
-    fn start(yaml: &str) -> Self {
-        EditState { text: yaml.to_string(), base: yaml.to_string(), job: None, error: None }
+    fn start(obj: &ObjectData) -> Self {
+        EditState { text: obj.yaml.clone(), base: obj.yaml.clone(), base_rv: obj.rv.clone(), job: None, error: None }
     }
 
     fn modified(&self) -> bool {
@@ -168,7 +170,7 @@ impl Detail {
             return;
         }
         match &self.obj {
-            Some(obj) => self.edit = Some(EditState::start(&obj.yaml)),
+            Some(obj) => self.edit = Some(EditState::start(obj)),
             None => self.want_edit = true,
         }
     }
@@ -202,7 +204,7 @@ impl Detail {
                         self.obj_error = None;
                         if self.want_edit {
                             self.want_edit = false;
-                            self.edit = Some(EditState::start(&obj.yaml));
+                            self.edit = Some(EditState::start(&obj));
                         }
                         self.obj = Some(obj);
                         // Related data may have changed with the object.
@@ -411,8 +413,16 @@ impl Detail {
         let Some(obj) = &self.obj else { return };
         if let Some(edit) = &mut self.edit {
             let saving = edit.job.is_some();
+            // The object changes underneath (status updates, other people).
+            // Untouched, the editor simply follows it. With changes typed,
+            // an apply would be refused as a conflict: say so up front.
+            if obj.rv != edit.base_rv && !saving && !edit.modified() {
+                *edit = EditState::start(obj);
+            }
+            let outdated = obj.rv != edit.base_rv;
             let mut apply = false;
             let mut cancel = false;
+            let mut reload = false;
             ui.horizontal(|ui| {
                 let label = (widgets::icon(icons::ICON_SAVE, 15.0), "Apply");
                 if ui.add_enabled(!saving, egui::Button::new(label)).on_hover_text("Ctrl+S").clicked() {
@@ -435,6 +445,28 @@ impl Detail {
                     .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
                         ui.add(egui::Label::new(RichText::new(err).color(pal.err)).wrap().selectable(true));
+                    });
+            }
+            if outdated && !saving {
+                Frame::new()
+                    .fill(pal.tint(pal.warn, 0.12))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("This object has changed on the server since you started editing, so applying will be refused.")
+                                    .color(pal.text)
+                                    .size(12.5),
+                            );
+                            if ui
+                                .button("Load the latest version")
+                                .on_hover_text("Replaces the text below; copy your changes first if you need them")
+                                .clicked()
+                            {
+                                reload = true;
+                            }
+                        });
                     });
             }
             if !overlay_open && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
@@ -462,12 +494,18 @@ impl Detail {
                         .desired_width(f32::INFINITY)
                         .desired_rows(30)
                         .frame(egui::Frame::NONE)
+                        // Read-only while a save is on its way: what is
+                        // typed then would vanish when it succeeds.
+                        .interactive(!saving)
                         .layouter(&mut layouter),
                 );
             });
             if apply && !saving {
                 edit.error = None;
                 edit.job = Some(session.replace_object(&self.key, &self.ns, &self.name, edit.text.clone()));
+            }
+            if reload {
+                *edit = EditState::start(obj);
             }
             if cancel {
                 self.edit = None;

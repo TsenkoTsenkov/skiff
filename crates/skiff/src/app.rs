@@ -83,8 +83,9 @@ pub struct Toast {
 enum Pending {
     Simple { job: Job<()>, ok: String },
     Forward { job: Job<Arc<PortForward>>, context: String },
-    /// A manifest apply whose dialog was closed before it finished.
-    Apply { job: Job<Vec<String>> },
+    /// A manifest apply whose dialog was closed before it finished. The
+    /// manifest is kept so that a failure can hand it back.
+    Apply { job: Job<Vec<String>>, text: String },
 }
 
 /// Modal dialogs.
@@ -104,8 +105,9 @@ pub enum Dialog {
         focused: bool,
     },
     Forward(ForwardDialog),
-    /// Create or update objects from a YAML manifest.
-    Create { text: String, job: Option<Job<Vec<String>>>, error: Option<String> },
+    /// Create or update objects from a YAML manifest. `pristine` is the
+    /// text the dialog opened with: untouched, it can be dismissed freely.
+    Create { text: String, pristine: String, job: Option<Job<Vec<String>>>, error: Option<String> },
 }
 
 pub struct ForwardDialog {
@@ -387,6 +389,13 @@ impl SkiffApp {
         self.cache.row(index).map(|r| (r.name.to_string(), r.namespace.to_string()))
     }
 
+    /// Name and namespace of the highlighted row of the current table.
+    pub fn selected_row(&self) -> Option<(String, String)> {
+        let View::Resource(key) = &self.view else { return None };
+        let uid = self.tables.get(&key.id())?.selected.as_deref()?;
+        self.row_at(self.cache.position(uid)?)
+    }
+
     /// Time the last filter + sort pass took.
     pub fn last_table_cost(&self) -> Duration {
         self.cache.last_cost()
@@ -425,6 +434,10 @@ impl SkiffApp {
     fn poll(&mut self) {
         let mut toasts = Vec::new();
         let sessions = &self.sessions;
+        // A background apply that failed gets its dialog back, manifest and
+        // error included, as soon as no other dialog is in the way.
+        let dialog_free = self.dialog.is_none();
+        let mut reopen: Option<(String, String)> = None;
         self.pending.retain(|p| match p {
             Pending::Simple { job, ok } => match job.take() {
                 None => true,
@@ -437,17 +450,24 @@ impl SkiffApp {
                     false
                 }
             },
-            Pending::Apply { job } => match job.take() {
-                None => true,
-                Some(Ok(lines)) => {
-                    toasts.push((lines.join("\n"), Tone::Ok));
-                    false
+            Pending::Apply { job, text } => {
+                let failed = job.peek(|r| matches!(r, Some(Err(_))));
+                if failed && (!dialog_free || reopen.is_some()) {
+                    return true;
                 }
-                Some(Err(e)) => {
-                    toasts.push((e, Tone::Err));
-                    false
+                match job.take() {
+                    None => true,
+                    Some(Ok(lines)) => {
+                        toasts.push((apply_summary(&lines), Tone::Ok));
+                        false
+                    }
+                    Some(Err(e)) => {
+                        toasts.push(("Applying the manifest failed".to_string(), Tone::Err));
+                        reopen = Some((text.clone(), e));
+                        false
+                    }
                 }
-            },
+            }
             Pending::Forward { job, context } => match job.take() {
                 None => true,
                 Some(Ok(fwd)) => {
@@ -469,6 +489,9 @@ impl SkiffApp {
         for (t, tone) in toasts {
             self.toast(t, tone);
         }
+        if let Some((text, error)) = reopen {
+            self.dialog = Some(Dialog::Create { text, pristine: String::new(), job: None, error: Some(error) });
+        }
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
 
@@ -484,7 +507,7 @@ impl SkiffApp {
         }
         if let Some(lines) = applied {
             self.dialog = None;
-            self.toast(lines.join("\n"), Tone::Ok);
+            self.toast(apply_summary(&lines), Tone::Ok);
         }
         if let Some(Dialog::Scale { replicas, current, error, .. }) = &mut self.dialog {
             if let Some(res) = current.as_ref().and_then(|j| j.take()) {
@@ -672,7 +695,7 @@ impl SkiffApp {
         let template = format!(
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: example\n  namespace: {ns}\ndata:\n  key: value\n"
         );
-        self.dialog = Some(Dialog::Create { text: template, job: None, error: None });
+        self.dialog = Some(Dialog::Create { pristine: template.clone(), text: template, job: None, error: None });
     }
 
     pub fn run_command(&mut self, ctx: &egui::Context, cmd: Command) {
@@ -1241,16 +1264,20 @@ impl SkiffApp {
                     .show(|ui| {
                         ui.set_min_width(180.0);
                         widgets::caption(ui, "Columns", &pal);
+                        // The last column standing cannot be switched off.
+                        let last_one = table_view::chosen_columns(key, &snap, tui, &metrics).len() <= 1;
                         for col in snap.columns.iter() {
                             let mut on = tui.col_visible.get(&*col.title).copied().unwrap_or(col.visible);
-                            if ui.checkbox(&mut on, &*col.title).changed() {
+                            let locked = on && last_one;
+                            if ui.add_enabled(!locked, egui::Checkbox::new(&mut on, &*col.title)).changed() {
                                 tui.col_visible.insert(col.title.to_string(), on);
                             }
                         }
                         if key.is("", "pods") && metrics.available {
                             for title in ["CPU", "Memory"] {
                                 let mut on = tui.col_visible.get(title).copied().unwrap_or(true);
-                                if ui.checkbox(&mut on, title).changed() {
+                                let locked = on && last_one;
+                                if ui.add_enabled(!locked, egui::Checkbox::new(&mut on, title)).changed() {
                                     tui.col_visible.insert(title.to_string(), on);
                                 }
                             }
@@ -1363,9 +1390,14 @@ impl SkiffApp {
 
         let mut to_open: Option<Arc<Row>> = None;
         if let Some(row) = out.clicked {
-            tui.selected = Some(row.uid.clone());
-            // Opening the panel narrows the table; keep the row in view.
-            tui.scroll_to_selected = self.detail.is_none();
+            // With unsaved YAML edits the panel stays on its object (and
+            // says why); the highlight must stay with it.
+            let refused = editing && !self.detail.as_ref().is_some_and(|d| d.is_for(key, &row.namespace, &row.name));
+            if !refused {
+                tui.selected = Some(row.uid.clone());
+                // Opening the panel narrows the table; keep the row in view.
+                tui.scroll_to_selected = self.detail.is_none();
+            }
             to_open = Some(row);
         } else if open_selected {
             to_open = tui
@@ -1482,7 +1514,7 @@ impl SkiffApp {
         // A dialog holding typed text or a running request is only closed
         // by its own buttons, not by Esc or a click outside.
         let sticky = match dialog {
-            Dialog::Create { job, .. } => job.is_some() || !fresh,
+            Dialog::Create { job, text, pristine, .. } => job.is_some() || text != pristine,
             _ => false,
         };
         let mut close = false;
@@ -1524,15 +1556,31 @@ impl SkiffApp {
                     let mut submitted = false;
                     ui.horizontal(|ui| {
                         ui.label("Replicas");
-                        let edit = ui.add(egui::TextEdit::singleline(replicas).hint_text("count").desired_width(70.0));
-                        // Focus once the current size is in the field (or
-                        // could not be read): focusing it while empty would
-                        // leave the caret in front of the number.
-                        if current.is_none() && !*focused {
+                        // The field is usable once the current size is in
+                        // it (or could not be read): a caret placed in the
+                        // empty field would end up in front of the number.
+                        let ready = current.is_none();
+                        let field = egui::TextEdit::singleline(replicas).hint_text("count").desired_width(70.0);
+                        let edit = ui.add_enabled(ready, field);
+                        if ready && !*focused {
                             *focused = true;
                             edit.request_focus();
                         }
-                        submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        // Enter confirms, but only a fresh key press: a key
+                        // still held from opening the dialog (auto-repeat)
+                        // must not send the prefilled number off unseen.
+                        let (enter, repeated) = ui.input(|i| {
+                            let pressed = |repeat: bool| {
+                                i.events.iter().any(|e| {
+                                    matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, repeat: r, .. } if *r == repeat)
+                                })
+                            };
+                            (pressed(false), pressed(true))
+                        });
+                        submitted = edit.lost_focus() && enter;
+                        if edit.lost_focus() && repeated && !enter {
+                            edit.request_focus();
+                        }
                         if current.is_some() {
                             ui.spinner();
                         }
@@ -1565,7 +1613,7 @@ impl SkiffApp {
                         }
                     });
                 }
-                Dialog::Create { text, job, error } => {
+                Dialog::Create { text, job, error, .. } => {
                     ui.set_width(640.0);
                     ui.label(widgets::semibold("Create or update from YAML", 15.0));
                     ui.label(
@@ -1579,7 +1627,11 @@ impl SkiffApp {
                     } else {
                         egui_extras::syntax_highlighting::CodeTheme::light(12.5)
                     };
-                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    // The dialog must fit the window whatever it holds, or
+                        // its buttons end up out of reach.
+                    let room = (ui.ctx().content_rect().height() - 260.0).max(120.0);
+                    let editor_height = room.min(420.0);
+                    egui::ScrollArea::vertical().id_salt("create-yaml").max_height(editor_height).show(ui, |ui| {
                         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
                             let job = egui_extras::syntax_highlighting::highlight(
                                 ui.ctx(),
@@ -1595,13 +1647,17 @@ impl SkiffApp {
                                 .code_editor()
                                 .hint_text("apiVersion: …")
                                 .desired_width(f32::INFINITY)
-                                .desired_rows(18)
+                                .desired_rows(((editor_height / 17.0) as usize).clamp(4, 18))
                                 .layouter(&mut layouter),
                         );
                     });
                     if let Some(err) = error {
                         ui.add_space(4.0);
-                        ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+                        // One line per document: a long manifest must not
+                        // push the buttons below the window.
+                        egui::ScrollArea::vertical().id_salt("create-error").max_height(110.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+                        });
                     }
                     ui.add_space(10.0);
                     let busy = job.is_some();
@@ -1618,7 +1674,7 @@ impl SkiffApp {
                         let label = if busy { "Close" } else { "Cancel" };
                         if ui.button(label).clicked() {
                             if let Some(running) = job.take() {
-                                push = Some(Pending::Apply { job: running });
+                                push = Some(Pending::Apply { job: running, text: std::mem::take(text) });
                             }
                             close = true;
                         }
@@ -1705,13 +1761,15 @@ impl SkiffApp {
         }
         let pal = self.pal;
         egui::Area::new(egui::Id::unique("toasts"))
-            // Top right: clear of the dock and of the tables' action buttons.
-            .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, TOP_BAR_HEIGHT + 10.0))
+            // Bottom centre, above the status bar: the one place with no
+            // controls under it (the detail panel's and the tables' buttons
+            // are along the top and the right).
+            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -34.0))
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                    for t in self.toasts.iter().rev() {
+                ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                    for t in self.toasts.iter() {
                         let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
                         Frame::new()
                             .fill(pal.raised)
@@ -1731,6 +1789,18 @@ impl SkiffApp {
             });
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// What a successful apply did, short enough for a notification however
+/// many documents the manifest had.
+fn apply_summary(lines: &[String]) -> String {
+    const SHOWN: usize = 6;
+    if lines.len() <= SHOWN {
+        return lines.join("\n");
+    }
+    let mut text = lines[..SHOWN].join("\n");
+    text.push_str(&format!("\n… and {} more", lines.len() - SHOWN));
+    text
 }
 
 impl eframe::App for SkiffApp {

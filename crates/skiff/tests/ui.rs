@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::accesskit::Role;
-use egui_kittest::kittest::Queryable as _;
+use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use egui_kittest::Harness;
 use skiff::{AppOptions, SkiffApp};
 
@@ -408,6 +408,11 @@ fn unsaved_yaml_edits_block_navigation() {
     assert_eq!(detail.name, editing, "the edited object must stay open");
     assert!(detail.has_unsaved_edit(), "the edit must survive");
     assert!(has_label_containing(&h, "Apply or cancel"), "the user is told why");
+    assert_eq!(
+        h.state().selected_row().map(|(name, _)| name).as_deref(),
+        Some(editing.as_str()),
+        "the highlight stays on the object in the panel"
+    );
     shot(&mut h, "20_unsaved_edit_guard");
 
     // Esc must not discard typed text either; Cancel does.
@@ -496,4 +501,252 @@ fn delete_dialog_waits_for_an_explicit_confirmation() {
     }
     assert!(h.state().dialog.is_none());
     assert_eq!(kubectl(&["-n", &ns, "get", "cm", &name, "-o", "jsonpath={.metadata.name}"]), name);
+}
+
+fn steps(h: &mut Harness<'static, SkiffApp>, n: usize) {
+    for _ in 0..n {
+        h.step();
+    }
+}
+
+#[test]
+fn the_last_column_cannot_be_hidden() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 3);
+    h.get_by_label("Choose columns").click();
+    settle(&mut h, "column menu", |h| h.query_all_by_role(Role::CheckBox).next().is_some());
+    // Untick whatever can be unticked, for as long as something can. (This
+    // used to end in a table without columns, which crashed.)
+    for _ in 0..40 {
+        let Some(next) = h
+            .query_all_by_role(Role::CheckBox)
+            .find(|n| n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True) && !n.accesskit_node().is_disabled())
+        else {
+            break;
+        };
+        next.click();
+        steps(&mut h, 3);
+    }
+    let ticked = h
+        .query_all_by_role(Role::CheckBox)
+        .filter(|n| n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True))
+        .count();
+    assert_eq!(ticked, 1, "exactly one column stays on");
+    shot(&mut h, "23_last_column");
+    let (rows, _) = h.state().table_stats();
+    let (first, _) = h.state().row_at(0).unwrap();
+    assert!(rows > 3 && (has_label(&h, &first) || has_label(&h, "Age")), "the table still shows rows");
+}
+
+#[test]
+fn opening_details_keeps_the_clicked_row_in_view() {
+    let Some(ctx) = test_context() else { return };
+    // A short window, so that even a filtered list is longer than a screen.
+    let mut h = harness_with(&ctx, "pods", [1440.0, 600.0], false);
+    settle(&mut h, "pods", |h| h.state().table_stats().1 && h.state().table_stats().0 > 100);
+    let total = h.state().table_stats().0;
+
+    // 1. A shorter (but still scrolling) list with the detail panel open:
+    //    the narrow table layout now remembers that list's length.
+    let mut found = false;
+    for term in ["shop", "monitoring", "payments", "running"] {
+        h.key_press(egui::Key::Slash);
+        h.step();
+        h.get_by_role(Role::TextInput).type_text(term);
+        steps(&mut h, 4);
+        let shown = h.state().table_stats().0;
+        if (25..=110).contains(&shown) {
+            found = true;
+            break;
+        }
+        h.key_press(egui::Key::Escape); // clears the filter: try another
+        steps(&mut h, 2);
+    }
+    if !found {
+        eprintln!("skipping: no filter gives a medium-sized pod list on this cluster");
+        return;
+    }
+    let filtered = h.state().table_stats().0;
+    let (first, _) = h.state().row_at(0).unwrap();
+    h.get_all_by_label(&first).next().expect("first row").click();
+    settle(&mut h, "detail panel", |h| h.state().detail.is_some());
+    assert_eq!(h.state().table_stats().0, filtered, "still the filtered list");
+    h.key_press(egui::Key::Escape); // closes the panel
+    steps(&mut h, 3);
+    assert!(h.state().detail.is_none());
+    h.key_press(egui::Key::Escape); // clears the filter
+    settle(&mut h, "full list", |h| h.state().table_stats().0 == total);
+
+    // 2. Far down the full list, click a row.
+    h.key_press(egui::Key::End);
+    steps(&mut h, 4);
+    let (name, _) = h.state().row_at(total - 4).expect("a row near the end");
+    h.get_all_by_label(&name).next().expect("that row is on screen after End").click();
+    settle(&mut h, "detail panel", |h| h.state().detail.as_ref().is_some_and(|d| d.name == name));
+    // Let any scrolling play out, then the row must still be on screen
+    // (once in the table, apart from the panel's title).
+    for _ in 0..90 {
+        h.step();
+    }
+    shot(&mut h, "24_row_stays_in_view");
+    let table_right = h.get_by_label("YAML").rect().left();
+    let visible = h.query_all_by_label(&name).any(|n| n.rect().right() <= table_right);
+    assert!(visible, "the table scrolled away from the row that was clicked ({name})");
+}
+
+#[test]
+fn row_menu_closes_when_rows_move_under_it() {
+    let Some(ctx) = test_context() else { return };
+    let ns = "default";
+    let extra = "000-skiff-menu-test";
+    let _ = kubectl(&["-n", ns, "delete", "cm", extra, "--ignore-not-found"]);
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 5);
+    let (name, _) = h.state().row_at(3).unwrap();
+    assert!(name.as_str() > extra, "the new object must sort above {name}");
+    h.get_all_by_label(&name).next().expect("row").click_secondary();
+    settle(&mut h, "row menu", |h| has_label_containing(h, "Copy name"));
+    assert_eq!(h.query_all_by_label(&name).count(), 2, "the menu names the object it is for");
+    shot(&mut h, "25_row_menu");
+    // It stays open while nothing moves.
+    steps(&mut h, 10);
+    assert!(has_label_containing(&h, "Copy name"));
+
+    // An object appears above it: every row below moves down by one, and
+    // the menu's position now belongs to another object.
+    kubectl(&["-n", ns, "create", "cm", extra]);
+    settle(&mut h, "the new row", |h| has_label(h, extra));
+    steps(&mut h, 3);
+    let closed = !has_label_containing(&h, "Copy name");
+    let _ = kubectl(&["-n", ns, "delete", "cm", extra, "--ignore-not-found"]);
+    assert!(closed, "a menu opened for {name} must not stay open over a different row");
+}
+
+#[test]
+fn create_dialog_always_fits_and_can_be_left() {
+    let Some(ctx) = test_context() else { return };
+    // The smallest window the app allows.
+    let mut h = harness_with(&ctx, "configmaps", [900.0, 560.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1);
+
+    // Untouched, Esc dismisses it.
+    h.state_mut().open_create_dialog();
+    settle(&mut h, "dialog", |h| has_label(h, "Apply"));
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_none(), "an untouched dialog closes on Esc");
+
+    // Thirty documents that all fail: thirty lines of error.
+    h.state_mut().open_create_dialog();
+    settle(&mut h, "dialog", |h| has_label(h, "Apply"));
+    let mut manifest = String::new();
+    for i in 0..30 {
+        manifest.push_str(&format!("---\napiVersion: v1\nkind: NoSuchKind\nmetadata:\n  name: thing-{i}\n"));
+    }
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).type_text(&manifest);
+    steps(&mut h, 3);
+    h.get_by_label("Apply").click();
+    settle(&mut h, "the error", |h| has_label_containing(h, "unknown resource type"));
+    shot(&mut h, "26_create_error_fits");
+    for label in ["Apply", "Cancel"] {
+        let rect = h.get_all_by_label(label).last().unwrap().rect();
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= 560.0,
+            "{label} button at y={:.0}..{:.0} is outside the 560 px window",
+            rect.top(),
+            rect.bottom()
+        );
+    }
+    // With text typed, Esc does not throw it away; Cancel does.
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_some(), "typed text is not lost to Esc");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_none());
+}
+
+#[test]
+fn held_enter_does_not_confirm_the_scale_dialog() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_with(&ctx, "deployments.apps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    // Enter goes down before the dialog opens and stays down. (egui works
+    // out by itself which key events are repeats of a held key.)
+    h.key_down(egui::Key::Enter);
+    h.step();
+    h.get_by_label("Scale").click();
+    settle(&mut h, "prefilled replica count", |h| {
+        h.query_all_by_role(Role::TextInput).last().and_then(|n| n.value()).is_some_and(|v| !v.is_empty())
+    });
+    for _ in 0..8 {
+        h.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    assert!(h.state().dialog.is_some(), "auto-repeat must not submit the dialog");
+    assert!(!has_label_containing(&h, "Scaled "), "nothing was sent");
+    assert!(h.get_all_by_role(Role::TextInput).last().unwrap().is_focused(), "the field is still ready for typing");
+    h.key_up(egui::Key::Enter);
+    h.step();
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_none());
+}
+
+#[test]
+fn yaml_editor_follows_or_flags_changes_on_the_server() {
+    let Some(ctx) = test_context() else { return };
+    let (ns, name) = ("default", "skiff-edit-test");
+    let _ = kubectl(&["-n", ns, "delete", "cm", name, "--ignore-not-found"]);
+    kubectl(&["-n", ns, "create", "cm", name, "--from-literal=k=v"]);
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 3);
+    h.key_press(egui::Key::Slash);
+    h.step();
+    h.get_by_role(Role::TextInput).type_text(name);
+    settle(&mut h, "filter", |h| h.state().table_stats().0 == 1);
+    h.get_all_by_label(name).next().expect("the row").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    assert_eq!(h.state().detail.as_ref().unwrap().name, name);
+    h.get_by_label("Edit YAML").click();
+    settle(&mut h, "editor", |h| has_label(h, "Cancel"));
+    let editor_text = |h: &Harness<'static, SkiffApp>| h.get_by_role(Role::MultilineTextInput).value().unwrap_or_default();
+
+    // Untouched: the editor follows the object.
+    kubectl(&["-n", ns, "annotate", "cm", name, "skiff-test/one=1"]);
+    settle(&mut h, "editor to follow", |h| editor_text(h).contains("skiff-test/one"));
+    assert!(!has_label_containing(&h, "has changed on the server"));
+
+    // With changes typed: it keeps them and says that applying will fail.
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).type_text("# mine ");
+    steps(&mut h, 3);
+    kubectl(&["-n", ns, "annotate", "cm", name, "skiff-test/two=2"]);
+    settle(&mut h, "the notice", |h| has_label_containing(h, "has changed on the server"));
+    assert!(editor_text(&h).contains("# mine "), "typed text is kept");
+    assert!(!editor_text(&h).contains("skiff-test/two"));
+    shot(&mut h, "27_edit_outdated");
+    h.get_by_label("Load the latest version").click();
+    settle(&mut h, "latest version", |h| editor_text(h).contains("skiff-test/two"));
+    assert!(!h.state().detail.as_ref().unwrap().has_unsaved_edit());
+    assert!(!has_label_containing(&h, "has changed on the server"));
+    h.get_by_label("Cancel").click();
+    h.step();
+    let _ = kubectl(&["-n", ns, "delete", "cm", name, "--ignore-not-found"]);
 }

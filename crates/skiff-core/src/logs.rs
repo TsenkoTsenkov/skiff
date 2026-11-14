@@ -26,6 +26,9 @@ const PING_INTERVAL: Duration = Duration::from_millis(100);
 /// reached (its `sinceTime` has whole-second resolution and line timestamps
 /// are not strictly ordered), and drop what was already delivered.
 const REPLAY_MS: i64 = 5_000;
+/// How long the server may take to start answering a log request (this also
+/// bounds the client's own retries of throttled or unavailable responses).
+const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound on delivered lines remembered for that de-duplication.
 const MAX_REMEMBERED: usize = 200_000;
 
@@ -282,6 +285,9 @@ struct ResumePoint {
     recent: VecDeque<(i64, u64)>,
     /// Fingerprints still expected in the replay, with multiplicity.
     skip: HashMap<u64, u32>,
+    /// Lines stamped before this have been dropped from `recent`, so a
+    /// replay must not reach back that far: they would not be recognised.
+    forgotten_before: i64,
 }
 
 fn fingerprint(time_ms: i64, text: &str) -> u64 {
@@ -294,14 +300,16 @@ fn fingerprint(time_ms: i64, text: &str) -> u64 {
 impl ResumePoint {
     const TAIL: usize = 5;
 
-    /// Timestamp the stream has reached, robust to one outlier.
+    /// Timestamp the stream has reached, robust to one outlier: the (lower)
+    /// median, so that of only two lines the earlier one counts. Resuming
+    /// too early costs a few recognised repeats; too late loses lines.
     fn position(&self) -> Option<i64> {
         if self.tail.is_empty() {
             return None;
         }
         let mut sorted: Vec<i64> = self.tail.iter().copied().collect();
         sorted.sort_unstable();
-        Some(sorted[sorted.len() / 2])
+        Some(sorted[(sorted.len() - 1) / 2])
     }
 
     /// Returns whether the line should be delivered.
@@ -329,9 +337,12 @@ impl ResumePoint {
         // line shows up once more after a reconnect).
         let since = self.position().unwrap_or(time_ms) - REPLAY_MS - 1_000;
         while let Some((t, _)) = self.recent.front() {
-            let stale = *t < since || *t > since + 3_600_000 || self.recent.len() > MAX_REMEMBERED;
-            if !stale {
+            let old = *t < since;
+            if !(old || *t > since + 3_600_000 || self.recent.len() > MAX_REMEMBERED) {
                 break;
+            }
+            if old {
+                self.forgotten_before = self.forgotten_before.max(since);
             }
             self.recent.pop_front();
         }
@@ -346,7 +357,12 @@ impl ResumePoint {
         for (_, fp) in &self.recent {
             *self.skip.entry(*fp).or_insert(0) += 1;
         }
-        Some(position - REPLAY_MS)
+        // The position can move backwards (a burst of lines from the other
+        // output stream, stamped a little earlier). Never ask for lines
+        // that were already forgotten; the server rounds the time down to
+        // a whole second, hence the rounding up here.
+        let forgotten = self.forgotten_before + (-self.forgotten_before).rem_euclid(1000);
+        Some((position - REPLAY_MS).max(forgotten))
     }
 }
 
@@ -405,12 +421,17 @@ async fn pump(
         // Whether this attempt got anywhere: it delivered a line, or the
         // connection was established and stayed up for a while.
         let mut healthy = false;
-        match pods.log_stream(&target.pod, &lp).await {
-            Err(e) => {
+        let opening = match tokio::time::timeout(OPEN_TIMEOUT, pods.log_stream(&target.pod, &lp)).await {
+            Ok(Ok(reader)) => Ok(reader),
+            Ok(Err(e)) => Err((is_gone(&e), friendly(&e))),
+            Err(_) => Err((false, "no response from the API server".to_string())),
+        };
+        match opening {
+            Err((gone, why)) => {
                 // The very first attempt failing, or the pod being gone, is
                 // final; anything else after we were connected is retried.
-                if !connected_once || is_gone(&e) || !opts.follow || opts.previous {
-                    let state = if connected_once { SourceState::Ended } else { SourceState::Failed(friendly(&e)) };
+                if !connected_once || gone || !opts.follow || opts.previous {
+                    let state = if connected_once { SourceState::Ended } else { SourceState::Failed(why) };
                     shared.set_state(idx, state);
                     notify.ping();
                     return;
@@ -602,7 +623,12 @@ mod tests {
         // One line stamped an hour ahead, even as the very last line before
         // the connection drops, must not make the resume skip an hour.
         assert!(r.admit(10_300 + hour, "from the future"));
-        assert_eq!(r.begin_resume(), Some(10_200 - REPLAY_MS));
+        assert_eq!(r.begin_resume(), Some(10_100 - REPLAY_MS));
+        // The same with only two lines to go by: the earlier one counts.
+        let mut r = ResumePoint::default();
+        assert!(r.admit(10_000, "first"));
+        assert!(r.admit(10_000 + hour, "from the future"));
+        assert_eq!(r.begin_resume(), Some(10_000 - REPLAY_MS));
         // ... and neither may one stamped far in the past pull it back.
         let mut r = ResumePoint::default();
         for t in [50_000_000, 50_000_100, 50_000_200, 1_000, 50_000_300] {
@@ -630,6 +656,60 @@ mod tests {
         let duplicates = replayed.filter(|(t, text)| r.admit(*t, text)).count();
         assert_eq!(duplicates, 0, "replayed lines must all be recognised");
         assert!(r.admit(base + 2_000 * 3, "seq=2000"), "new lines are delivered");
+    }
+
+    /// Plays a container log through kills and resumes the way the kubelet
+    /// serves it: after each kill, everything stamped at or after the resume
+    /// time (rounded down to a second) is sent again, in file order.
+    /// Returns how often each line was delivered.
+    fn deliveries(log: &[(i64, String)], kills: &[usize]) -> Vec<u32> {
+        let mut r = ResumePoint::default();
+        let mut seen = vec![0u32; log.len()];
+        let mut from = 0;
+        let mut floor = i64::MIN;
+        for end in kills.iter().copied().chain([log.len()]) {
+            for (i, (t, text)) in log.iter().enumerate().take(end).skip(from) {
+                if *t >= floor && r.admit(*t, text) {
+                    seen[i] += 1;
+                }
+            }
+            if end == log.len() {
+                break;
+            }
+            let since = r.begin_resume().unwrap();
+            floor = since - since.rem_euclid(1000);
+            // The replay starts at the first line that qualifies.
+            from = log.iter().position(|(t, _)| *t >= floor).unwrap_or(end);
+        }
+        seen
+    }
+
+    #[test]
+    fn resume_survives_bursts_stamped_earlier() {
+        // stdout lines every 10 ms; after every 20 of them, three stderr
+        // lines stamped `skew` earlier. When those three are the latest
+        // lines, the position moves back, which must not replay lines that
+        // are no longer remembered.
+        for skew in [50i64, 300, 2_000, 4_000] {
+            let mut log = Vec::new();
+            let mut t = 1_700_000_000_000i64;
+            for group in 0..600 {
+                for i in 0..20 {
+                    log.push((t, format!("out {group}/{i}")));
+                    t += 10;
+                }
+                for i in 0..3 {
+                    log.push((t - skew, format!("err {group}/{i}")));
+                    t += 10;
+                }
+            }
+            // Kills at every phase of a group, including right after a burst.
+            let kills: Vec<usize> = (0..40).map(|k| 3_000 + k * 233).collect();
+            let seen = deliveries(&log, &kills);
+            let repeated = seen.iter().filter(|n| **n > 1).count();
+            let missing = seen.iter().filter(|n| **n == 0).count();
+            assert_eq!((repeated, missing), (0, 0), "skew {skew} ms");
+        }
     }
 
     #[test]

@@ -55,8 +55,10 @@ hardware have not been measured yet.
   services, ingresses, nodes, config maps, secrets with reveal/copy, PVCs,
   cron jobs, events, …), conditions, related pods, object events, and links
   between objects
-- YAML view with syntax highlighting; edit and apply with conflict detection;
-  create or update objects from a manifest (server-side apply)
+- YAML view with syntax highlighting; edit and apply with conflict detection
+  (the editor follows the object until you type, and tells you if it changed
+  underneath your edits); create or update objects from a manifest
+  (server-side apply, any number of documents)
 - Pod and workload logs: follow, multi-pod merge, filter, timestamps, wrap,
   previous container, level colouring
 - Port forwarding for pods and services, with a list of active forwards
@@ -68,6 +70,25 @@ hardware have not been measured yet.
   work: `po`, `deploy`, `svc`, …), any loaded object by name, namespace,
   cluster or action
 - Dark and light themes
+
+## When the network misbehaves
+
+- A watch that goes silent is treated as dead after 150 seconds and
+  re-established; waking from sleep triggers an immediate refresh; a request
+  that gets no answer is abandoned after 15 seconds and retried with backoff.
+  The table says so (`reconnecting`, `polling`) instead of showing stale rows
+  as live.
+- If something between you and the API server cuts watches short, or your
+  account may list but not watch, the table falls back to polling every ten
+  seconds and tries watching again later.
+- A proxy or load balancer that drops idle connections after 30 or 45
+  seconds is not mistaken for that: a quiet table keeps its watch, and an
+  occasional list confirms that nothing was missed. Only if that list shows
+  changes the watch never delivered does the table switch to polling.
+- Log following survives dropped connections and container restarts without
+  losing or repeating lines, and follows a reconnect to new credentials.
+- Closing a log tab, a shell or a port-forward closes its connection on the
+  server too; the tests check this against the API server's own metrics.
 
 ## Build and run
 
@@ -133,13 +154,17 @@ Tests:
 cargo test
 ```
 
-The UI tests in `crates/skiff/tests/ui.rs` drive the real app headlessly
-against the `demo` cluster and write screenshots to `target/shots/`, and
-`crates/skiff-core/tests/live.rs` checks that background work really stops
-and reconnects really recover. Both are skipped when the cluster is not
-running; rendering uses a software Vulkan driver (`mesa-vulkan-drivers` on
-Linux). `crates/skiff/tests/qa_flows.rs` holds a larger, slower set of
-exploratory flows that is opt-in (see the note at the top of that file).
+The unit tests need nothing; the watch engine's are run against a small
+in-process fake API server. The UI tests in `crates/skiff/tests/ui.rs` drive
+the real app headlessly against the `demo` cluster and write screenshots to
+`target/shots/`, and `crates/skiff-core/tests/live.rs` checks that
+background work really stops and reconnects really recover. Both are skipped
+when the cluster is not running; rendering uses a software Vulkan driver
+(`mesa-vulkan-drivers` on Linux). One UI test covers an account confined to
+a namespace; it runs when `SKIFF_TEST_RESTRICTED_KUBECONFIG` points at a
+kubeconfig made by `hack/restricted-kubeconfig.sh`.
+`crates/skiff/tests/qa_flows.rs` holds a larger, slower set of exploratory
+flows that is opt-in (see the note at the top of that file).
 
 Performance numbers come from:
 
@@ -149,8 +174,16 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 
 ## Not there yet
 
+- A shell inside a container: the exec backend and the dock tab exist, but
+  the terminal widget is a separate crate that is not part of this tree yet
+  (the tab is behind the `terminal` build feature and says so)
 - Helm releases
 - Node drain, cron job trigger, bulk actions on multiple rows
+- Merging your YAML edits into a newer version of the object: when it
+  changed while you were typing you are told, and can load the latest
+  version, but your changes have to be made again
+- Logs across a backwards step of the node's clock: lines stamped earlier
+  than ones already shown can be missed until the clock catches up
 - Accounts limited to a namespace: tables work once that one namespace is
   selected (`-n <namespace>` or the picker), but the overview page and
   selecting several namespaces still need cluster-wide list rights

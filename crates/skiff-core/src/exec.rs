@@ -130,7 +130,13 @@ async fn drive(
     let mut stdout = proc.stdout().ok_or("no stdout")?;
     let mut size_tx = proc.terminal_size();
     let status = proc.take_status();
-    *shared.state.lock() = ExecState::Running;
+    {
+        // Not if it was closed in the meantime: "exited" is final.
+        let mut state = shared.state.lock();
+        if matches!(*state, ExecState::Connecting) {
+            *state = ExecState::Running;
+        }
+    }
     notify.ping();
 
     let mut buf = vec![0u8; 16 * 1024];

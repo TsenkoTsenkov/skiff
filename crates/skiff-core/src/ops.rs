@@ -339,6 +339,10 @@ pub async fn log_targets(
     Ok(targets)
 }
 
+/// How long the API server may take over one request before it counts as
+/// not answering.
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Sends a request and returns the HTTP status alongside the parsed body.
 async fn send_with_status(client: &Client, req: http::Request<Vec<u8>>) -> Result<(http::StatusCode, Value), String> {
     let res = client
@@ -362,7 +366,9 @@ async fn send_with_status(client: &Client, req: http::Request<Vec<u8>>) -> Resul
 ///
 /// Every document is attempted. `Ok` lists what happened to each; if any
 /// document failed, `Err` carries the same per-document report including
-/// the failures.
+/// the failures. Each request has its own time limit, so a large manifest on
+/// a slow connection is not cut off half-way; only when the server stops
+/// answering are the remaining documents left alone, and the report says so.
 pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &str) -> Result<Vec<String>, String> {
     // Parse everything up front: the YAML parser is not `Send` and must not
     // live across an await.
@@ -389,7 +395,8 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
     }
     let mut report = Vec::new();
     let mut failed = false;
-    for value in docs {
+    let total = docs.len();
+    for (index, value) in docs.into_iter().enumerate() {
         let api_version = value.get("apiVersion").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let name = value.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -440,7 +447,21 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
             }
         };
         let outcome = match request(Method::PATCH, &url, body, Some(APPLY_PATCH), None) {
-            Ok(req) => send_with_status(client, req).await,
+            Ok(req) => match tokio::time::timeout(REQUEST_TIMEOUT, send_with_status(client, req)).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    report.push(format!(
+                        "{label}: no response from the API server within {} s",
+                        REQUEST_TIMEOUT.as_secs()
+                    ));
+                    let rest = total - index - 1;
+                    if rest > 0 {
+                        report.push(format!("{rest} more {} not attempted", if rest == 1 { "document" } else { "documents" }));
+                    }
+                    failed = true;
+                    break;
+                }
+            },
             Err(e) => Err(e),
         };
         match outcome {
