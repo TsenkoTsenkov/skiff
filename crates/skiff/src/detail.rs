@@ -42,13 +42,27 @@ struct EditState {
     base: String,
     /// resourceVersion of the object `base` was taken from.
     base_rv: String,
+    /// Identity of this edit's text field. Fixed for the life of the edit,
+    /// so that the field keeps focus, caret and undo history whatever is
+    /// shown above it; new for every edit, so that none of those carry
+    /// over to different text.
+    id: egui::Id,
     job: Option<Job<ObjectData>>,
     error: Option<String>,
 }
 
 impl EditState {
     fn start(obj: &ObjectData) -> Self {
-        EditState { text: obj.yaml.clone(), base: obj.yaml.clone(), base_rv: obj.rv.clone(), job: None, error: None }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EditState {
+            text: obj.yaml.clone(),
+            base: obj.yaml.clone(),
+            base_rv: obj.rv.clone(),
+            id: egui::Id::unique(("yaml-editor", n)),
+            job: None,
+            error: None,
+        }
     }
 
     fn modified(&self) -> bool {
@@ -380,7 +394,13 @@ impl Detail {
         match self.tab {
             DetailTab::Overview => {
                 let value = obj.value.clone();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // Lay out at the panel's width, and scroll sideways in the
+                // rare case that something cannot be made to fit: content
+                // wider than the panel would otherwise spill under the
+                // table next to it.
+                let width = ui.available_width();
+                egui::ScrollArea::both().id_salt("detail-overview").auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_max_width(width);
                     ui.spacing_mut().item_spacing.y = 4.0;
                     self.overview(ui, pal, &value, &mut actions);
                     ui.add_space(16.0);
@@ -414,9 +434,13 @@ impl Detail {
         if let Some(edit) = &mut self.edit {
             let saving = edit.job.is_some();
             // The object changes underneath (status updates, other people).
-            // Untouched, the editor simply follows it. With changes typed,
-            // an apply would be refused as a conflict: say so up front.
-            if obj.rv != edit.base_rv && !saving && !edit.modified() {
+            // Untouched and not in use, the editor simply follows it. With
+            // the caret in it or changes typed, the text stays as it is
+            // (replacing it under the caret would put the next keystroke
+            // somewhere else) and an apply would be refused as a conflict:
+            // say so up front.
+            let in_use = ui.memory(|m| m.has_focus(edit.id));
+            if obj.rv != edit.base_rv && !saving && !edit.modified() && !in_use {
                 *edit = EditState::start(obj);
             }
             let outdated = obj.rv != edit.base_rv;
@@ -474,7 +498,7 @@ impl Detail {
             }
             // (Esc is handled by the app's shortcuts, on every tab: it
             // leaves edit mode only when nothing would be lost.)
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::both().id_salt("yaml-edit").auto_shrink([false, false]).show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                     let job = if text.as_str().len() <= HIGHLIGHT_EDIT_MAX {
                         highlight(ui.ctx(), ui.style(), &theme, text.as_str(), "yaml")
@@ -490,6 +514,7 @@ impl Detail {
                 };
                 ui.add(
                     egui::TextEdit::multiline(&mut edit.text)
+                        .id(edit.id)
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .desired_rows(30)
@@ -566,7 +591,9 @@ impl Detail {
         let mut rows: Vec<_> = events.rows.iter().collect();
         rows.sort_by(|a, b| skiff_core::compare(a, b, c_seen));
         let now = now_unix();
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let width = ui.available_width();
+        egui::ScrollArea::both().id_salt("detail-events").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(width);
             for r in rows {
                 let tone = status_tone(r.text(c_type)).max(r.cell(c_reason).map(|c| c.tone).unwrap_or(Tone::Normal));
                 let color = if tone >= Tone::Warn { pal.tone(tone) } else { pal.faint };

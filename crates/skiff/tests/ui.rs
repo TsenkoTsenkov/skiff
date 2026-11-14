@@ -408,6 +408,8 @@ fn unsaved_yaml_edits_block_navigation() {
     assert_eq!(detail.name, editing, "the edited object must stay open");
     assert!(detail.has_unsaved_edit(), "the edit must survive");
     assert!(has_label_containing(&h, "Apply or cancel"), "the user is told why");
+    let toast = h.get_by_label_contains("Apply or cancel").rect();
+    assert!((toast.center().x - 720.0).abs() < 12.0, "the notification is centred, not at x={:.0}", toast.center().x);
     assert_eq!(
         h.state().selected_row().map(|(name, _)| name).as_deref(),
         Some(editing.as_str()),
@@ -649,7 +651,7 @@ fn create_dialog_always_fits_and_can_be_left() {
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
     h.step();
     h.get_by_role(Role::MultilineTextInput).type_text(&manifest);
-    steps(&mut h, 3);
+    steps(&mut h, 8);
     h.get_by_label("Apply").click();
     settle(&mut h, "the error", |h| has_label_containing(h, "unknown resource type"));
     shot(&mut h, "26_create_error_fits");
@@ -666,6 +668,86 @@ fn create_dialog_always_fits_and_can_be_left() {
     h.key_press(egui::Key::Escape);
     steps(&mut h, 3);
     assert!(h.state().dialog.is_some(), "typed text is not lost to Esc");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_none());
+
+    // A very long line (certificates, last-applied annotations) scrolls
+    // inside the editor; it must not widen the dialog past the window.
+    h.state_mut().open_create_dialog();
+    settle(&mut h, "dialog", |h| has_label(h, "Apply"));
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    let long = format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: long\ndata:\n  cert: {}\n", "A".repeat(3_000));
+    h.get_by_role(Role::MultilineTextInput).type_text(&long);
+    steps(&mut h, 8);
+    shot(&mut h, "31_create_long_line");
+    for label in ["Apply", "Cancel"] {
+        let rect = h.get_all_by_label(label).last().unwrap().rect();
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 900.0 && rect.bottom() <= 560.0,
+            "{label} button at x={:.0}..{:.0} is outside the 900 px window",
+            rect.left(),
+            rect.right()
+        );
+    }
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    steps(&mut h, 3);
+    assert!(h.state().dialog.is_none());
+}
+
+#[test]
+fn a_failed_background_apply_returns_on_its_own_cluster() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" {
+        return;
+    }
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1);
+    h.state_mut().open_create_dialog();
+    settle(&mut h, "dialog", |h| has_label(h, "Apply"));
+    assert!(has_label(&h, "on demo"), "the dialog says which cluster it applies to");
+    // Enough documents (all refused: the namespace does not exist, which
+    // the API server takes about 50 ms to say) to still be running when
+    // the dialog is closed, and to fail a few seconds later.
+    let mut manifest = String::new();
+    for i in 0..60 {
+        manifest.push_str(&format!(
+            "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: bg-{i}\n  namespace: skiff-no-such-namespace\n"
+        ));
+    }
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).type_text(&manifest);
+    // (The dialog grows over a few frames after a large paste.)
+    steps(&mut h, 8);
+    h.get_by_label("Apply").click();
+    steps(&mut h, 2);
+    assert!(has_label(&h, "Close"), "the apply is still running, so the button reads Close");
+    h.get_by_label("Close").click();
+    h.step();
+    assert!(h.state().dialog.is_none());
+
+    // On another cluster the failure must not bring the dialog back: its
+    // Apply button would send the manifest to the wrong cluster.
+    h.state_mut().switch_context("scale");
+    for _ in 0..160 {
+        std::thread::sleep(Duration::from_millis(50));
+        h.step();
+        assert!(h.state().dialog.is_none(), "the dialog must not reopen on another cluster");
+    }
+
+    // Back on its own cluster it returns, manifest and report included.
+    h.state_mut().switch_context("demo");
+    settle(&mut h, "the dialog to return", |h| h.state().dialog.is_some());
+    assert!(has_label(&h, "on demo"));
+    assert!(has_label_containing(&h, "skiff-no-such-namespace"), "the report is shown");
+    let text = h.get_by_role(Role::MultilineTextInput).value().unwrap_or_default();
+    assert!(text.contains("name: bg-59"), "the manifest is back");
     h.get_all_by_label("Cancel").last().unwrap().click();
     steps(&mut h, 3);
     assert!(h.state().dialog.is_none());
@@ -742,10 +824,27 @@ fn yaml_editor_follows_or_flags_changes_on_the_server() {
     assert!(editor_text(&h).contains("# mine "), "typed text is kept");
     assert!(!editor_text(&h).contains("skiff-test/two"));
     shot(&mut h, "27_edit_outdated");
+    // The notice appearing above the editor must not take the keyboard
+    // away from it: typing simply continues, "/" included (which would
+    // otherwise jump to the table's filter).
+    assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the editor keeps the keyboard");
+    h.get_by_role(Role::MultilineTextInput).type_text("more/");
+    steps(&mut h, 3);
+    assert!(editor_text(&h).contains("# mine more/"), "typing continues in the editor: {:?}", editor_text(&h).lines().next());
+    assert_eq!(h.state().table_stats().0, 1, "the table's filter is untouched");
     h.get_by_label("Load the latest version").click();
     settle(&mut h, "latest version", |h| editor_text(h).contains("skiff-test/two"));
     assert!(!h.state().detail.as_ref().unwrap().has_unsaved_edit());
     assert!(!has_label_containing(&h, "has changed on the server"));
+
+    // With the caret in the editor (but nothing typed) the text is not
+    // swapped under it either: the notice is shown instead.
+    h.get_by_role(Role::MultilineTextInput).focus();
+    steps(&mut h, 2);
+    kubectl(&["-n", ns, "annotate", "cm", name, "skiff-test/three=3"]);
+    settle(&mut h, "the notice", |h| has_label_containing(h, "has changed on the server"));
+    assert!(!editor_text(&h).contains("skiff-test/three"));
+    assert!(h.get_by_role(Role::MultilineTextInput).is_focused());
     h.get_by_label("Cancel").click();
     h.step();
     let _ = kubectl(&["-n", ns, "delete", "cm", name, "--ignore-not-found"]);
@@ -812,4 +911,26 @@ fn shell_runs_commands_in_a_container() {
     h.key_press(egui::Key::Enter);
     settle(&mut h, "shell to end", |h| has_label(h, "ended"));
     shot(&mut h, "29_shell_ended");
+}
+
+#[test]
+fn detail_panel_and_table_do_not_overlap_in_a_small_window() {
+    let Some(ctx) = test_context() else { return };
+    // The smallest window the app allows; this pod has labels far wider
+    // than the detail panel can be here.
+    let mut h = harness_with(&ctx, "pods", [900.0, 560.0], false);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    h.get_by_label("alertmanager-0").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    steps(&mut h, 5);
+    shot(&mut h, "30_small_window_detail");
+    // Everything in the panel's header is to the right of every table row.
+    let panel_left = ["Logs", "YAML"].iter().map(|l| h.get_by_label(l).rect().left()).fold(f32::MAX, f32::min);
+    let (second, _) = h.state().row_at(1).unwrap();
+    let row = h.get_all_by_label(&second).next().expect("second row").rect();
+    assert!(row.right() <= panel_left, "table row ends at x={:.0}, panel content starts at x={panel_left:.0}", row.right());
+    // And a click on the panel's first button goes to that button.
+    h.get_by_label("Logs").click();
+    settle(&mut h, "logs to open", |h| has_label_containing(h, "streaming"));
+    assert_eq!(h.state().detail.as_ref().unwrap().name, "alertmanager-0", "the click must not land on a table row");
 }

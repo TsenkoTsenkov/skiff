@@ -62,14 +62,23 @@ pub fn pill(ui: &mut Ui, text: &str, color: Color32, pal: &Palette) -> Response 
 
 /// A `key=value` chip, used for labels.
 pub fn chip(ui: &mut Ui, text: &str, pal: &Palette) -> Response {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::mono(11.5), pal.muted);
+    // Never wider than the row it sits in: something that cannot be broken
+    // or shortened would push its container wider than it is allowed to be.
+    let room = (ui.max_rect().width() - 12.0).max(40.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), theme::mono(11.5), pal.muted);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    let galley = ui.painter().layout_job(job);
+    let shortened = galley.elided;
     let size = galley.size() + Vec2::new(12.0, 6.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if ui.is_rect_visible(rect) {
         let fill = if resp.hovered() { pal.hover } else { pal.raised };
         ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
         ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
         ui.painter().galley(rect.center() - galley.size() / 2.0, galley, pal.muted);
+    }
+    if shortened {
+        resp = resp.on_hover_text(text);
     }
     resp
 }

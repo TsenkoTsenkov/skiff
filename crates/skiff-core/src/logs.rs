@@ -288,7 +288,16 @@ struct ResumePoint {
     /// Lines stamped before this have been dropped from `recent`, so a
     /// replay must not reach back that far: they would not be recognised.
     forgotten_before: i64,
+    /// Delivered lines stamped far ahead of the position (the node's clock
+    /// jumped forward for a moment, or a line is simply wrong). The server
+    /// sends them again on every resume until the stream's time reaches
+    /// them, so they are set aside rather than forgotten.
+    ahead: VecDeque<(i64, u64)>,
 }
+
+/// How far past the position a timestamp must be to count as "far ahead".
+const AHEAD_MS: i64 = 60_000;
+const MAX_AHEAD: usize = 50_000;
 
 fn fingerprint(time_ms: i64, text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -333,16 +342,20 @@ impl ResumePoint {
         self.recent.push_back((time_ms, fp));
         // Forget what a future replay can no longer contain: lines older
         // than its starting point. Lines stamped far ahead of the stream
-        // are let go as well so they cannot pin the queue (at worst such a
-        // line shows up once more after a reconnect).
-        let since = self.position().unwrap_or(time_ms) - REPLAY_MS - 1_000;
-        while let Some((t, _)) = self.recent.front() {
-            let old = *t < since;
-            if !(old || *t > since + 3_600_000 || self.recent.len() > MAX_REMEMBERED) {
-                break;
-            }
-            if old {
+        // move to `ahead`, so that they neither pin this queue nor come
+        // back as new lines after a reconnect.
+        let position = self.position().unwrap_or(time_ms);
+        let since = position - REPLAY_MS - 1_000;
+        while let Some(&(t, fp)) = self.recent.front() {
+            if t < since {
                 self.forgotten_before = self.forgotten_before.max(since);
+            } else if t > position + AHEAD_MS {
+                if self.ahead.len() == MAX_AHEAD {
+                    self.ahead.pop_front();
+                }
+                self.ahead.push_back((t, fp));
+            } else if self.recent.len() <= MAX_REMEMBERED {
+                break;
             }
             self.recent.pop_front();
         }
@@ -353,16 +366,30 @@ impl ResumePoint {
     /// line with a timestamp was delivered.
     fn begin_resume(&mut self) -> Option<i64> {
         let position = self.position()?;
+        let mut since = position - REPLAY_MS;
+        if self.forgotten_before > position {
+            // The stream's time went back past what was forgotten: the
+            // node's clock was set back, or a run of lines was stamped far
+            // ahead. Holding out for it to catch up would lose everything
+            // written until then; starting from here repeats, once, at
+            // most the few seconds of lines before the step.
+            self.forgotten_before = 0;
+        } else {
+            // The position can also dip a little (a burst of lines from the
+            // other output stream, stamped slightly earlier). Never ask
+            // for lines that were already forgotten; the server rounds the
+            // time down to a whole second, hence the rounding up here.
+            let forgotten = self.forgotten_before + (-self.forgotten_before).rem_euclid(1000);
+            since = since.max(forgotten);
+        }
+        // Lines set aside as "ahead" that the stream's time has now passed
+        // will not be sent again.
+        self.ahead.retain(|(t, _)| *t >= since - 1_000);
         self.skip.clear();
-        for (_, fp) in &self.recent {
+        for (_, fp) in self.recent.iter().chain(&self.ahead) {
             *self.skip.entry(*fp).or_insert(0) += 1;
         }
-        // The position can move backwards (a burst of lines from the other
-        // output stream, stamped a little earlier). Never ask for lines
-        // that were already forgotten; the server rounds the time down to
-        // a whole second, hence the rounding up here.
-        let forgotten = self.forgotten_before + (-self.forgotten_before).rem_euclid(1000);
-        Some((position - REPLAY_MS).max(forgotten))
+        Some(since)
     }
 }
 
@@ -385,6 +412,8 @@ async fn pump(
     let mut resume = ResumePoint::default();
     let mut connected_once = false;
     let mut attempt = 0u32;
+    // Why the last attempt to open the stream failed.
+    let mut last_error = String::new();
     // Lines delivered since the UI was last woken for them.
     let mut unannounced = false;
     // The most recent client that the session considered good.
@@ -423,19 +452,23 @@ async fn pump(
         let mut healthy = false;
         let opening = match tokio::time::timeout(OPEN_TIMEOUT, pods.log_stream(&target.pod, &lp)).await {
             Ok(Ok(reader)) => Ok(reader),
-            Ok(Err(e)) => Err((is_gone(&e), friendly(&e))),
-            Err(_) => Err((false, "no response from the API server".to_string())),
+            Ok(Err(e)) => Err((is_gone(&e), false, friendly(&e))),
+            Err(_) => Err((false, true, "no response from the API server".to_string())),
         };
         match opening {
-            Err((gone, why)) => {
-                // The very first attempt failing, or the pod being gone, is
-                // final; anything else after we were connected is retried.
-                if !connected_once || gone || !opts.follow || opts.previous {
+            Err((gone, timed_out, why)) => {
+                // Final: the pod is gone, this is a one-off read, or the
+                // very first attempt was refused (the reason is shown). A
+                // first attempt that merely got no answer in time is
+                // retried like any later failure: a busy server is slow,
+                // not broken.
+                if gone || !opts.follow || opts.previous || (!connected_once && !timed_out) {
                     let state = if connected_once { SourceState::Ended } else { SourceState::Failed(why) };
                     shared.set_state(idx, state);
                     notify.ping();
                     return;
                 }
+                last_error = why;
             }
             Ok(reader) => {
                 let opened = Instant::now();
@@ -505,7 +538,9 @@ async fn pump(
         notify.ping();
         tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt.min(6)))).await;
     }
-    shared.set_state(idx, SourceState::Ended);
+    // Out of retries (or a one-off read that is complete).
+    let state = if connected_once { SourceState::Ended } else { SourceState::Failed(last_error) };
+    shared.set_state(idx, state);
     notify.ping();
 }
 
@@ -710,6 +745,44 @@ mod tests {
             let missing = seen.iter().filter(|n| **n == 0).count();
             assert_eq!((repeated, missing), (0, 0), "skew {skew} ms");
         }
+    }
+
+    #[test]
+    fn resume_survives_a_clock_that_jumps_ahead_and_back() {
+        // Lines every 10 ms. For a while the node's clock is an hour (or
+        // half an hour) ahead, then it is corrected.
+        for jump in [3_600_000i64, 1_800_000, 120_000] {
+            let base = 1_700_000_000_000i64;
+            let mut log = Vec::new();
+            for i in 0..3_000i64 {
+                let ahead = if (600..800).contains(&i) { jump } else { 0 };
+                log.push((base + i * 10 + ahead, format!("seq={i}")));
+            }
+            // Resumes well after the excursion: nothing lost, nothing
+            // repeated (not even the lines stamped ahead, which the server
+            // sends again every time).
+            let seen = deliveries(&log, &[1_600, 2_000, 2_400]);
+            let repeated = seen.iter().filter(|n| **n > 1).count();
+            let missing = seen.iter().filter(|n| **n == 0).count();
+            assert_eq!((repeated, missing), (0, 0), "jump {jump} ms");
+            // A resume right after the correction may repeat the seconds
+            // before the jump, but must never lose a line.
+            let seen = deliveries(&log, &[830, 1_200, 2_000]);
+            let repeated = seen.iter().filter(|n| **n > 1).count();
+            let missing = seen.iter().filter(|n| **n == 0).count();
+            assert_eq!(missing, 0, "jump {jump} ms");
+            assert!(repeated <= 600, "jump {jump} ms: {repeated} lines repeated");
+        }
+    }
+
+    #[test]
+    fn two_lines_with_the_second_stamped_early() {
+        let hour = 3_600_000;
+        let log = vec![(10 * hour, "first".to_string()), (9 * hour, "second, stamped an hour early".to_string())];
+        let mut more = log.clone();
+        more.extend((0..20).map(|i| (10 * hour + 1_000 * (i + 1), format!("later {i}"))));
+        let seen = deliveries(&more, &[2, 10]);
+        assert!(seen.iter().all(|n| *n == 1), "{seen:?}");
     }
 
     #[test]

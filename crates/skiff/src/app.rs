@@ -84,8 +84,9 @@ enum Pending {
     Simple { job: Job<()>, ok: String },
     Forward { job: Job<Arc<PortForward>>, context: String },
     /// A manifest apply whose dialog was closed before it finished. The
-    /// manifest is kept so that a failure can hand it back.
-    Apply { job: Job<Vec<String>>, text: String },
+    /// manifest is kept so that a failure can hand it back, on the cluster
+    /// it was meant for.
+    Apply { job: Job<Vec<String>>, text: String, context: String },
 }
 
 /// Modal dialogs.
@@ -107,7 +108,8 @@ pub enum Dialog {
     Forward(ForwardDialog),
     /// Create or update objects from a YAML manifest. `pristine` is the
     /// text the dialog opened with: untouched, it can be dismissed freely.
-    Create { text: String, pristine: String, job: Option<Job<Vec<String>>>, error: Option<String> },
+    /// `context` is the cluster it applies to (the one it was opened on).
+    Create { text: String, pristine: String, context: String, job: Option<Job<Vec<String>>>, error: Option<String> },
 }
 
 pub struct ForwardDialog {
@@ -435,9 +437,12 @@ impl SkiffApp {
         let mut toasts = Vec::new();
         let sessions = &self.sessions;
         // A background apply that failed gets its dialog back, manifest and
-        // error included, as soon as no other dialog is in the way.
-        let dialog_free = self.dialog.is_none();
-        let mut reopen: Option<(String, String)> = None;
+        // error included: on the cluster it was meant for (never on another
+        // one, where "Apply" would send it to the wrong place), and once no
+        // dialog, palette or menu is in the way.
+        let dialog_free = self.dialog.is_none() && self.palette.is_none() && !self.overlay_at_start;
+        let active = self.active.clone();
+        let mut reopen: Option<(String, String, String)> = None;
         self.pending.retain(|p| match p {
             Pending::Simple { job, ok } => match job.take() {
                 None => true,
@@ -450,20 +455,32 @@ impl SkiffApp {
                     false
                 }
             },
-            Pending::Apply { job, text } => {
+            Pending::Apply { job, text, context } => {
+                let elsewhere = active.as_deref() != Some(context.as_str());
                 let failed = job.peek(|r| matches!(r, Some(Err(_))));
-                if failed && (!dialog_free || reopen.is_some()) {
+                if failed && !sessions.contains_key(context) {
+                    // That cluster was disconnected: there is no place for
+                    // the dialog to come back to. Say what happened.
+                    if let Some(Err(e)) = job.take() {
+                        let lines: Vec<String> = e.lines().map(str::to_string).collect();
+                        toasts.push((format!("Applying to {context} failed:\n{}", apply_summary(&lines)), Tone::Err));
+                    }
+                    return false;
+                }
+                if failed && (elsewhere || !dialog_free || reopen.is_some()) {
+                    // Wait until the user is back on that cluster and free.
                     return true;
                 }
                 match job.take() {
                     None => true,
                     Some(Ok(lines)) => {
-                        toasts.push((apply_summary(&lines), Tone::Ok));
+                        let summary = apply_summary(&lines);
+                        toasts.push((if elsewhere { format!("{context}:\n{summary}") } else { summary }, Tone::Ok));
                         false
                     }
                     Some(Err(e)) => {
                         toasts.push(("Applying the manifest failed".to_string(), Tone::Err));
-                        reopen = Some((text.clone(), e));
+                        reopen = Some((text.clone(), context.clone(), e));
                         false
                     }
                 }
@@ -489,8 +506,8 @@ impl SkiffApp {
         for (t, tone) in toasts {
             self.toast(t, tone);
         }
-        if let Some((text, error)) = reopen {
-            self.dialog = Some(Dialog::Create { text, pristine: String::new(), job: None, error: Some(error) });
+        if let Some((text, context, error)) = reopen {
+            self.dialog = Some(Dialog::Create { text, pristine: String::new(), context, job: None, error: Some(error) });
         }
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
@@ -695,7 +712,8 @@ impl SkiffApp {
         let template = format!(
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: example\n  namespace: {ns}\ndata:\n  key: value\n"
         );
-        self.dialog = Some(Dialog::Create { pristine: template.clone(), text: template, job: None, error: None });
+        let Some(context) = self.active.clone() else { return };
+        self.dialog = Some(Dialog::Create { pristine: template.clone(), text: template, context, job: None, error: None });
     }
 
     pub fn run_command(&mut self, ctx: &egui::Context, cmd: Command) {
@@ -1514,6 +1532,11 @@ impl SkiffApp {
             self.dialog = None;
             return;
         };
+        // A manifest is only ever applied to the cluster it was written for.
+        if matches!(dialog, Dialog::Create { context, .. } if *context != session.context) {
+            self.dialog = None;
+            return;
+        }
         // Keys that opened the dialog must not also act inside it, so
         // default focus is given once and Enter is left to the focused
         // widget rather than read globally.
@@ -1621,9 +1644,13 @@ impl SkiffApp {
                         }
                     });
                 }
-                Dialog::Create { text, job, error, .. } => {
-                    ui.set_width(640.0);
-                    ui.label(widgets::semibold("Create or update from YAML", 15.0));
+                Dialog::Create { text, job, error, context, .. } => {
+                    // Never wider than the window, whatever is pasted.
+                    ui.set_width((ui.ctx().content_rect().width() - 64.0).clamp(280.0, 640.0));
+                    ui.horizontal(|ui| {
+                        ui.label(widgets::semibold("Create or update from YAML", 15.0));
+                        ui.label(RichText::new(format!("on {context}")).color(pal.muted));
+                    });
                     ui.label(
                         RichText::new("Multiple documents separated by --- are applied in order. Existing objects are replaced.")
                             .color(pal.muted)
@@ -1639,7 +1666,10 @@ impl SkiffApp {
                         // its buttons end up out of reach.
                     let room = (ui.ctx().content_rect().height() - 260.0).max(120.0);
                     let editor_height = room.min(420.0);
-                    egui::ScrollArea::vertical().id_salt("create-yaml").max_height(editor_height).show(ui, |ui| {
+                    // (Long lines scroll sideways instead of widening the
+                    // dialog until its buttons leave the window.)
+                    let editor = egui::ScrollArea::both().id_salt("create-yaml").max_height(editor_height).auto_shrink([false, true]);
+                    editor.show(ui, |ui| {
                         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
                             let job = egui_extras::syntax_highlighting::highlight(
                                 ui.ctx(),
@@ -1682,7 +1712,11 @@ impl SkiffApp {
                         let label = if busy { "Close" } else { "Cancel" };
                         if ui.button(label).clicked() {
                             if let Some(running) = job.take() {
-                                push = Some(Pending::Apply { job: running, text: std::mem::take(text) });
+                                push = Some(Pending::Apply {
+                                    job: running,
+                                    text: std::mem::take(text),
+                                    context: context.clone(),
+                                });
                             }
                             close = true;
                         }
@@ -1768,6 +1802,17 @@ impl SkiffApp {
             return;
         }
         let pal = self.pal;
+        // Lay the texts out first: the stack is as wide as its widest
+        // notification and each one is centred in it.
+        const TEXT_MAX: f32 = 400.0;
+        let font = egui::TextStyle::Body.resolve(&ctx.global_style());
+        let galleys: Vec<_> = self
+            .toasts
+            .iter()
+            .map(|t| ctx.fonts_mut(|f| f.layout(t.text.clone(), font.clone(), pal.text, TEXT_MAX)))
+            .collect();
+        // Text + dot (8) + gap (6) + the frame's margins (2 x 12).
+        let widest = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max) + 8.0 + 6.0 + 24.0;
         egui::Area::new(egui::Id::unique("toasts"))
             // Bottom centre, above the status bar: the one place with no
             // controls under it (the detail panel's and the tables' buttons
@@ -1776,8 +1821,9 @@ impl SkiffApp {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
+                ui.set_width(widest);
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                    for t in self.toasts.iter() {
+                    for (t, galley) in self.toasts.iter().zip(galleys) {
                         let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
                         Frame::new()
                             .fill(pal.raised)
@@ -1785,10 +1831,10 @@ impl SkiffApp {
                             .corner_radius(CornerRadius::same(8))
                             .inner_margin(Margin::symmetric(12, 8))
                             .show(ui, |ui| {
-                                ui.set_max_width(420.0);
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
                                     widgets::dot(ui, color);
-                                    ui.add(egui::Label::new(RichText::new(&t.text).color(pal.text)).wrap());
+                                    ui.add(egui::Label::new(galley));
                                 });
                             });
                         ui.add_space(6.0);

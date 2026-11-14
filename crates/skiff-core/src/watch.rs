@@ -54,6 +54,13 @@ const QUIET_WATCH_MIN: Duration = Duration::from_secs(20);
 /// After this many quiet watches in a row, one list checks that nothing was
 /// in fact missed.
 const QUIET_CHECK_AFTER: u32 = 3;
+/// Pause before re-opening a watch that was cut while quiet. Whatever cut
+/// it is usually also closing the connection it ran on; a request sent in
+/// that instant would be lost with it.
+const QUIET_REOPEN_DELAY: Duration = Duration::from_millis(300);
+/// How long a housekeeping list may take before the table stops saying
+/// "live" (no watch is open while it runs).
+const ROUTINE_GRACE: Duration = Duration::from_secs(2);
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const PERMANENT_RETRY: Duration = Duration::from_secs(60);
@@ -572,6 +579,8 @@ struct Engine {
     quick_gone: u32,
     /// The next list is housekeeping, not something to announce as Loading.
     routine_relist: bool,
+    /// ... unless it is still running at this time.
+    routine_grace: Option<tokio::time::Instant>,
     /// Fingerprint of the rows before a list that checks on quiet watches.
     quiet_check: Option<u64>,
     /// See `QUIET_WATCH_MIN`; a field so that tests need not wait that long.
@@ -674,25 +683,38 @@ impl Engine {
         let mut is_table;
         let rv;
         let query = ListQuery::default();
+        let client = self.client.clone();
+        let store = self.store.clone();
+        let mut grace = self.routine_grace.take();
         loop {
             let limit = if cont.is_none() && initial { FIRST_PAGE } else { PAGE };
-            let page = loop {
-                let fetch = fetch_page(
-                    &self.client,
-                    &key,
-                    scope.as_deref(),
-                    &query,
-                    cont.as_deref(),
-                    &mut plan,
-                    limit,
-                );
-                tokio::select! {
-                    res = fetch => break res?,
-                    _ = self.store.relist.notified() => {
-                        if self.refresh_requested() {
-                            return Err(Fail::Restart);
+            let page = {
+                let fetch = fetch_page(&client, &key, scope.as_deref(), &query, cont.as_deref(), &mut plan, limit);
+                tokio::pin!(fetch);
+                loop {
+                    let overdue = async {
+                        match grace {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
                         }
-                        // A stale wake-up: ask for the same page again.
+                    };
+                    tokio::select! {
+                        res = &mut fetch => break res?,
+                        _ = store.relist.notified() => {
+                            if self.refresh_requested() {
+                                return Err(Fail::Restart);
+                            }
+                            // (A stale wake-up: keep waiting for the page.)
+                        }
+                        _ = overdue => {
+                            // A housekeeping list that drags on: no watch
+                            // is open meanwhile, so stop saying "live".
+                            grace = None;
+                            if self.state == LoadState::Live {
+                                self.set_state(LoadState::Loading, None);
+                                self.publish();
+                            }
+                        }
                     }
                 }
             };
@@ -871,6 +893,14 @@ impl Engine {
                     if dirty {
                         self.publish();
                     }
+                    // Many proxies and load balancers end an idle
+                    // connection by resetting it rather than closing the
+                    // response. For a watch that had been quiet that is the
+                    // same thing; a network that is really down shows on
+                    // the next attempt.
+                    if lines == 0 && started.elapsed() >= self.quiet_min {
+                        return WatchEnd::Resume(Health::Quiet);
+                    }
                     return WatchEnd::Failed(Fail::Transient(e.to_string()));
                 }
                 Ok(Ok(_)) => {
@@ -928,6 +958,7 @@ impl Engine {
                 self.set_state(LoadState::Loading, None);
                 self.publish();
             }
+            self.routine_grace = routine.then(|| tokio::time::Instant::now() + ROUTINE_GRACE);
             if self.poll_only && self.watch_retry_at.is_some_and(|t| Instant::now() >= t) {
                 self.poll_only = false;
                 self.watch_retry_at = None;
@@ -1004,6 +1035,7 @@ impl Engine {
                             self.routine_relist = true;
                             break;
                         }
+                        self.pause(QUIET_REOPEN_DELAY).await;
                         if self.refresh_requested() {
                             break;
                         }
@@ -1029,9 +1061,15 @@ impl Engine {
                         // An expired resourceVersion is normally a one-off
                         // that a relist cures. If it happens again right
                         // after opening, back off and say so.
+                        // A one-off is housekeeping: the rows stay as they
+                        // are and so does the state. Not so when it keeps
+                        // happening, or when the pause before the next try
+                        // has grown long: then say what is going on.
+                        let mut announced = false;
                         if started.elapsed() < Duration::from_secs(5) {
                             self.quick_gone += 1;
-                            if self.quick_gone >= 2 {
+                            if self.quick_gone >= 2 || backoff > ROUTINE_GRACE {
+                                announced = true;
                                 self.set_state(LoadState::Reconnecting, Some(&f));
                                 self.publish();
                             }
@@ -1040,10 +1078,8 @@ impl Engine {
                         } else {
                             self.quick_gone = 0;
                         }
-                        // A one-off is housekeeping: the rows stay as they
-                        // are and so does the state. (A refresh asked for
-                        // meanwhile still shows as one.)
-                        self.routine_relist = self.quick_gone < 2 && !self.refresh_requested();
+                        // (A refresh asked for meanwhile still shows as one.)
+                        self.routine_relist = !announced && !self.refresh_requested();
                         break;
                     }
                     WatchEnd::Failed(Fail::Permanent { code: 403 | 405, .. }) => {
@@ -1060,6 +1096,11 @@ impl Engine {
                         break;
                     }
                     WatchEnd::Failed(f) => {
+                        if started.elapsed() >= Duration::from_secs(5) {
+                            // It did run for a while: earlier immediate
+                            // expiries are history.
+                            self.quick_gone = 0;
+                        }
                         if started.elapsed() > Duration::from_secs(30) {
                             failures = 0;
                             backoff = BACKOFF_START;
@@ -1103,6 +1144,7 @@ async fn run_with(store: Arc<TableStore>, client: Client, notify: Notifier, quie
         watch_retry_at: None,
         quick_gone: 0,
         routine_relist: false,
+        routine_grace: None,
         quiet_check: None,
         quiet_min,
     }
@@ -1211,6 +1253,7 @@ mod tests {
             watch_retry_at: None,
             quick_gone: 0,
             routine_relist: false,
+            routine_grace: None,
             quiet_check: None,
             quiet_min: QUIET_WATCH_MIN,
         };
@@ -1275,6 +1318,9 @@ mod tests {
     /// connection stays open before it is sent and the stream closed.
     type WatchFn = Arc<dyn Fn(usize) -> (Duration, String) + Send + Sync>;
 
+    /// Stands for a watch that is ended by resetting the connection.
+    const RESET: &str = "<reset>";
+
     impl FakeApi {
         async fn start(watch_body: &'static str) -> FakeApi {
             Self::start_with(Arc::new(move |_| (Duration::ZERO, watch_body.to_string())), false).await
@@ -1282,6 +1328,15 @@ mod tests {
 
         /// `changing_list`: every list reports the object at a newer version.
         async fn start_with(watch: WatchFn, changing_list: bool) -> FakeApi {
+            Self::start_slow(watch, changing_list, Arc::new(|_| Duration::ZERO)).await
+        }
+
+        /// `list_delay`: how long the n-th list takes to answer.
+        async fn start_slow(
+            watch: WatchFn,
+            changing_list: bool,
+            list_delay: Arc<dyn Fn(usize) -> Duration + Send + Sync>,
+        ) -> FakeApi {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1292,7 +1347,7 @@ mod tests {
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else { return };
                     let (l, w) = (l.clone(), w.clone());
-                    let watch = watch.clone();
+                    let (watch, list_delay) = (watch.clone(), list_delay.clone());
                     tokio::spawn(async move {
                         let mut req = Vec::new();
                         let mut chunk = [0u8; 2048];
@@ -1312,11 +1367,19 @@ mod tests {
                                 .await;
                             let _ = sock.flush().await;
                             tokio::time::sleep(hold).await;
+                            if body == RESET {
+                                // Close without the orderly goodbye: the
+                                // client sees "connection reset".
+                                #[allow(deprecated)]
+                                let _ = sock.set_linger(Some(Duration::ZERO));
+                                return;
+                            }
                             let _ = sock.write_all(body.as_bytes()).await;
                             let _ = sock.shutdown().await;
                             return;
                         }
                         let n = l.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(list_delay(n)).await;
                         let rv = if changing_list { 5 + n } else { 5 };
                         let body = format!(
                             r#"{{"kind":"Table","metadata":{{"resourceVersion":"{rv}"}},"columnDefinitions":[{{"name":"Name","type":"string","priority":0}}],"rows":[{{"cells":["a"],"object":{{"metadata":{{"name":"a","namespace":"x","uid":"u-a","resourceVersion":"{rv}"}}}}}}]}}"#
@@ -1444,13 +1507,39 @@ mod tests {
         let store = api.store_with(Duration::from_millis(100));
         until("live", Duration::from_secs(5), || store.peek().state == LoadState::Live).await;
         let states = record_states(&store);
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        tokio::time::sleep(Duration::from_millis(4500)).await;
         let (lists, watches) = api.counts();
         assert_eq!(*states.lock().unwrap(), [LoadState::Live], "no polling and no flicker");
-        assert!(watches >= 9, "kept watching: {watches} watches");
+        assert!(watches >= 8, "kept watching: {watches} watches");
         assert!(lists >= 3, "checked by listing: {lists} lists");
         assert!(lists <= watches / 3 + 2, "one list per few watches, not {lists} for {watches}");
         assert_eq!(store.peek().rows.len(), 1);
+    }
+
+    /// The same when the idle connection is reset instead of closed, which
+    /// is how most load balancers do it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quiet_watches_that_are_reset_keep_watching() {
+        let api = FakeApi::start_with(Arc::new(|_| (Duration::from_millis(150), RESET.to_string())), false).await;
+        let store = api.store_with(Duration::from_millis(100));
+        until("live", Duration::from_secs(5), || store.peek().state == LoadState::Live).await;
+        let states = record_states(&store);
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        let (lists, watches) = api.counts();
+        assert_eq!(*states.lock().unwrap(), [LoadState::Live], "a reset idle watch is not a failure");
+        assert!(watches >= 8 && lists >= 3, "{watches} watches, {lists} lists");
+    }
+
+    /// ... but a watch that is reset right away is a failure, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watches_reset_at_once_are_failures() {
+        let api = FakeApi::start_with(Arc::new(|_| (Duration::ZERO, RESET.to_string())), false).await;
+        let store = api.store();
+        until("reconnecting", Duration::from_secs(5), || store.peek().state == LoadState::Reconnecting).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let (lists, watches) = api.counts();
+        assert!(watches <= 8 && lists <= 4, "backs off: {watches} watches, {lists} lists in 3 s");
+        assert_eq!(store.peek().rows.len(), 1, "rows stay available");
     }
 
     /// The same, except that the list shows changes those watches never
@@ -1487,6 +1576,27 @@ mod tests {
         until("second watch", Duration::from_secs(5), || api.counts() == (2, 2)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(*states.lock().unwrap(), [LoadState::Live]);
+    }
+
+    /// Housekeeping lists are silent only while they are quick: no watch is
+    /// open meanwhile, so a list that drags on must not leave the table
+    /// claiming to be live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_housekeeping_list_is_announced() {
+        let gone = "{\"type\":\"ERROR\",\"object\":{\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\"}}\n";
+        let api = FakeApi::start_slow(
+            Arc::new(move |n| if n == 0 { (Duration::from_millis(100), gone.to_string()) } else { (Duration::from_secs(30), String::new()) }),
+            false,
+            // The first list is prompt, the one after the expiry takes 3.5 s.
+            Arc::new(|n| if n == 0 { Duration::ZERO } else { Duration::from_millis(3500) }),
+        )
+        .await;
+        let store = api.store();
+        until("live", Duration::from_secs(5), || store.peek().state == LoadState::Live).await;
+        let states = record_states(&store);
+        until("second watch", Duration::from_secs(10), || api.counts() == (2, 2)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*states.lock().unwrap(), [LoadState::Live, LoadState::Loading, LoadState::Live]);
     }
 
     /// A refresh requested while the engine is pausing between watch
