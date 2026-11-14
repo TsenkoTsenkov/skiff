@@ -117,7 +117,27 @@ auth plugins (EKS, GKE, …) and OIDC are supported.
 
 Linux needs a Vulkan or OpenGL driver and `libxkbcommon` (on Debian/Ubuntu:
 `libxkbcommon-x11-0`, plus `mesa-vulkan-drivers` if you have no GPU driver).
-macOS and Windows need nothing extra.
+Windows needs nothing extra.
+
+### macOS
+
+A Mac build has to be made on a Mac (the linker needs Apple's own system
+libraries). With the Xcode command line tools (`xcode-select --install`) and
+Rust installed:
+
+```bash
+hack/macos-app.sh --install
+```
+
+builds the app and puts `Skiff.app` into `/Applications`; without `--install`
+it stays in `target/release/`. Started from the Finder or the Dock, the app
+runs through a login shell so that the credential helpers your kubeconfig
+calls (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`, …) are found.
+`cargo build --release` and `./target/release/skiff` from a terminal work
+as on Linux.
+
+The code compiles for Apple Silicon (checked by cross-compiling everything
+up to the link step), but it has not been run on a Mac yet.
 
 ## Keyboard
 
