@@ -560,6 +560,8 @@ struct Engine {
     poll_only: bool,
     /// When to give watching another try while `poll_only`.
     watch_retry_at: Option<Instant>,
+    /// Consecutive watches that were refused as expired right away.
+    quick_gone: u32,
 }
 
 enum WatchEnd {
@@ -654,8 +656,10 @@ impl Engine {
                 break;
             }
             cont = page.cont;
-            if initial {
+            if initial && self.state == LoadState::Loading {
                 // Show rows as pages arrive instead of a long blank wait.
+                // (Not while retrying after a failure: partial rows that
+                // vanish again on the next failure are worse than none.)
                 self.plan = plan.clone();
                 self.rows = fresh.clone();
                 self.set_state(LoadState::Loading, None);
@@ -744,9 +748,17 @@ impl Engine {
             Err(_) => return WatchEnd::Failed(Fail::Transient("timed out opening the watch".into())),
         };
         futures::pin_mut!(reader);
+        // The watch is open: normally that is "live". After watches that
+        // were refused right after opening, wait for this one to prove
+        // itself, so the table does not flash Live between failures.
+        let mut live_at = None;
         if self.state != LoadState::Live {
-            self.set_state(LoadState::Live, None);
-            self.publish();
+            if self.quick_gone == 0 {
+                self.set_state(LoadState::Live, None);
+                self.publish();
+            } else {
+                live_at = Some(Instant::now() + Duration::from_secs(2));
+            }
         }
 
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -766,11 +778,24 @@ impl Engine {
                 }
                 return WatchEnd::Failed(Fail::Transient("connection stalled".into()));
             }
-            let wait = if dirty {
+            let mut wait = if dirty {
                 MIN_PUBLISH.saturating_sub(last_publish.elapsed()).min(until_stalled)
             } else {
                 until_stalled
             };
+            if let Some(at) = live_at {
+                let remaining = at.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    live_at = None;
+                    self.quick_gone = 0;
+                    self.set_state(LoadState::Live, None);
+                    self.publish();
+                    dirty = false;
+                    last_publish = Instant::now();
+                    continue;
+                }
+                wait = wait.min(remaining);
+            }
             // `read_until` keeps partial data in `buf` when cancelled, so
             // timing out here loses nothing.
             let read = tokio::select! {
@@ -805,7 +830,14 @@ impl Engine {
                         if dirty {
                             self.publish();
                         }
-                        let productive = lines > 0 || started.elapsed() > Duration::from_secs(5);
+                        // A watch did its job if it delivered something and
+                        // was not cut short at once, or if it simply lasted
+                        // until the server's own timeout. One that ends
+                        // early with nothing (or after a single line) is a
+                        // sign that something cuts watches short.
+                        let age = started.elapsed();
+                        let productive = (lines > 0 && age >= Duration::from_secs(5))
+                            || age >= Duration::from_secs(u64::from(WATCH_TIMEOUT_SECS) - 15);
                         return WatchEnd::Resume { productive };
                     }
                     last_data = Instant::now();
@@ -886,7 +918,8 @@ impl Engine {
                 self.pause(POLL_INTERVAL).await;
                 continue;
             }
-            self.set_state(LoadState::Live, None);
+            // Publish the listed rows, but leave it to `watch()` to declare
+            // the table live once a watch is actually open.
             self.publish();
 
             let mut failures = 0u32;
@@ -897,6 +930,7 @@ impl Engine {
                     WatchEnd::Resume { productive: true } => {
                         failures = 0;
                         unproductive = 0;
+                        self.quick_gone = 0;
                         backoff = BACKOFF_START;
                     }
                     WatchEnd::Resume { productive: false } => {
@@ -916,16 +950,28 @@ impl Engine {
                         }
                     }
                     WatchEnd::Relist => break,
-                    WatchEnd::Failed(Fail::Gone) | WatchEnd::Failed(Fail::Restart) => {
-                        // Usually immediate; back off if it keeps happening.
+                    WatchEnd::Failed(f @ (Fail::Gone | Fail::Restart)) => {
+                        // An expired resourceVersion is normally a one-off
+                        // that a relist cures. If it happens again right
+                        // after opening, back off and say so.
                         if started.elapsed() < Duration::from_secs(5) {
+                            self.quick_gone += 1;
+                            if self.quick_gone >= 2 {
+                                self.set_state(LoadState::Reconnecting, Some(&f));
+                                self.publish();
+                            }
                             self.pause(backoff).await;
                             backoff = (backoff * 2).min(BACKOFF_MAX);
+                        } else {
+                            self.quick_gone = 0;
                         }
                         break;
                     }
                     WatchEnd::Failed(Fail::Permanent { code: 403 | 405, .. }) => {
+                        // Not allowed to watch: poll, and check now and then
+                        // whether that has changed.
                         self.poll_only = true;
+                        self.watch_retry_at = Some(Instant::now() + WATCH_RETRY_AFTER);
                         break;
                     }
                     WatchEnd::Failed(f @ Fail::Permanent { .. }) => {
@@ -972,6 +1018,7 @@ pub(crate) async fn run(store: Arc<TableStore>, client: Client, notify: Notifier
         listed_once: false,
         poll_only: false,
         watch_retry_at: None,
+        quick_gone: 0,
     }
     .run()
     .await
@@ -1076,6 +1123,7 @@ mod tests {
             listed_once: true,
             poll_only: false,
             watch_retry_at: None,
+            quick_gone: 0,
         };
         let mut rv = "1234".to_string();
 
@@ -1225,6 +1273,20 @@ mod tests {
         let (_, watches) = api.counts();
         assert!(watches <= 4, "gave up watching after a few attempts, not {watches}");
         assert_eq!(store.peek().rows.len(), 1);
+    }
+
+    /// A watch that delivers a single line and then ends is not healthy
+    /// either: re-opening it at once would flood the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watches_that_end_after_one_line_do_not_spin() {
+        let api = FakeApi::start(
+            "{\"type\":\"BOOKMARK\",\"object\":{\"kind\":\"Table\",\"metadata\":{\"resourceVersion\":\"6\"},\"rows\":[{\"cells\":[\"\"],\"object\":{\"metadata\":{\"resourceVersion\":\"6\"}}}]}}\n",
+        )
+        .await;
+        let store = api.store();
+        until("polling", Duration::from_secs(8), || store.peek().state == LoadState::Polling).await;
+        let (_, watches) = api.counts();
+        assert!(watches <= 4, "{watches} watch requests: must not re-open in a loop");
     }
 
     /// A refresh requested while the engine is pausing between watch

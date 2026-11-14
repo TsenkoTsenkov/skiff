@@ -37,8 +37,21 @@ pub enum DetailAction {
 
 struct EditState {
     text: String,
+    /// The YAML the edit started from. "Modified" means different from
+    /// this, not from the live object, which keeps changing underneath.
+    base: String,
     job: Option<Job<ObjectData>>,
     error: Option<String>,
+}
+
+impl EditState {
+    fn start(yaml: &str) -> Self {
+        EditState { text: yaml.to_string(), base: yaml.to_string(), job: None, error: None }
+    }
+
+    fn modified(&self) -> bool {
+        self.text != self.base
+    }
 }
 
 pub struct Detail {
@@ -139,10 +152,13 @@ impl Detail {
 
     /// Whether the YAML editor holds changes that have not been applied.
     pub fn has_unsaved_edit(&self) -> bool {
-        match (&self.edit, &self.obj) {
-            (Some(edit), Some(obj)) => edit.text != obj.yaml,
-            _ => false,
-        }
+        self.edit.as_ref().is_some_and(|e| e.modified())
+    }
+
+    /// Leaves edit mode, dropping whatever was typed.
+    pub fn cancel_edit(&mut self) {
+        self.edit = None;
+        self.want_edit = false;
     }
 
     pub fn start_edit(&mut self) {
@@ -152,7 +168,7 @@ impl Detail {
             return;
         }
         match &self.obj {
-            Some(obj) => self.edit = Some(EditState { text: obj.yaml.clone(), job: None, error: None }),
+            Some(obj) => self.edit = Some(EditState::start(&obj.yaml)),
             None => self.want_edit = true,
         }
     }
@@ -186,7 +202,7 @@ impl Detail {
                         self.obj_error = None;
                         if self.want_edit {
                             self.want_edit = false;
-                            self.edit = Some(EditState { text: obj.yaml.clone(), job: None, error: None });
+                            self.edit = Some(EditState::start(&obj.yaml));
                         }
                         self.obj = Some(obj);
                         // Related data may have changed with the object.
@@ -408,7 +424,7 @@ impl Detail {
                 if saving {
                     ui.spinner();
                 }
-                if edit.text != obj.yaml {
+                if edit.modified() {
                     ui.label(RichText::new("modified").color(pal.warn).size(12.0));
                 }
             });
@@ -424,11 +440,8 @@ impl Detail {
             if !overlay_open && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
                 apply = true;
             }
-            // Esc leaves edit mode only when nothing would be lost and the
-            // key was not meant for a dialog or menu on top.
-            if !overlay_open && edit.text == obj.yaml && ui.input(|i| i.key_pressed(Key::Escape)) {
-                cancel = true;
-            }
+            // (Esc is handled by the app's shortcuts, on every tab: it
+            // leaves edit mode only when nothing would be lost.)
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                     let job = if text.as_str().len() <= HIGHLIGHT_EDIT_MAX {

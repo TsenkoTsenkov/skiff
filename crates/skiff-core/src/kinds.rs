@@ -46,7 +46,7 @@ impl ResourceKey {
     pub fn list_path(&self, ns: Option<&str>) -> String {
         match ns {
             Some(ns) if self.namespaced && !ns.is_empty() => {
-                format!("{}/namespaces/{}/{}", self.base_path(), ns, self.plural)
+                format!("{}/namespaces/{}/{}", self.base_path(), crate::util::enc_segment(ns), self.plural)
             }
             _ => format!("{}/{}", self.base_path(), self.plural),
         }
@@ -228,6 +228,7 @@ mod tests {
         let n = nodes();
         assert_eq!(n.object_path("", "n1"), "/api/v1/nodes/n1");
         assert_eq!(n.list_path(Some("ignored")), "/api/v1/nodes");
+        assert_eq!(p.list_path(Some("a/b?c")), "/api/v1/namespaces/a%2Fb%3Fc/pods");
         let cr = builtin("rbac.authorization.k8s.io", "clusterroles").unwrap().key();
         assert_eq!(
             cr.object_path("", "system:a#b c"),

@@ -22,12 +22,12 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_RETRIES: u32 = 30;
 /// The UI is woken at most this often per stream, however fast lines arrive.
 const PING_INTERVAL: Duration = Duration::from_millis(100);
-/// On resume, ask the server to replay this much before the newest line we
-/// have (its `sinceTime` has whole-second resolution and line timestamps are
-/// not strictly ordered), and drop what was already delivered.
-const REPLAY_MS: i64 = 2_000;
-/// How long delivered lines are remembered for that de-duplication.
-const REMEMBER_MS: i64 = REPLAY_MS + 2_000;
+/// On resume, ask the server to replay this much before the point we
+/// reached (its `sinceTime` has whole-second resolution and line timestamps
+/// are not strictly ordered), and drop what was already delivered.
+const REPLAY_MS: i64 = 5_000;
+/// Upper bound on delivered lines remembered for that de-duplication.
+const MAX_REMEMBERED: usize = 200_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogTarget {
@@ -91,6 +91,9 @@ struct Shared {
     /// Whether anything is displaying this stream right now. Lines are
     /// buffered either way; the UI is only woken while it is shown.
     visible: AtomicBool,
+    /// When the UI was last woken for this stream (all of its containers
+    /// share one budget).
+    last_ping: Mutex<Instant>,
 }
 
 impl Shared {
@@ -135,6 +138,18 @@ impl Shared {
         }
         // Take the buffer lock once so an in-flight `push` has finished.
         drop(self.buf.lock());
+    }
+
+    /// Whether a wake-up may be sent now; at most one per `PING_INTERVAL`
+    /// for the whole stream.
+    fn may_ping(&self) -> bool {
+        let mut last = self.last_ping.lock();
+        if last.elapsed() >= PING_INTERVAL {
+            *last = Instant::now();
+            true
+        } else {
+            false
+        }
     }
 
     /// Registers a task, or aborts it right away if we were stopped already.
@@ -249,16 +264,21 @@ pub fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
 /// delivered.
 ///
 /// The API can only resume "since" a whole second, and lines are not always
-/// stamped in order (stdout and stderr interleave; clocks jump), so neither
-/// "newer than the last timestamp" nor "the same count at that timestamp" is
-/// a safe rule. Instead we remember the recent lines themselves, ask the
-/// server to replay a little more than necessary, and drop each replayed
-/// line that matches one we remember.
+/// stamped in order (stdout and stderr interleave), so neither "newer than
+/// the last timestamp" nor "the same count at that timestamp" is a safe
+/// rule. Instead we remember the recent lines themselves, ask the server to
+/// replay a little more than necessary, and drop each replayed line that
+/// matches one we remember.
+///
+/// Only the stream's own timestamps are used, never the local clock: the
+/// node's clock may be ahead of or behind ours by any amount.
 #[derive(Default)]
 struct ResumePoint {
-    /// Newest timestamp delivered.
-    max_ms: i64,
-    /// (timestamp, fingerprint) of recently delivered lines, oldest first.
+    /// Timestamps of the last few delivered lines, newest last. Their median
+    /// is where we have got to; a single line stamped far in the future (or
+    /// past) cannot move it.
+    tail: VecDeque<i64>,
+    /// (timestamp, fingerprint) of recently delivered lines in arrival order.
     recent: VecDeque<(i64, u64)>,
     /// Fingerprints still expected in the replay, with multiplicity.
     skip: HashMap<u64, u32>,
@@ -272,6 +292,18 @@ fn fingerprint(time_ms: i64, text: &str) -> u64 {
 }
 
 impl ResumePoint {
+    const TAIL: usize = 5;
+
+    /// Timestamp the stream has reached, robust to one outlier.
+    fn position(&self) -> Option<i64> {
+        if self.tail.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<i64> = self.tail.iter().copied().collect();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2])
+    }
+
     /// Returns whether the line should be delivered.
     fn admit(&mut self, time_ms: i64, text: &str) -> bool {
         if time_ms <= 0 {
@@ -286,26 +318,35 @@ impl ResumePoint {
             }
             return false;
         }
+        if self.tail.len() == Self::TAIL {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(time_ms);
         self.recent.push_back((time_ms, fp));
-        self.max_ms = self.max_ms.max(time_ms);
-        while self.recent.front().is_some_and(|(t, _)| *t < self.max_ms - REMEMBER_MS) {
+        // Forget what a future replay can no longer contain: lines older
+        // than its starting point. Lines stamped far ahead of the stream
+        // are let go as well so they cannot pin the queue (at worst such a
+        // line shows up once more after a reconnect).
+        let since = self.position().unwrap_or(time_ms) - REPLAY_MS - 1_000;
+        while let Some((t, _)) = self.recent.front() {
+            let stale = *t < since || *t > since + 3_600_000 || self.recent.len() > MAX_REMEMBERED;
+            if !stale {
+                break;
+            }
             self.recent.pop_front();
         }
         true
     }
 
     /// Prepares for a replay and returns the time to resume from, if any
-    /// line with a timestamp was delivered. `now_ms` guards against a line
-    /// stamped in the future pushing the resume point past real time.
-    fn begin_resume(&mut self, now_ms: i64) -> Option<i64> {
-        if self.max_ms <= 0 {
-            return None;
-        }
+    /// line with a timestamp was delivered.
+    fn begin_resume(&mut self) -> Option<i64> {
+        let position = self.position()?;
         self.skip.clear();
         for (_, fp) in &self.recent {
             *self.skip.entry(*fp).or_insert(0) += 1;
         }
-        Some(self.max_ms.min(now_ms) - REPLAY_MS)
+        Some(position - REPLAY_MS)
     }
 }
 
@@ -328,14 +369,25 @@ async fn pump(
     let mut resume = ResumePoint::default();
     let mut connected_once = false;
     let mut attempt = 0u32;
-    // Wake the UI at most every PING_INTERVAL, and only while shown.
-    let mut last_ping = Instant::now() - PING_INTERVAL;
+    // Lines delivered since the UI was last woken for them.
     let mut unannounced = false;
+    // The most recent client that the session considered good.
+    let mut client = first_client;
     loop {
-        // After a reconnect the session has a new client; an old one may be
-        // pointing at a server or credentials that no longer work.
-        let client = provider().unwrap_or_else(|| first_client.clone());
-        let pods: Api<Pod> = Api::namespaced(client, &target.namespace);
+        // After a reconnect the session has a new client; the old one may
+        // point at a server or credentials that no longer work. While the
+        // session is (re)connecting there is nothing useful to try, and
+        // waiting must not use up the retry budget.
+        match provider() {
+            Some(current) => client = current,
+            None if connected_once => {
+                shared.set_state(idx, SourceState::Reconnecting);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            None => {}
+        }
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &target.namespace);
         let mut lp = LogParams {
             container: Some(target.container.clone()),
             follow: opts.follow,
@@ -343,15 +395,16 @@ async fn pump(
             timestamps: true,
             ..Default::default()
         };
-        match resume.begin_resume(jiff::Timestamp::now().as_millisecond()) {
+        match resume.begin_resume() {
             Some(since_ms) => lp.since_time = jiff::Timestamp::from_millisecond(since_ms).ok(),
             None => {
                 lp.tail_lines = opts.tail;
                 lp.since_seconds = opts.since_seconds;
             }
         }
-        let opened = Instant::now();
-        let mut delivered = false;
+        // Whether this attempt got anywhere: it delivered a line, or the
+        // connection was established and stayed up for a while.
+        let mut healthy = false;
         match pods.log_stream(&target.pod, &lp).await {
             Err(e) => {
                 // The very first attempt failing, or the pod being gone, is
@@ -364,6 +417,7 @@ async fn pump(
                 }
             }
             Ok(reader) => {
+                let opened = Instant::now();
                 connected_once = true;
                 shared.set_state(idx, SourceState::Streaming);
                 notify.ping();
@@ -372,11 +426,7 @@ async fn pump(
                 loop {
                     // `read_until` keeps partial data in `buf` when it is
                     // cancelled, so the timeout loses nothing.
-                    let wait = if unannounced {
-                        PING_INTERVAL.saturating_sub(last_ping.elapsed())
-                    } else {
-                        Duration::from_secs(3600)
-                    };
+                    let wait = if unannounced { PING_INTERVAL } else { Duration::from_secs(3600) };
                     let read = tokio::time::timeout(wait, reader.read_until(b'\n', &mut buf)).await;
                     match read {
                         Err(_elapsed) => {}
@@ -393,7 +443,7 @@ async fn pump(
                             let (time_ms, body) = split_timestamp(&text);
                             if resume.admit(time_ms, body) {
                                 shared.push(idx as u16, time_ms, body);
-                                delivered = true;
+                                healthy = true;
                                 unannounced = true;
                             }
                             buf.clear();
@@ -401,9 +451,8 @@ async fn pump(
                         // End of stream (possibly mid-line) or a read error.
                         Ok(_) => break,
                     }
-                    if unannounced && last_ping.elapsed() >= PING_INTERVAL {
+                    if unannounced && shared.may_ping() {
                         unannounced = false;
-                        last_ping = Instant::now();
                         if shared.visible.load(Ordering::Relaxed) {
                             notify.ping();
                         }
@@ -413,6 +462,7 @@ async fn pump(
                     unannounced = false;
                     notify.ping();
                 }
+                healthy |= opened.elapsed() >= Duration::from_secs(1);
                 if !opts.follow || opts.previous {
                     break;
                 }
@@ -420,10 +470,10 @@ async fn pump(
         }
         // The stream ends when the container restarts or the connection
         // drops: back off and resume where we stopped. A connection that
-        // delivered something or simply stayed up was healthy, however often
-        // an idle timeout in between cuts it; only consecutive attempts that
-        // achieve nothing count towards giving up.
-        if delivered || opened.elapsed() >= Duration::from_secs(1) {
+        // delivered something or stayed up was healthy, however often an
+        // idle timeout in between cuts it; only consecutive attempts that
+        // achieve nothing (including slow failures) count towards giving up.
+        if healthy {
             attempt = 0;
         }
         attempt += 1;
@@ -452,6 +502,7 @@ pub(crate) fn open(
         aborts: Mutex::new(Vec::new()),
         stopped: AtomicBool::new(false),
         visible: AtomicBool::new(true),
+        last_ping: Mutex::new(Instant::now() - PING_INTERVAL),
     });
     let stream = Arc::new(LogStream { targets: targets.clone(), options: options.clone(), shared: shared.clone() });
     let h = handle.clone();
@@ -508,20 +559,20 @@ mod tests {
     #[test]
     fn resume_skips_exactly_what_was_delivered() {
         let mut r = ResumePoint::default();
-        assert_eq!(r.begin_resume(10_000), None, "nothing delivered yet: no resume point");
+        assert_eq!(r.begin_resume(), None, "nothing delivered yet: no resume point");
         // First connection.
-        assert!(r.admit(1000, "a"));
-        assert!(r.admit(1500, "b"));
-        assert!(r.admit(1500, "b"), "identical lines are both real");
-        assert!(r.admit(1500, "c"));
-        // Resume replays from earlier than the newest line.
-        assert_eq!(r.begin_resume(10_000), Some(1500 - REPLAY_MS));
-        assert!(!r.admit(1000, "a"));
-        assert!(!r.admit(1500, "b"));
-        assert!(!r.admit(1500, "b"));
-        assert!(r.admit(1500, "b"), "a third identical line was never delivered");
-        assert!(!r.admit(1500, "c"));
-        assert!(r.admit(1600, "d"));
+        assert!(r.admit(100_000, "a"));
+        assert!(r.admit(100_500, "b"));
+        assert!(r.admit(100_500, "b"), "identical lines are both real");
+        assert!(r.admit(100_500, "c"));
+        // Resume replays from before the point we reached.
+        assert_eq!(r.begin_resume(), Some(100_500 - REPLAY_MS));
+        assert!(!r.admit(100_000, "a"));
+        assert!(!r.admit(100_500, "b"));
+        assert!(!r.admit(100_500, "b"));
+        assert!(r.admit(100_500, "b"), "a third identical line was never delivered");
+        assert!(!r.admit(100_500, "c"));
+        assert!(r.admit(100_600, "d"));
         // Lines without a timestamp are always delivered.
         assert!(r.admit(0, "x"));
         assert!(r.admit(0, "x"));
@@ -534,7 +585,7 @@ mod tests {
         let mut r = ResumePoint::default();
         assert!(r.admit(10_000, "seq=1"));
         assert!(r.admit(10_700, "seq=2"));
-        r.begin_resume(60_000);
+        r.begin_resume();
         assert!(!r.admit(10_000, "seq=1"));
         assert!(r.admit(10_600, "seq=3 (stderr, stamped earlier)"));
         assert!(!r.admit(10_700, "seq=2"));
@@ -542,13 +593,55 @@ mod tests {
     }
 
     #[test]
-    fn resume_point_ignores_timestamps_from_the_future() {
+    fn resume_point_is_not_moved_by_one_wild_timestamp() {
+        let hour = 3_600_000;
         let mut r = ResumePoint::default();
-        assert!(r.admit(10_000, "now"));
-        assert!(r.admit(99_000, "clock skew: stamped far ahead"));
-        // Resuming must not skip the stretch between real time and the
-        // bogus timestamp.
-        assert_eq!(r.begin_resume(11_000), Some(11_000 - REPLAY_MS));
+        for (i, t) in [10_000, 10_100, 10_200].into_iter().enumerate() {
+            assert!(r.admit(t, &format!("line {i}")));
+        }
+        // One line stamped an hour ahead, even as the very last line before
+        // the connection drops, must not make the resume skip an hour.
+        assert!(r.admit(10_300 + hour, "from the future"));
+        assert_eq!(r.begin_resume(), Some(10_200 - REPLAY_MS));
+        // ... and neither may one stamped far in the past pull it back.
+        let mut r = ResumePoint::default();
+        for t in [50_000_000, 50_000_100, 50_000_200, 1_000, 50_000_300] {
+            assert!(r.admit(t, "x"));
+        }
+        // (The median of the last five: 1_000 is the outlier.)
+        assert_eq!(r.begin_resume(), Some(50_000_100 - REPLAY_MS));
+    }
+
+    #[test]
+    fn resume_works_whatever_the_node_clock_says() {
+        // The node's clock is far ahead of ours: every timestamp is "in the
+        // future". Nothing may be lost or repeated across a resume.
+        let base = 9_000_000_000_000i64;
+        let mut r = ResumePoint::default();
+        let lines: Vec<(i64, String)> = (0..2_000).map(|i| (base + i * 3, format!("seq={i}"))).collect();
+        for (t, text) in &lines {
+            assert!(r.admit(*t, text));
+        }
+        let since = r.begin_resume().unwrap();
+        // The server replays everything stamped at or after `since`
+        // (rounded down to a whole second, as the API does) plus new lines.
+        let floor = since - since.rem_euclid(1000);
+        let replayed = lines.iter().filter(|(t, _)| *t >= floor);
+        let duplicates = replayed.filter(|(t, text)| r.admit(*t, text)).count();
+        assert_eq!(duplicates, 0, "replayed lines must all be recognised");
+        assert!(r.admit(base + 2_000 * 3, "seq=2000"), "new lines are delivered");
+    }
+
+    #[test]
+    fn remembered_lines_stay_bounded() {
+        let mut r = ResumePoint::default();
+        // A long stream with one future-stamped line early on.
+        assert!(r.admit(1_000_000 + 7_200_000, "wild"));
+        for i in 0..50_000i64 {
+            r.admit(1_000_000 + i * 10, "line");
+        }
+        // Only about the replay window is kept: ~6 s at 100 lines/s.
+        assert!(r.recent.len() < 2_000, "remembered {} lines", r.recent.len());
     }
 
     #[test]
@@ -559,6 +652,7 @@ mod tests {
             aborts: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             visible: AtomicBool::new(true),
+            last_ping: Mutex::new(Instant::now()),
         };
         shared.push(0, 1, "before");
         shared.stop();
@@ -579,6 +673,7 @@ mod tests {
                 aborts: Mutex::new(Vec::new()),
                 stopped: AtomicBool::new(false),
                 visible: AtomicBool::new(true),
+                last_ping: Mutex::new(Instant::now()),
             };
             shared.stop();
             let late = tokio::spawn(std::future::pending::<()>());

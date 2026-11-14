@@ -31,6 +31,8 @@ const IDLE_EVICT_SECS: i64 = 180;
 /// The same, while the UI is not painting at all (hidden or minimised).
 const HIDDEN_EVICT_SECS: i64 = 900;
 const METRICS_INTERVAL: Duration = Duration::from_secs(15);
+/// Upper bound for one-shot requests (get, apply, delete, ...).
+const JOB_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextInfo {
@@ -116,6 +118,8 @@ impl Metrics {
 }
 
 type ClientState = Option<Result<Client, String>>;
+/// Live tables by (resource, namespace scope).
+type Stores = HashMap<(ResourceKey, Option<Box<str>>), Arc<TableStore>>;
 
 pub struct Session {
     pub context: String,
@@ -124,7 +128,7 @@ pub struct Session {
     client_tx: tokio_watch::Sender<ClientState>,
     status: ArcSwap<ConnStatus>,
     discovered: ArcSwap<Vec<Discovered>>,
-    stores: Mutex<HashMap<(ResourceKey, Option<Box<str>>), Arc<TableStore>>>,
+    stores: Mutex<Stores>,
     metrics: ArcSwap<Metrics>,
     metrics_wanted: AtomicI64,
     forwards: Mutex<Vec<Arc<PortForward>>>,
@@ -361,7 +365,7 @@ impl Session {
                 }
 
                 ticks += 1;
-                if ticks % 4 == 0 {
+                if ticks.is_multiple_of(4) {
                     let mut stores = s.stores.lock();
                     // While the UI is painting, tables it stopped asking for
                     // are unused. If nothing is asked for at all the window
@@ -398,7 +402,7 @@ impl Session {
                             // the old connection must not look current.
                             match weak.upgrade() {
                                 Some(s) if s.metrics.load().available => {
-                                    generation += 1;
+                                    generation = generation.max(s.metrics.load().generation) + 1;
                                     s.metrics.store(Arc::new(Metrics { generation, ..Default::default() }));
                                     s.notify.ping();
                                 }
@@ -419,9 +423,18 @@ impl Session {
                         None => return,
                     };
                     let delay = if wanted && now_unix() >= missing_until {
-                        generation += 1;
-                        let sample =
-                            tokio::time::timeout(Duration::from_secs(20), sample_metrics(&client, generation)).await;
+                        generation = generation.max(weak.upgrade().map_or(0, |s| s.metrics.load().generation)) + 1;
+                        // A reconnect must not wait for a sample that is
+                        // still in flight on the old connection.
+                        let sample = tokio::select! {
+                            r = tokio::time::timeout(Duration::from_secs(20), sample_metrics(&client, generation)) => r,
+                            changed = rx.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                                break;
+                            }
+                        };
                         let Some(s) = weak.upgrade() else { return };
                         match sample {
                             Ok(Ok(m)) => {
@@ -492,6 +505,12 @@ impl Session {
             // `send_replace` stores the value even when nobody is subscribed
             // right now; `send` would silently keep the old client.
             self.client_tx.send_replace(None);
+            // Numbers from the old connection are not current any more.
+            let old = self.metrics.load();
+            if old.available {
+                self.metrics
+                    .store(Arc::new(Metrics { generation: old.generation + 1, ..Default::default() }));
+            }
         }
         self.start_connect();
         self.notify.ping();
@@ -587,7 +606,12 @@ impl Session {
         let (j, notify, client) = (job.clone(), self.notify.clone(), self.client());
         self.handle.spawn(async move {
             let res = match client.await {
-                Ok(c) => f(c).await,
+                // One-shot requests never hang forever: a stalled server
+                // must not leave a dialog or a spinner waiting indefinitely.
+                Ok(c) => match tokio::time::timeout(JOB_TIMEOUT, f(c)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(format!("no response from the API server within {} s", JOB_TIMEOUT.as_secs())),
+                },
                 Err(e) => Err(e),
             };
             j.finish(res);

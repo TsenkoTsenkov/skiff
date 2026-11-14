@@ -83,13 +83,26 @@ pub struct Toast {
 enum Pending {
     Simple { job: Job<()>, ok: String },
     Forward { job: Job<Arc<PortForward>>, context: String },
+    /// A manifest apply whose dialog was closed before it finished.
+    Apply { job: Job<Vec<String>> },
 }
 
 /// Modal dialogs.
 pub enum Dialog {
     Delete { key: ResourceKey, ns: String, name: String, force: bool },
     /// `current` fetches the object so the field starts at its real size.
-    Scale { key: ResourceKey, ns: String, name: String, replicas: String, current: Option<Job<skiff_core::ObjectData>> },
+    Scale {
+        key: ResourceKey,
+        ns: String,
+        name: String,
+        replicas: String,
+        current: Option<Job<skiff_core::ObjectData>>,
+        /// Why the current size could not be read, if it could not.
+        error: Option<String>,
+        /// The field has been given focus (done once the size is known, so
+        /// the caret ends up after it).
+        focused: bool,
+    },
     Forward(ForwardDialog),
     /// Create or update objects from a YAML manifest.
     Create { text: String, job: Option<Job<Vec<String>>>, error: Option<String> },
@@ -137,6 +150,9 @@ pub struct SkiffApp {
     tick: Duration,
     /// Frames the current dialog has been shown for (0 = just opened).
     dialog_frames: u32,
+    /// Whether a dialog, the palette or a menu was open when this frame
+    /// began.
+    overlay_at_start: bool,
     /// (context, resource id) pairs whose cluster-wide list was refused.
     forbidden: std::collections::HashSet<(String, String)>,
 }
@@ -273,6 +289,7 @@ impl SkiffApp {
             trace: StartupTrace::from_env(),
             tick: Duration::from_secs(30),
             dialog_frames: 0,
+            overlay_at_start: false,
             forbidden: std::collections::HashSet::new(),
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
@@ -343,6 +360,9 @@ impl SkiffApp {
     }
 
     pub fn disconnect(&mut self, name: &str) {
+        if self.active.as_deref() == Some(name) && self.blocked_by_edit() {
+            return;
+        }
         if let Some(s) = self.sessions.remove(name) {
             s.shutdown();
         }
@@ -389,7 +409,12 @@ impl SkiffApp {
 
     pub fn toast(&mut self, text: impl Into<String>, tone: Tone) {
         let secs = if tone == Tone::Err { 8 } else { 4 };
-        self.toasts.push(Toast { text: text.into(), tone, until: Instant::now() + Duration::from_secs(secs) });
+        let (text, until) = (text.into(), Instant::now() + Duration::from_secs(secs));
+        // Saying the same thing again just keeps it on screen longer.
+        match self.toasts.iter_mut().find(|t| t.text == text) {
+            Some(existing) => existing.until = until,
+            None => self.toasts.push(Toast { text, tone, until }),
+        }
     }
 
     pub fn set_theme(&mut self, ctx: &egui::Context, dark: bool) {
@@ -405,6 +430,17 @@ impl SkiffApp {
                 None => true,
                 Some(Ok(())) => {
                     toasts.push((ok.clone(), Tone::Ok));
+                    false
+                }
+                Some(Err(e)) => {
+                    toasts.push((e, Tone::Err));
+                    false
+                }
+            },
+            Pending::Apply { job } => match job.take() {
+                None => true,
+                Some(Ok(lines)) => {
+                    toasts.push((lines.join("\n"), Tone::Ok));
                     false
                 }
                 Some(Err(e)) => {
@@ -450,13 +486,18 @@ impl SkiffApp {
             self.dialog = None;
             self.toast(lines.join("\n"), Tone::Ok);
         }
-        if let Some(Dialog::Scale { replicas, current, .. }) = &mut self.dialog {
+        if let Some(Dialog::Scale { replicas, current, error, .. }) = &mut self.dialog {
             if let Some(res) = current.as_ref().and_then(|j| j.take()) {
                 *current = None;
-                if let (Ok(obj), true) = (res, replicas.is_empty()) {
-                    if let Some(n) = obj.value.pointer("/spec/replicas").and_then(|v| v.as_i64()) {
-                        *replicas = n.to_string();
+                match res {
+                    Ok(obj) => {
+                        if replicas.is_empty() {
+                            if let Some(n) = obj.value.pointer("/spec/replicas").and_then(|v| v.as_i64()) {
+                                *replicas = n.to_string();
+                            }
+                        }
                     }
+                    Err(e) => *error = Some(format!("Couldn't read the current size: {e}")),
                 }
             }
         }
@@ -502,6 +543,8 @@ impl SkiffApp {
     /// Navigates to an object by kind and name (owner links, palette).
     pub fn open_object(&mut self, key: &ResourceKey, ns: &str, name: &str) {
         let Some(session) = self.session().cloned() else { return };
+        // Jumping to the object that is already open keeps its panel (and
+        // any edit in it) as it is.
         let same = self.detail.as_ref().is_some_and(|d| d.is_for(key, ns, name));
         if !same && self.blocked_by_edit() {
             return;
@@ -518,7 +561,9 @@ impl SkiffApp {
         if key.namespaced && !self.ns_filter.is_empty() && !self.ns_filter.contains(ns) {
             self.ns_filter.insert(ns.to_string());
         }
-        self.detail = Some(Detail::open(&session, key, ns, name));
+        if !same {
+            self.detail = Some(Detail::open(&session, key, ns, name));
+        }
     }
 
     fn open_by_kind(&mut self, kind: &str, ns: &str, name: &str) {
@@ -540,7 +585,7 @@ impl SkiffApp {
         match action {
             RowAction::Logs => {
                 let job = session.log_targets(key, ns, name);
-                self.dock.open_logs(&session, format!("{name}"), job);
+                self.dock.open_logs(&session, name.to_string(), job);
             }
             RowAction::Shell => {
                 let job = session.pod_containers(ns, name);
@@ -579,6 +624,8 @@ impl SkiffApp {
                     name: name.to_string(),
                     replicas: String::new(),
                     current: Some(session.get_object(key, ns, name)),
+                    error: None,
+                    focused: false,
                 });
             }
             RowAction::Forward => {
@@ -659,6 +706,9 @@ impl SkiffApp {
         let started = Instant::now();
         let ctx = ui.ctx().clone();
         self.tick = Duration::from_secs(30);
+        // Sampled before anything is drawn: a key that closes a menu this
+        // frame was meant for that menu, not for the table underneath.
+        self.overlay_at_start = self.overlay_open(&ctx);
         self.poll();
         self.shortcuts(&ctx);
 
@@ -728,14 +778,19 @@ impl SkiffApp {
         if busy {
             return;
         }
-        if ctx.input(|i| i.key_pressed(Key::Slash)) && matches!(self.view, View::Resource(_)) {
+        // Only where a filter box is actually drawn.
+        if ctx.input(|i| i.key_pressed(Key::Slash)) && matches!(self.view, View::Resource(_)) && self.session().is_some() {
             self.focus_filter = true;
             // Don't let the "/" itself land in the filter box.
             ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if self.detail.as_ref().is_some_and(|d| d.editing()) {
-                // Leave edit mode to the detail panel.
+            if let Some(d) = self.detail.as_mut().filter(|d| d.editing()) {
+                // Esc backs out of an untouched edit; typed changes are
+                // only discarded with the Cancel button.
+                if !d.has_unsaved_edit() {
+                    d.cancel_edit();
+                }
             } else if self.detail.is_some() {
                 self.detail = None;
             } else if let View::Resource(key) = &self.view {
@@ -1029,7 +1084,7 @@ impl SkiffApp {
             }
         }
         for (group, keys) in groups {
-            let has_current = matches!(&self.view, View::Resource(k) if keys.iter().any(|x| *x == k));
+            let has_current = matches!(&self.view, View::Resource(k) if keys.contains(&k));
             let open = *self.nav_open.get(group).unwrap_or(&false) || has_current;
             let chevron = if open { icons::ICON_EXPAND_MORE } else { icons::ICON_CHEVRON_RIGHT };
             if nav_row(ui, &pal, chevron, group, false, 0.0).clicked() {
@@ -1257,8 +1312,14 @@ impl SkiffApp {
         }
 
         // Keyboard navigation.
-        let overlay = self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(&ctx);
-        let typing = ctx.text_edit_focused() || overlay || self.terminal_focused;
+        let overlay = self.overlay_at_start
+            || self.palette.is_some()
+            || self.dialog.is_some()
+            || egui::Popup::is_any_open(&ctx);
+        // While unsaved YAML edits are open the selection stays put: moving
+        // it would be refused anyway, one toast per key press.
+        let editing = self.detail.as_ref().is_some_and(|d| d.has_unsaved_edit());
+        let typing = ctx.text_edit_focused() || overlay || self.terminal_focused || editing;
         let mut open_selected = false;
         if !typing {
             let step: Option<i64> = ctx.input(|i| {
@@ -1342,7 +1403,10 @@ impl SkiffApp {
             && self.cache.snap.state == LoadState::Live;
         detail.set_gone(listed && current_rv.is_none());
         self.tick = self.tick.min(Duration::from_secs(5));
-        let overlay = self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(ui.ctx());
+        let overlay = self.overlay_at_start
+            || self.palette.is_some()
+            || self.dialog.is_some()
+            || egui::Popup::is_any_open(ui.ctx());
         let mut actions = Vec::new();
         // Leave the table usable in small windows.
         let max_width = (ui.available_width() - 340.0).clamp(300.0, 1100.0);
@@ -1436,45 +1500,54 @@ impl SkiffApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(pal.err);
-                        let del = ui.add(del);
-                        if fresh {
-                            del.request_focus();
-                        }
-                        if del.clicked() {
+                        if ui.add(del).clicked() {
                             push = Some(Pending::Simple {
                                 job: session.delete_object(key, ns, name, *force),
                                 ok: format!("Deleted {name}"),
                             });
                             close = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Cancel is the default: a key held a moment too
+                        // long (or repeated) must never confirm a deletion.
+                        let cancel = ui.button("Cancel");
+                        if fresh {
+                            cancel.request_focus();
+                        }
+                        if cancel.clicked() {
                             close = true;
                         }
                     });
                 }
-                Dialog::Scale { key, ns, name, replicas, current } => {
+                Dialog::Scale { key, ns, name, replicas, current, error, focused } => {
                     ui.label(widgets::semibold(format!("Scale {name}"), 15.0));
                     ui.add_space(6.0);
                     let mut submitted = false;
                     ui.horizontal(|ui| {
                         ui.label("Replicas");
                         let edit = ui.add(egui::TextEdit::singleline(replicas).hint_text("count").desired_width(70.0));
-                        if fresh {
+                        // Focus once the current size is in the field (or
+                        // could not be read): focusing it while empty would
+                        // leave the caret in front of the number.
+                        if current.is_none() && !*focused {
+                            *focused = true;
                             edit.request_focus();
                         }
                         submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if current.is_some() {
                             ui.spinner();
                         }
-                        if ui.small_button("−").clicked() {
-                            let n: i32 = replicas.trim().parse().unwrap_or(1);
-                            *replicas = (n - 1).max(0).to_string();
+                        // Stepping needs a number to step from.
+                        let known: Option<i32> = replicas.trim().parse().ok();
+                        if ui.add_enabled(known.is_some(), egui::Button::new("−").small()).clicked() {
+                            *replicas = (known.unwrap_or(1) - 1).max(0).to_string();
                         }
-                        if ui.small_button("+").clicked() {
-                            let n: i32 = replicas.trim().parse().unwrap_or(0);
-                            *replicas = (n + 1).to_string();
+                        if ui.add_enabled(known.is_some(), egui::Button::new("+").small()).clicked() {
+                            *replicas = (known.unwrap_or(0) + 1).to_string();
                         }
                     });
+                    if let Some(err) = error {
+                        ui.add(egui::Label::new(RichText::new(&*err).color(pal.warn).size(12.0)).wrap());
+                    }
                     ui.add_space(10.0);
                     let parsed: Option<i32> = replicas.trim().parse().ok().filter(|n| *n >= 0);
                     ui.horizontal(|ui| {
@@ -1539,8 +1612,14 @@ impl SkiffApp {
                             *error = None;
                             *job = Some(session.apply_manifest(text.clone()));
                         }
-                        // Closing now would lose the outcome of the request.
-                        if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
+                        // Always a way out, even when the server has stopped
+                        // answering: a running request keeps going and
+                        // reports its result as a notification.
+                        let label = if busy { "Close" } else { "Cancel" };
+                        if ui.button(label).clicked() {
+                            if let Some(running) = job.take() {
+                                push = Some(Pending::Apply { job: running });
+                            }
                             close = true;
                         }
                         if busy {

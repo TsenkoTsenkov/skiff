@@ -41,6 +41,22 @@ fn connected(core: &Core, context: &str) -> std::sync::Arc<Session> {
     session
 }
 
+/// Requests of one kind the API server currently holds open (follow logs,
+/// exec sessions, port-forwards), from its own metrics. This is the
+/// server's view: it only goes down when the connection is really closed.
+fn held_open(subresource: &str) -> u64 {
+    let out = std::process::Command::new("kubectl")
+        .args(["--context", "demo", "get", "--raw", "/metrics"])
+        .output()
+        .expect("kubectl is needed for this test");
+    let needle = format!("subresource=\"{subresource}\"");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("apiserver_longrunning_requests{") && l.contains(&needle))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum::<f64>() as u64
+}
+
 /// A running pod in the demo cluster, as (namespace, name).
 fn some_running_pod(session: &Session) -> (String, String) {
     let store = session.table(&kinds::pods());
@@ -68,23 +84,73 @@ fn dropping_a_log_stream_or_shell_stops_its_tasks() {
     wait_for("containers", Duration::from_secs(10), || containers.is_done());
     let container = containers.take().unwrap().unwrap().remove(0).name;
 
+    // Let start-up work (discovery) finish so the task baseline is stable.
+    wait_for("discovery", Duration::from_secs(20), || !session.discovered().is_empty());
     let metrics = core.handle().metrics();
-    let settle = Duration::from_millis(300);
-    std::thread::sleep(settle);
-    let baseline = metrics.num_alive_tasks();
+    let mut baseline = metrics.num_alive_tasks();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(150));
+        let now = metrics.num_alive_tasks();
+        if now == baseline {
+            break;
+        }
+        baseline = now;
+    }
+    let (logs_before, exec_before) = (held_open("log"), held_open("exec"));
 
     let target = LogTarget { namespace: ns.clone(), pod: pod.clone(), container: container.clone() };
     let logs = session.logs(vec![target], LogOptions::default());
     wait_for("log stream", Duration::from_secs(15), || logs.states() == [SourceState::Streaming]);
     assert!(metrics.num_alive_tasks() > baseline, "log stream should be running tasks");
+    wait_for("server sees the follow", Duration::from_secs(5), || held_open("log") > logs_before);
     drop(logs);
     wait_for("log tasks to stop after drop", Duration::from_secs(5), || metrics.num_alive_tasks() <= baseline);
+    wait_for("server-side log stream to close", Duration::from_secs(5), || held_open("log") <= logs_before);
 
+    // Dropped and explicitly closed shells must both end on the server,
+    // including shells whose process ignores end-of-input.
+    for explicit_close in [false, true] {
+        let shell = session.exec(&ns, &pod, &container, vec!["sh".into()]);
+        wait_for("shell", Duration::from_secs(15), || shell.state() == ExecState::Running);
+        wait_for("server sees the exec", Duration::from_secs(5), || held_open("exec") > exec_before);
+        if explicit_close {
+            shell.close();
+            assert_eq!(shell.state(), ExecState::Exited("closed".into()));
+        }
+        drop(shell);
+        wait_for("exec tasks to stop", Duration::from_secs(6), || metrics.num_alive_tasks() <= baseline);
+        wait_for("server-side exec to close", Duration::from_secs(6), || held_open("exec") <= exec_before);
+    }
+}
+
+#[test]
+fn session_shutdown_ends_streams_and_shells() {
+    let Some(kc) = kubeconfig() else { return };
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("KUBECONFIG", &kc) };
+    let core = Core::new(Notifier::noop()).unwrap();
+    let session = connected(&core, "demo");
+    let (ns, pod) = some_running_pod(&session);
+    let containers = session.pod_containers(&ns, &pod);
+    wait_for("containers", Duration::from_secs(10), || containers.is_done());
+    let container = containers.take().unwrap().unwrap().remove(0).name;
+    let (logs_before, exec_before) = (held_open("log"), held_open("exec"));
+
+    let target = LogTarget { namespace: ns.clone(), pod: pod.clone(), container: container.clone() };
+    let logs = session.logs(vec![target], LogOptions::default());
     let shell = session.exec(&ns, &pod, &container, vec!["sh".into()]);
+    wait_for("log stream", Duration::from_secs(15), || logs.states() == [SourceState::Streaming]);
     wait_for("shell", Duration::from_secs(15), || shell.state() == ExecState::Running);
-    assert!(metrics.num_alive_tasks() > baseline, "exec should be running tasks");
-    drop(shell);
-    wait_for("exec tasks to stop after drop", Duration::from_secs(5), || metrics.num_alive_tasks() <= baseline);
+
+    // The handles are still held: shutdown alone must end both.
+    session.shutdown();
+    wait_for("stream ended", Duration::from_secs(5), || logs.states() == [SourceState::Ended]);
+    wait_for("shell ended", Duration::from_secs(5), || matches!(shell.state(), ExecState::Exited(_)));
+    wait_for("server-side log stream to close", Duration::from_secs(6), || held_open("log") <= logs_before);
+    wait_for("server-side exec to close", Duration::from_secs(6), || held_open("exec") <= exec_before);
+    let lines = logs.with(|b| b.generation);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(logs.with(|b| b.generation), lines, "no lines may arrive after shutdown");
 }
 
 #[test]

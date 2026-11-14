@@ -109,6 +109,7 @@ struct Target {
     container: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     shared: Arc<Shared>,
     target: Target,
@@ -136,11 +137,18 @@ async fn drive(
     loop {
         tokio::select! {
             _ = closing.notified() => {
-                // End of input first, so the remote shell sees EOF and
-                // exits; then give the connection a moment to wind down
-                // before it is dropped.
-                drop(stdin);
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(800), proc.join()).await;
+                // End of input first (an explicit shutdown: merely dropping
+                // the writer signals nothing), so the remote shell sees EOF
+                // and exits. Give it a moment, then abort the connection
+                // whatever happened. `proc` must stay owned here: handing
+                // it to `join()` under a timeout would detach its task and
+                // leak the connection.
+                let _ = stdin.shutdown().await;
+                let drain = async {
+                    while matches!(stdout.read(&mut buf).await, Ok(n) if n > 0) {}
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(800), drain).await;
+                proc.abort();
                 return Ok("closed".into());
             }
             n = stdout.read(&mut buf) => {

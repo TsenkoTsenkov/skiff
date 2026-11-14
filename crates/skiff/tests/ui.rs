@@ -386,6 +386,7 @@ fn unsaved_yaml_edits_block_navigation() {
     let editing = h.state().detail.as_ref().unwrap().name.clone();
     h.get_by_label("Edit YAML").click();
     settle(&mut h, "editor", |h| has_label(h, "Cancel"));
+    assert!(!h.state().detail.as_ref().unwrap().has_unsaved_edit(), "an untouched edit is not unsaved");
     // Focus through the accessibility tree: the editor is taller than the
     // window, so a click at its centre would land off-screen.
     h.get_by_role(Role::MultilineTextInput).focus();
@@ -477,7 +478,18 @@ fn delete_dialog_waits_for_an_explicit_confirmation() {
     }
     assert!(h.state().dialog.is_some(), "the dialog must stay open until answered");
     shot(&mut h, "22_delete_dialog");
-    // Esc cancels, and the object is still there.
+    // Enter goes to the default button, which is Cancel: a key held too
+    // long on the Delete action can never confirm the deletion.
+    h.key_press(egui::Key::Enter);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.state().dialog.is_none(), "Enter activates the default (Cancel) button");
+    assert_eq!(kubectl(&["-n", &ns, "get", "cm", &name, "-o", "jsonpath={.metadata.name}"]), name);
+
+    // Esc cancels as well.
+    h.get_by_label("Delete").click();
+    settle(&mut h, "dialog", |h| h.state().dialog.is_some());
     h.key_press(egui::Key::Escape);
     for _ in 0..3 {
         h.step();

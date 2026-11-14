@@ -408,7 +408,7 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
         let key = discovered
             .iter()
             .map(|d| &d.key)
-            .find(|k| &*k.kind == kind && &*k.group == group)
+            .find(|k| *k.kind == *kind && *k.group == *group)
             .cloned()
             .or_else(|| crate::kinds::builtin_by_kind(&kind).map(|b| b.key()).filter(|k| &*k.group == group))
             .map(|k| ResourceKey::new(group, version, &k.plural, &k.kind, k.namespaced));

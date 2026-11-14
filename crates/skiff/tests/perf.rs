@@ -110,7 +110,8 @@ fn large_cluster() {
         loop {
             h.step();
             let (shown, live) = h.state().table_stats();
-            if live && shown > 0 {
+            // Events expire after an hour, so an idle cluster may have none.
+            if live && h.state().view_id().starts_with(&view.to_lowercase()) {
                 println!("{view}: {shown} rows live {:?} after click", t.elapsed());
                 break;
             }

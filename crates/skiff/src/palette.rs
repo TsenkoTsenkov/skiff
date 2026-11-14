@@ -195,7 +195,7 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
                 }
             }
         }
-        found.sort_by(|a, b| b.score.cmp(&a.score));
+        found.sort_by_key(|item| std::cmp::Reverse(item.score));
         found.truncate(40);
         items.extend(found);
     }

@@ -27,6 +27,11 @@ pub struct TableUi {
     pub col_visible: HashMap<String, bool>,
     /// Set to scroll the selected row into view on the next frame.
     pub scroll_to_selected: bool,
+    /// Scroll position and column count of the last frame, to carry the
+    /// position over when the set of columns (and so the table's stored
+    /// state) changes.
+    pub scroll_y: f32,
+    pub last_cols: usize,
 }
 
 /// A column as displayed: either from the snapshot or computed in the UI.
@@ -443,9 +448,10 @@ pub fn show(
 
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut builder = TableBuilder::new(ui)
-        // Keyed on the resource only: the scroll position must survive the
-        // column set changing (the table drops stale widths by itself).
-        .id_salt(("resource-table", key.id()))
+        // One stored state per column count, so widths the user dragged
+        // survive the detail panel opening and closing (which changes how
+        // many columns fit). The scroll position is carried over below.
+        .id_salt(("resource-table", key.id(), cols.len()))
         .striped(false)
         .resizable(true)
         .sense(Sense::click())
@@ -462,6 +468,12 @@ pub fn show(
             TableColumn::initial(width).at_least(36.0).clip(true)
         });
     }
+    if tui.last_cols != cols.len() {
+        if tui.last_cols != 0 {
+            builder = builder.vertical_scroll_offset(tui.scroll_y);
+        }
+        tui.last_cols = cols.len();
+    }
     if tui.scroll_to_selected {
         tui.scroll_to_selected = false;
         if let Some(pos) = selected_uid.as_deref().and_then(|uid| cache.position(uid)) {
@@ -469,7 +481,7 @@ pub fn show(
         }
     }
 
-    builder
+    let scroll = builder
         .header(28.0, |mut header| {
             for c in cols {
                 header.col(|ui| {
@@ -591,6 +603,8 @@ pub fn show(
                 });
             });
         });
+
+    tui.scroll_y = scroll.state.clamped_offset().y;
 
     if let Some(title) = clicked_header {
         tui.sort = Some(if title.eq_ignore_ascii_case(&sort_title) {
