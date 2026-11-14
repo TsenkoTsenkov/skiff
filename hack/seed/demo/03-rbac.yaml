@@ -83,3 +83,38 @@ roleRef: {kind: ClusterRole, name: skiff-crd-admin, apiGroup: rbac.authorization
 apiVersion: v1
 kind: ServiceAccount
 metadata: {name: batch-runner, namespace: incidents}
+---
+# An account confined to one namespace, for testing how the UI behaves
+# without cluster-wide list rights (see hack/restricted-kubeconfig.sh).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: skiff-viewer
+  namespace: shop
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: skiff-viewer
+  namespace: shop
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "configmaps", "services", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: skiff-viewer
+  namespace: shop
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: skiff-viewer
+subjects:
+  - kind: ServiceAccount
+    name: skiff-viewer
+    namespace: shop

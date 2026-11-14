@@ -11,7 +11,7 @@ use egui_kittest::Harness;
 use skiff::{AppOptions, SkiffApp};
 
 fn harness(context: &str, view: &str) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None };
     Harness::builder()
         .with_size([1440.0, 900.0])
         .with_pixels_per_point(1.0)

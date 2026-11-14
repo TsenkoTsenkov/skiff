@@ -62,6 +62,8 @@ pub struct AppOptions {
     pub light: bool,
     /// Initial view, as a resource id such as `pods` or `deployments.apps`.
     pub view: Option<String>,
+    /// Start with the namespace filter set to this namespace.
+    pub namespace: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -274,6 +276,9 @@ impl SkiffApp {
             .or(app.contexts.items.first().map(|c| c.name.clone()));
         if let Some(c) = initial {
             app.switch_context(&c);
+        }
+        if let Some(ns) = opts.namespace {
+            app.ns_filter = BTreeSet::from([ns]);
         }
         if let Some(id) = opts.view {
             if let Some(b) = BUILTINS.iter().find(|b| b.key().id() == id || b.plural == id) {
@@ -885,11 +890,35 @@ impl SkiffApp {
                         }
                     }
                     if snap.rows.is_empty() {
-                        let msg = match snap.state {
-                            LoadState::Failed => snap.error.as_deref().unwrap_or("failed to list namespaces"),
-                            _ => "Loading…",
-                        };
-                        ui.label(RichText::new(msg).color(pal.muted));
+                        match snap.state {
+                            LoadState::Failed => {
+                                // Not allowed to list namespaces: let the
+                                // user name the one they work in.
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new("Namespaces can't be listed with this account. Type a namespace name above to use it.")
+                                            .color(pal.muted)
+                                            .size(12.0),
+                                    )
+                                    .wrap(),
+                                );
+                                let typed = self.ns_search.trim().to_string();
+                                if !typed.is_empty() && ui.button(format!("Use namespace \"{typed}\"")).clicked() {
+                                    self.ns_filter = BTreeSet::from([typed]);
+                                    self.ns_search.clear();
+                                    ui.close();
+                                }
+                                for name in self.ns_filter.clone() {
+                                    let mut on = true;
+                                    if ui.checkbox(&mut on, &name).changed() {
+                                        self.ns_filter.remove(&name);
+                                    }
+                                }
+                            }
+                            _ => {
+                                ui.label(RichText::new("Loading…").color(pal.muted));
+                            }
+                        }
                     }
                 });
             });
@@ -1040,8 +1069,17 @@ impl SkiffApp {
             return;
         };
         let ctx = ui.ctx().clone();
-        let store = session.table(key);
-        let latest = store.snapshot();
+        let mut store = session.table(key);
+        let mut latest = store.snapshot();
+        // Accounts confined to a namespace may not list cluster-wide. With a
+        // single namespace selected, watch just that namespace instead.
+        let forbidden = latest.state == LoadState::Failed && latest.error_code == 403 && key.namespaced;
+        if forbidden && self.ns_filter.len() == 1 {
+            if let Some(ns) = self.ns_filter.iter().next() {
+                store = session.table_in(key, Some(ns));
+                latest = store.snapshot();
+            }
+        }
         let metrics = if key.is("", "pods") || key.is("", "nodes") {
             session.metrics()
         } else {
@@ -1124,8 +1162,11 @@ impl SkiffApp {
         if shown == 0 {
             match snap.state {
                 LoadState::Failed => {
-                    let msg = snap.error.as_deref().unwrap_or("request failed");
-                    widgets::empty_state(ui, icons::ICON_ERROR, "Couldn't load this view", msg, &pal);
+                    let mut msg = snap.error.as_deref().unwrap_or("request failed").to_string();
+                    if snap.error_code == 403 && key.namespaced && self.ns_filter.len() != 1 {
+                        msg.push_str("\n\nIf your account is limited to a namespace, select that one namespace in the picker at the top.");
+                    }
+                    widgets::empty_state(ui, icons::ICON_ERROR, "Couldn't load this view", &msg, &pal);
                     ui.vertical_centered(|ui| {
                         ui.add_space(8.0);
                         if ui.button("Retry").clicked() {

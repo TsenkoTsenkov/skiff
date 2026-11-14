@@ -49,7 +49,7 @@ pub fn setup() -> bool {
 }
 
 pub fn harness_sized(context: &str, view: &str, size: [f32; 2], light: bool) -> H {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -1798,7 +1798,7 @@ fn t14_unreachable_cluster() {
     }
     unsafe { std::env::set_var("KUBECONFIG", &dead) };
     let t0 = Instant::now();
-    let opts = AppOptions { context: Some("dead".into()), view: Some("pods".into()), light: false };
+    let opts = AppOptions { context: Some("dead".into()), view: Some("pods".into()), light: false, namespace: None };
     let mut h = Harness::builder()
         .with_size([1440.0, 900.0])
         .with_pixels_per_point(1.0)

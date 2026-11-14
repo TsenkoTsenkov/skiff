@@ -10,6 +10,7 @@ USAGE:
 
 OPTIONS:
     -c, --context <NAME>   Open this kubeconfig context (default: last used / current)
+    -n, --namespace <NS>   Start with only this namespace selected
         --view <RESOURCE>  Start on a resource view, e.g. pods or deployments.apps
         --light            Use the light theme
     -h, --help             Show this help
@@ -23,6 +24,7 @@ fn parse_args() -> Result<AppOptions, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-c" | "--context" => opts.context = Some(args.next().ok_or("--context needs a value")?),
+            "-n" | "--namespace" => opts.namespace = Some(args.next().ok_or("--namespace needs a value")?),
             "--view" => opts.view = Some(args.next().ok_or("--view needs a value")?),
             "--light" => opts.light = true,
             "-h" | "--help" => {

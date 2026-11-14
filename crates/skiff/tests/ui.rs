@@ -16,21 +16,42 @@ fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn test_context() -> Option<String> {
-    let kubeconfig = std::env::var("SKIFF_TEST_KUBECONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace().join("hack/kubeconfig"));
-    if !kubeconfig.exists() {
-        eprintln!("skipping: no kubeconfig at {}", kubeconfig.display());
-        return None;
+/// Points `$KUBECONFIG` at the dev clusters. Every test sets the same value
+/// (the environment is shared by all test threads), merging in the
+/// restricted-account kubeconfig when one is provided.
+fn use_test_kubeconfig() -> bool {
+    static VALUE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let value = VALUE.get_or_init(|| {
+        let main = std::env::var("SKIFF_TEST_KUBECONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| workspace().join("hack/kubeconfig"));
+        if !main.exists() {
+            eprintln!("skipping: no kubeconfig at {}", main.display());
+            return None;
+        }
+        let mut value = main.display().to_string();
+        if let Ok(extra) = std::env::var("SKIFF_TEST_RESTRICTED_KUBECONFIG") {
+            value.push(if cfg!(windows) { ';' } else { ':' });
+            value.push_str(&extra);
+        }
+        Some(value)
+    });
+    match value {
+        Some(v) => {
+            // SAFETY: always the same value, see above.
+            unsafe { std::env::set_var("KUBECONFIG", v) };
+            true
+        }
+        None => false,
     }
-    // SAFETY: tests in this file only ever set the same value.
-    unsafe { std::env::set_var("KUBECONFIG", &kubeconfig) };
-    Some(std::env::var("SKIFF_TEST_CONTEXT").unwrap_or_else(|_| "demo".to_string()))
+}
+
+fn test_context() -> Option<String> {
+    use_test_kubeconfig().then(|| std::env::var("SKIFF_TEST_CONTEXT").unwrap_or_else(|_| "demo".to_string()))
 }
 
 fn harness(context: &str, view: &str, size: [f32; 2]) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -169,7 +190,7 @@ fn logs_dock_streams_and_filters() {
 }
 
 fn harness_with(context: &str, view: &str, size: [f32; 2], light: bool) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -290,4 +311,56 @@ fn gsub_features(font: &[u8]) -> Vec<String> {
     (0..u16_at(list))
         .map(|i| String::from_utf8_lossy(&font[list + 2 + i * 6..list + 6 + i * 6]).into_owned())
         .collect()
+}
+
+/// An account that may only read one namespace. Needs a kubeconfig for such
+/// an account in `SKIFF_TEST_RESTRICTED_KUBECONFIG` (context `restricted`,
+/// allowed namespace in `SKIFF_TEST_RESTRICTED_NAMESPACE`, default `shop`).
+#[test]
+fn restricted_account_can_work_in_its_namespace() {
+    if std::env::var("SKIFF_TEST_RESTRICTED_KUBECONFIG").is_err() {
+        eprintln!("skipping: SKIFF_TEST_RESTRICTED_KUBECONFIG not set (see hack/restricted-kubeconfig.sh)");
+        return;
+    }
+    if !use_test_kubeconfig() {
+        return;
+    }
+    let ns = std::env::var("SKIFF_TEST_RESTRICTED_NAMESPACE").unwrap_or_else(|_| "shop".to_string());
+
+    // Without a namespace the cluster-wide list is refused, and the app
+    // says what to do about it.
+    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: None };
+    let mut h = Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless(&cc.egui_ctx, opts));
+    settle(&mut h, "forbidden message", |h| has_label(h, "Couldn't load this view"));
+    assert!(has_label_containing(&h, "select that one namespace"), "should explain the namespace fallback");
+    shot(&mut h, "17_restricted_all_namespaces");
+
+    // With the namespace selected, the table loads from a namespaced watch.
+    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: Some(ns.clone()) };
+    let mut h = Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless(&cc.egui_ctx, opts));
+    settle(&mut h, "pods in the allowed namespace", |h| {
+        let (rows, live) = h.state().table_stats();
+        live && rows > 0
+    });
+    assert!(!has_label(&h, "Couldn't load this view"));
+    shot(&mut h, "18_restricted_one_namespace");
+
+    // Opening the namespace picker offers a way to name a namespace even
+    // though namespaces cannot be listed.
+    // The picker button is the topmost node showing the namespace name.
+    let top = h
+        .query_all_by_label_contains(&ns)
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("namespace picker button");
+    top.click();
+    settle(&mut h, "picker", |h| has_label_containing(h, "can't be listed"));
+    shot(&mut h, "19_restricted_picker");
 }
