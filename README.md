@@ -136,8 +136,8 @@ as on Linux.
 
 Without a Mac toolchain at hand, GitHub can build it: the workflow in
 `.github/workflows/macos.yml` produces the disk image on an Apple Silicon
-runner for every push to `main` (as an artifact of the run) and attaches it
-to a release when a tag such as `v0.1.0` is pushed. Such a downloaded copy is
+runner and attaches it to a release when a tag such as `v0.1.0` is pushed
+(or when the workflow is started by hand). Such a downloaded copy is
 not notarized by Apple, so the first launch has to be allowed once: System
 Settings → Privacy & Security → Open Anyway, or
 

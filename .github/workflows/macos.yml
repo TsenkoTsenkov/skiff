@@ -1,11 +1,14 @@
 # Builds Skiff for Apple Silicon on GitHub's own Macs and offers the disk
-# image for download: as an artifact of every run, and attached to a release
-# when a tag like v0.1.0 is pushed.
+# image for download: attached to a release when a tag like v0.1.0 is
+# pushed, and as an artifact of the run. It can also be started by hand
+# (Actions > macOS build > Run workflow), which runs the unit tests as well.
+#
+# Only tags start it by themselves: on a private repository a Mac runner
+# uses up the included Actions minutes ten times as fast as a Linux one.
 name: macOS build
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -40,6 +43,7 @@ jobs:
 
   tests:
     name: Unit tests on macOS
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
