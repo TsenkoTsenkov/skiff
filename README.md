@@ -81,8 +81,8 @@ cargo build --release
 ./target/release/skiff
 ```
 
-Options: `--context <name>`, `--view <resource>` (e.g. `--view pods`),
-`--light`. Clusters come from `$KUBECONFIG` or `~/.kube/config`; exec-based
+Options: `--context <name>`, `--namespace <name>`, `--view <resource>` (e.g.
+`--view pods`), `--light`. Clusters come from `$KUBECONFIG` or `~/.kube/config`; exec-based
 auth plugins (EKS, GKE, …) and OIDC are supported.
 
 Linux needs a Vulkan or OpenGL driver and `libxkbcommon` (on Debian/Ubuntu:
@@ -151,8 +151,9 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 
 - Helm releases
 - Node drain, cron job trigger, bulk actions on multiple rows
-- Namespace-scoped watches for accounts that cannot list cluster-wide (the
-  data layer supports them; the UI does not switch to them yet)
+- Accounts limited to a namespace: tables work once that one namespace is
+  selected (`-n <namespace>` or the picker), but the overview page and
+  selecting several namespaces still need cluster-wide list rights
 
 ## License
 
