@@ -1,6 +1,7 @@
 //! Streaming pod logs from one or many containers into a bounded buffer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use crate::util::{friendly, Notifier};
 
 const MAX_LINES: usize = 100_000;
 const MAX_LINE_BYTES: usize = 64 * 1024;
+/// How often a dropped follow stream is retried before giving up.
+const MAX_RETRIES: u32 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogTarget {
@@ -61,77 +64,96 @@ pub struct LogBuffer {
 pub enum SourceState {
     Connecting,
     Streaming,
+    /// Connection lost; retrying.
+    Reconnecting,
     Ended,
     Failed(String),
 }
 
-pub struct LogStream {
-    pub targets: Vec<LogTarget>,
-    pub options: LogOptions,
+/// State shared between the handle and its background tasks. The tasks hold
+/// only this, never the `LogStream` handle, so dropping the handle stops
+/// them.
+struct Shared {
     buf: Mutex<LogBuffer>,
     states: Mutex<Vec<SourceState>>,
     aborts: Mutex<Vec<AbortHandle>>,
+    stopped: AtomicBool,
 }
 
-impl LogStream {
-    pub fn with<R>(&self, f: impl FnOnce(&LogBuffer) -> R) -> R {
-        f(&self.buf.lock())
-    }
-
-    pub fn states(&self) -> Vec<SourceState> {
-        self.states.lock().clone()
-    }
-
-    pub fn clear(&self) {
-        let mut b = self.buf.lock();
-        b.lines.clear();
-        b.generation += 1;
-    }
-
-    pub fn stop(&self) {
-        for h in self.aborts.lock().drain(..) {
-            h.abort();
-        }
-        for s in self.states.lock().iter_mut() {
-            if matches!(s, SourceState::Connecting | SourceState::Streaming) {
-                *s = SourceState::Ended;
-            }
-        }
-    }
-
+impl Shared {
     fn set_state(&self, idx: usize, s: SourceState) {
         if let Some(slot) = self.states.lock().get_mut(idx) {
             *slot = s;
         }
     }
 
-    fn push(&self, source: u16, raw: &[u8]) -> i64 {
-        let mut raw = raw;
-        while let Some((last, rest)) = raw.split_last() {
-            if *last == b'\n' || *last == b'\r' {
-                raw = rest;
-            } else {
-                break;
-            }
-        }
-        let text = String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE_BYTES)]);
-        let (time_ms, body) = split_timestamp(&text);
+    fn push(&self, source: u16, time_ms: i64, text: &str) {
         let mut b = self.buf.lock();
         if b.lines.len() >= MAX_LINES {
             b.lines.pop_front();
             b.dropped += 1;
         }
-        b.lines.push_back(LogLine { source, time_ms, text: body.into() });
+        b.lines.push_back(LogLine { source, time_ms, text: text.into() });
         b.generation += 1;
-        time_ms
+    }
+
+    fn stop(&self) {
+        // Taking the lock orders this against tasks registering new handles.
+        let mut aborts = self.aborts.lock();
+        self.stopped.store(true, Ordering::SeqCst);
+        for h in aborts.drain(..) {
+            h.abort();
+        }
+        drop(aborts);
+        for s in self.states.lock().iter_mut() {
+            if matches!(s, SourceState::Connecting | SourceState::Streaming | SourceState::Reconnecting) {
+                *s = SourceState::Ended;
+            }
+        }
+    }
+
+    /// Registers a task, or aborts it right away if we were stopped already.
+    fn track(&self, handle: AbortHandle) {
+        let mut aborts = self.aborts.lock();
+        if self.stopped.load(Ordering::SeqCst) {
+            handle.abort();
+        } else {
+            aborts.push(handle);
+        }
+    }
+}
+
+/// A set of followed containers. Dropping it (or calling `stop`) ends the
+/// streams.
+pub struct LogStream {
+    pub targets: Vec<LogTarget>,
+    pub options: LogOptions,
+    shared: Arc<Shared>,
+}
+
+impl LogStream {
+    pub fn with<R>(&self, f: impl FnOnce(&LogBuffer) -> R) -> R {
+        f(&self.shared.buf.lock())
+    }
+
+    pub fn states(&self) -> Vec<SourceState> {
+        self.shared.states.lock().clone()
+    }
+
+    pub fn clear(&self) {
+        let mut b = self.shared.buf.lock();
+        b.lines.clear();
+        b.generation += 1;
+    }
+
+    pub fn stop(&self) {
+        self.shared.stop();
     }
 }
 
 impl Drop for LogStream {
     fn drop(&mut self) {
-        for h in self.aborts.lock().drain(..) {
-            h.abort();
-        }
+        self.shared.stop();
     }
 }
 
@@ -192,11 +214,66 @@ pub fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-async fn pump(stream: Arc<LogStream>, client: Client, idx: usize, notify: Notifier) {
-    let target = stream.targets[idx].clone();
+/// Remembers where a stream stopped so a resumed stream can skip what was
+/// already delivered. The API only resumes at whole seconds, so the last
+/// second arrives again.
+#[derive(Default)]
+struct ResumePoint {
+    /// Timestamp of the newest line delivered.
+    last_ms: i64,
+    /// How many lines carried exactly that timestamp.
+    at_last: usize,
+    /// Lines at `last_ms` still to skip after a resume.
+    skip_at_last: usize,
+    resuming: bool,
+}
+
+impl ResumePoint {
+    /// Returns whether the line should be delivered.
+    fn admit(&mut self, time_ms: i64) -> bool {
+        if time_ms <= 0 {
+            return true;
+        }
+        if self.resuming {
+            if time_ms < self.last_ms {
+                return false;
+            }
+            if time_ms == self.last_ms && self.skip_at_last > 0 {
+                self.skip_at_last -= 1;
+                return false;
+            }
+        }
+        if time_ms > self.last_ms {
+            self.last_ms = time_ms;
+            self.at_last = 1;
+            self.resuming = false;
+        } else if time_ms == self.last_ms {
+            self.at_last += 1;
+        }
+        true
+    }
+
+    fn begin_resume(&mut self) {
+        self.resuming = true;
+        self.skip_at_last = self.at_last;
+    }
+}
+
+fn is_gone(e: &kube::Error) -> bool {
+    matches!(e, kube::Error::Api(s) if matches!(s.code, 401 | 403 | 404))
+}
+
+async fn pump(
+    shared: Arc<Shared>,
+    client: Client,
+    target: LogTarget,
+    opts: LogOptions,
+    idx: usize,
+    notify: Notifier,
+) {
     let pods: Api<Pod> = Api::namespaced(client, &target.namespace);
-    let opts = stream.options.clone();
-    let mut last_ms: i64 = 0;
+    let mut resume = ResumePoint::default();
+    let mut connected_once = false;
     let mut attempt = 0u32;
     loop {
         let mut lp = LogParams {
@@ -206,53 +283,69 @@ async fn pump(stream: Arc<LogStream>, client: Client, idx: usize, notify: Notifi
             timestamps: true,
             ..Default::default()
         };
-        if last_ms > 0 {
-            // Resuming after a dropped connection: continue where we stopped.
-            lp.since_time = jiff::Timestamp::from_millisecond(last_ms + 1).ok();
+        if resume.last_ms > 0 {
+            lp.since_time = jiff::Timestamp::from_millisecond(resume.last_ms).ok();
+            resume.begin_resume();
         } else {
             lp.tail_lines = opts.tail;
             lp.since_seconds = opts.since_seconds;
         }
-        let reader = match pods.log_stream(&target.pod, &lp).await {
-            Ok(r) => r,
+        match pods.log_stream(&target.pod, &lp).await {
             Err(e) => {
-                stream.set_state(idx, SourceState::Failed(friendly(&e)));
-                notify.ping();
-                return;
-            }
-        };
-        stream.set_state(idx, SourceState::Streaming);
-        notify.ping();
-        futures::pin_mut!(reader);
-        let mut buf = Vec::with_capacity(1024);
-        let mut got_any = false;
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    let t = stream.push(idx as u16, &buf);
-                    if t > 0 {
-                        last_ms = t;
-                    }
-                    got_any = true;
+                // The very first attempt failing, or the pod being gone, is
+                // final; anything else after we were connected is retried.
+                if !connected_once || is_gone(&e) || !opts.follow || opts.previous {
+                    let state = if connected_once { SourceState::Ended } else { SourceState::Failed(friendly(&e)) };
+                    shared.set_state(idx, state);
                     notify.ping();
+                    return;
                 }
-                Err(_) => break,
             }
-        }
-        if !opts.follow || opts.previous {
-            break;
+            Ok(reader) => {
+                connected_once = true;
+                shared.set_state(idx, SourceState::Streaming);
+                notify.ping();
+                futures::pin_mut!(reader);
+                let mut buf = Vec::with_capacity(1024);
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let mut raw = &buf[..];
+                            while let Some((last, rest)) = raw.split_last() {
+                                if *last == b'\n' || *last == b'\r' {
+                                    raw = rest;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let text = String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE_BYTES)]);
+                            let (time_ms, body) = split_timestamp(&text);
+                            if resume.admit(time_ms) {
+                                shared.push(idx as u16, time_ms, body);
+                                attempt = 0;
+                                notify.ping();
+                            }
+                        }
+                    }
+                }
+                if !opts.follow || opts.previous {
+                    break;
+                }
+            }
         }
         // The stream ends when the container restarts or the connection
-        // drops; retry a few times before giving up.
-        attempt = if got_any { 0 } else { attempt + 1 };
-        if attempt >= 5 {
+        // drops: back off and resume where we stopped.
+        attempt += 1;
+        if attempt > MAX_RETRIES {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        shared.set_state(idx, SourceState::Reconnecting);
+        notify.ping();
+        tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt.min(6)))).await;
     }
-    stream.set_state(idx, SourceState::Ended);
+    shared.set_state(idx, SourceState::Ended);
     notify.ping();
 }
 
@@ -263,32 +356,32 @@ pub(crate) fn open(
     options: LogOptions,
     notify: Notifier,
 ) -> Arc<LogStream> {
-    let stream = Arc::new(LogStream {
-        states: Mutex::new(vec![SourceState::Connecting; targets.len()]),
-        targets,
-        options,
+    let shared = Arc::new(Shared {
         buf: Mutex::new(LogBuffer::default()),
+        states: Mutex::new(vec![SourceState::Connecting; targets.len()]),
         aborts: Mutex::new(Vec::new()),
+        stopped: AtomicBool::new(false),
     });
-    let s = stream.clone();
+    let stream = Arc::new(LogStream { targets: targets.clone(), options: options.clone(), shared: shared.clone() });
     let h = handle.clone();
+    let s = shared.clone();
     let task = handle.spawn(async move {
         let client = match client.await {
             Ok(c) => c,
             Err(e) => {
-                for i in 0..s.targets.len() {
+                for i in 0..targets.len() {
                     s.set_state(i, SourceState::Failed(e.clone()));
                 }
                 notify.ping();
                 return;
             }
         };
-        for idx in 0..s.targets.len() {
-            let t = h.spawn(pump(s.clone(), client.clone(), idx, notify.clone()));
-            s.aborts.lock().push(t.abort_handle());
+        for (idx, target) in targets.into_iter().enumerate() {
+            let t = h.spawn(pump(s.clone(), client.clone(), target, options.clone(), idx, notify.clone()));
+            s.track(t.abort_handle());
         }
     });
-    stream.aborts.lock().push(task.abort_handle());
+    shared.track(task.abort_handle());
     stream
 }
 
@@ -311,5 +404,47 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m plain"), "red plain");
         assert_eq!(strip_ansi("plain"), "plain");
         assert_eq!(strip_ansi("a\u{1b}]0;title\u{7}b"), "ab");
+    }
+
+    #[test]
+    fn resume_skips_what_was_delivered() {
+        let mut r = ResumePoint::default();
+        // First connection: three lines, two of them in the same millisecond.
+        assert!(r.admit(1000));
+        assert!(r.admit(1500));
+        assert!(r.admit(1500));
+        // Resume replays the whole last second, then continues.
+        r.begin_resume();
+        assert!(!r.admit(1000), "older line is a duplicate");
+        assert!(!r.admit(1500), "first line at the resume point was seen");
+        assert!(!r.admit(1500), "second line at the resume point was seen");
+        assert!(r.admit(1500), "a third line at that instant is new");
+        assert!(r.admit(1600));
+        assert!(r.admit(1600));
+        // Lines without a timestamp are always delivered.
+        assert!(r.admit(0));
+        // A second resume counts the lines seen since.
+        r.begin_resume();
+        assert!(!r.admit(1600));
+        assert!(!r.admit(1600));
+        assert!(r.admit(1700));
+    }
+
+    #[test]
+    fn stopped_stream_aborts_late_tasks() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let shared = Shared {
+                buf: Mutex::new(LogBuffer::default()),
+                states: Mutex::new(vec![SourceState::Connecting]),
+                aborts: Mutex::new(Vec::new()),
+                stopped: AtomicBool::new(false),
+            };
+            shared.stop();
+            let late = tokio::spawn(std::future::pending::<()>());
+            shared.track(late.abort_handle());
+            assert!(late.await.unwrap_err().is_cancelled());
+            assert_eq!(shared.states.lock()[0], SourceState::Ended);
+        });
     }
 }

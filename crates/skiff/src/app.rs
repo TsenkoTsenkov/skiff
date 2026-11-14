@@ -24,6 +24,31 @@ use crate::table_view::{self, RowAction, TableUi, ViewCache};
 use crate::theme::{self, Palette, TOP_BAR_HEIGHT};
 use crate::widgets;
 
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Call first thing in `main` so startup tracing measures from process start.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.set(Instant::now());
+}
+
+/// With `SKIFF_TRACE_STARTUP=1`, prints when the first frame and the first
+/// fully loaded table happened; `=exit` also quits once loaded.
+struct StartupTrace {
+    mode: Option<String>,
+    first_frame: bool,
+    loaded: bool,
+}
+
+impl StartupTrace {
+    fn from_env() -> Self {
+        StartupTrace { mode: std::env::var("SKIFF_TRACE_STARTUP").ok(), first_frame: false, loaded: false }
+    }
+
+    fn since_start() -> Duration {
+        PROCESS_START.get().map(|t| t.elapsed()).unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Overview,
@@ -63,6 +88,8 @@ pub enum Dialog {
     Delete { key: ResourceKey, ns: String, name: String, force: bool },
     Scale { key: ResourceKey, ns: String, name: String, replicas: String },
     Forward(ForwardDialog),
+    /// Create or update objects from a YAML manifest.
+    Create { text: String, job: Option<Job<Vec<String>>>, error: Option<String> },
 }
 
 pub struct ForwardDialog {
@@ -102,6 +129,7 @@ pub struct SkiffApp {
     /// Time spent building the previous frame's UI.
     pub last_ui: Duration,
     empty_metrics: Arc<Metrics>,
+    trace: StartupTrace,
 }
 
 fn kind_icon(key: &ResourceKey) -> MaterialIcon {
@@ -233,6 +261,7 @@ impl SkiffApp {
             terminal_focused: false,
             last_ui: Duration::ZERO,
             empty_metrics: Arc::new(Metrics::default()),
+            trace: StartupTrace::from_env(),
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
         let initial = opts
@@ -295,6 +324,17 @@ impl SkiffApp {
             self.active = None;
             self.detail = None;
         }
+    }
+
+    /// (rows shown in the current table, whether it is fully loaded).
+    pub fn table_stats(&self) -> (usize, bool) {
+        let live = matches!(self.cache.snap.state, LoadState::Live | LoadState::Polling);
+        (self.cache.order.len(), live)
+    }
+
+    /// Time the last filter + sort pass took.
+    pub fn last_table_cost(&self) -> Duration {
+        self.cache.last_cost()
     }
 
     /// Identifier of the current view (`overview` or a resource id).
@@ -361,6 +401,20 @@ impl SkiffApp {
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
 
+        let mut applied: Option<Vec<String>> = None;
+        if let Some(Dialog::Create { job, error, .. }) = &mut self.dialog {
+            if let Some(res) = job.as_ref().and_then(|j| j.take()) {
+                *job = None;
+                match res {
+                    Ok(lines) => applied = Some(lines),
+                    Err(e) => *error = Some(e),
+                }
+            }
+        }
+        if let Some(lines) = applied {
+            self.dialog = None;
+            self.toast(lines.join("\n"), Tone::Ok);
+        }
         if let Some(Dialog::Forward(d)) = &mut self.dialog {
             if let Some(job) = &d.job {
                 if let Some(res) = job.take() {
@@ -431,7 +485,6 @@ impl SkiffApp {
 
     pub fn run_row_action(&mut self, ctx: &egui::Context, action: RowAction, key: &ResourceKey, ns: &str, name: &str) {
         let Some(session) = self.session().cloned() else { return };
-        let context = session.context.clone();
         match action {
             RowAction::Logs => {
                 let job = session.log_targets(key, ns, name);
@@ -503,8 +556,14 @@ impl SkiffApp {
                     ok: format!("{} {name}", if on { "Cordoned" } else { "Uncordoned" }),
                 });
             }
+            RowAction::Suspend | RowAction::Resume => {
+                let on = action == RowAction::Suspend;
+                self.pending.push(Pending::Simple {
+                    job: session.suspend_cronjob(key, ns, name, on),
+                    ok: format!("{} {name}", if on { "Suspended" } else { "Resumed" }),
+                });
+            }
         }
-        let _ = context;
     }
 
     fn open_object_if_needed(&mut self, key: &ResourceKey, ns: &str, name: &str) {
@@ -514,6 +573,14 @@ impl SkiffApp {
                 self.detail = Some(Detail::open(&session, key, ns, name));
             }
         }
+    }
+
+    pub fn open_create_dialog(&mut self) {
+        let ns = self.ns_filter.iter().next().cloned().unwrap_or_else(|| "default".to_string());
+        let template = format!(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: example\n  namespace: {ns}\ndata:\n  key: value\n"
+        );
+        self.dialog = Some(Dialog::Create { text: template, job: None, error: None });
     }
 
     pub fn run_command(&mut self, ctx: &egui::Context, cmd: Command) {
@@ -530,6 +597,7 @@ impl SkiffApp {
             Command::ToggleTheme => self.set_theme(ctx, !self.pal.dark),
             Command::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             Command::PortForwards => self.dock.show_forwards(),
+            Command::CreateResource => self.open_create_dialog(),
             Command::Reconnect => {
                 if let Some(s) = self.session() {
                     s.reconnect();
@@ -577,6 +645,25 @@ impl SkiffApp {
         // Keep relative ages ticking without spinning the CPU.
         ctx.request_repaint_after(Duration::from_secs(1));
         self.last_ui = started.elapsed();
+        self.trace_startup(&ctx);
+    }
+
+    fn trace_startup(&mut self, ctx: &egui::Context) {
+        if self.trace.mode.is_none() || self.trace.loaded {
+            return;
+        }
+        if !self.trace.first_frame {
+            self.trace.first_frame = true;
+            eprintln!("startup: first frame built at {:?} ({:?} of UI work)", StartupTrace::since_start(), self.last_ui);
+        }
+        let (rows, live) = self.table_stats();
+        if live && rows > 0 {
+            self.trace.loaded = true;
+            eprintln!("startup: {} rows live at {:?}", rows, StartupTrace::since_start());
+            if self.trace.mode.as_deref() == Some("exit") {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -640,6 +727,9 @@ impl SkiffApp {
                         if widgets::icon_button(ui, theme_icon, "Toggle light / dark theme").clicked() {
                             let dark = !self.pal.dark;
                             self.set_theme(ui.ctx(), dark);
+                        }
+                        if widgets::icon_button(ui, icons::ICON_ADD, "Create resource from YAML").clicked() {
+                            self.open_create_dialog();
                         }
                         self.connection_badge(ui);
                     });
@@ -982,6 +1072,10 @@ impl SkiffApp {
                     widgets::pill(ui, "polling", pal.info, &pal)
                         .on_hover_text("This API does not support watch; refreshed every 10 seconds.");
                 }
+                LoadState::Failed if total > 0 => {
+                    widgets::pill(ui, "update failed — data may be stale", pal.err, &pal)
+                        .on_hover_text(snap.error.as_deref().unwrap_or(""));
+                }
                 LoadState::Live | LoadState::Failed => {}
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1041,6 +1135,17 @@ impl SkiffApp {
                 }
             }
             return;
+        }
+
+        // Keep the highlighted row in step with the open detail panel (it
+        // may have been opened before this table finished loading).
+        if tui.selected.is_none() {
+            if let Some(d) = self.detail.as_ref().filter(|d| &d.key == key) {
+                if let Some(row) = snap.find(&d.ns, &d.name) {
+                    tui.selected = Some(row.uid.clone());
+                    tui.scroll_to_selected = true;
+                }
+            }
         }
 
         // Keyboard navigation.
@@ -1121,6 +1226,9 @@ impl SkiffApp {
             _ => None,
         };
         detail.poll(&session, current_rv.as_deref());
+        let listed = matches!(&self.view, View::Resource(k) if k == &detail.key)
+            && self.cache.snap.state == LoadState::Live;
+        detail.set_gone(listed && current_rv.is_none());
         let mut actions = Vec::new();
         Panel::right("detail")
             .resizable(true)
@@ -1238,6 +1346,61 @@ impl SkiffApp {
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;
+                        }
+                    });
+                }
+                Dialog::Create { text, job, error } => {
+                    ui.set_width(640.0);
+                    ui.label(widgets::semibold("Create or update from YAML", 15.0));
+                    ui.label(
+                        RichText::new("Multiple documents separated by --- are applied in order. Existing objects are replaced.")
+                            .color(pal.muted)
+                            .size(12.0),
+                    );
+                    ui.add_space(6.0);
+                    let theme = if pal.dark {
+                        egui_extras::syntax_highlighting::CodeTheme::dark(12.5)
+                    } else {
+                        egui_extras::syntax_highlighting::CodeTheme::light(12.5)
+                    };
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+                            let job = egui_extras::syntax_highlighting::highlight(
+                                ui.ctx(),
+                                ui.style(),
+                                &theme,
+                                buf.as_str(),
+                                "yaml",
+                            );
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
+                        ui.add(
+                            egui::TextEdit::multiline(text)
+                                .code_editor()
+                                .hint_text("apiVersion: …")
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(18)
+                                .layouter(&mut layouter),
+                        );
+                    });
+                    if let Some(err) = error {
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+                    }
+                    ui.add_space(10.0);
+                    let busy = job.is_some();
+                    ui.horizontal(|ui| {
+                        let go = ui.add_enabled(!busy, egui::Button::new("Apply")).clicked()
+                            || (!busy && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)));
+                        if go {
+                            *error = None;
+                            *job = Some(session.apply_manifest(text.clone()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                        if busy {
+                            ui.spinner();
                         }
                     });
                 }

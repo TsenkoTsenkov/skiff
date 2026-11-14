@@ -2,7 +2,7 @@
 //! snapshots published by the watch engine.
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -217,6 +217,9 @@ pub struct TableStore {
     snap: ArcSwap<Snapshot>,
     last_used: AtomicI64,
     pub(crate) relist: Notify,
+    /// Counts refresh requests, so the engine can tell a new request from a
+    /// wake-up it has already acted on.
+    pub(crate) refresh_gen: AtomicU64,
     pub(crate) abort: Mutex<Option<AbortHandle>>,
 }
 
@@ -228,6 +231,7 @@ impl TableStore {
             snap: ArcSwap::from_pointee(Snapshot::empty(LoadState::Connecting)),
             last_used: AtomicI64::new(now_unix()),
             relist: Notify::new(),
+            refresh_gen: AtomicU64::new(0),
             abort: Mutex::new(None),
         }
     }
@@ -253,6 +257,7 @@ impl TableStore {
 
     /// Drop cached rows and list again from scratch.
     pub fn refresh(&self) {
+        self.refresh_gen.fetch_add(1, AtomicOrdering::SeqCst);
         self.relist.notify_one();
     }
 

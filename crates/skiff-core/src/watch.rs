@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,10 +25,24 @@ use crate::util::{enc, get_request, Notifier};
 use crate::views::{tweaks_for, Tweaks};
 
 pub(crate) const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,application/json";
-const PAGE: usize = 500;
+/// A small first page paints quickly; later pages are large to keep the
+/// number of round trips low on high-latency links.
+const FIRST_PAGE: usize = 250;
+const PAGE: usize = 2000;
 const MIN_PUBLISH: Duration = Duration::from_millis(80);
 const WATCH_TIMEOUT_SECS: u32 = 290;
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Longest a single list page or watch handshake may take.
+const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A watch that has shown bookmarks (sent about once a minute) and then goes
+/// silent this long is dead.
+const BOOKMARK_SILENCE: Duration = Duration::from_secs(150);
+/// Without bookmarks the only guaranteed traffic is the server ending the
+/// watch at `WATCH_TIMEOUT_SECS`.
+const WATCH_SILENCE: Duration = Duration::from_secs(WATCH_TIMEOUT_SECS as u64 + 30);
+const BACKOFF_START: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const PERMANENT_RETRY: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize, Default)]
 struct ListMetaLite {
@@ -346,6 +361,8 @@ impl Plan {
 pub(crate) enum Fail {
     /// Resource version too old: list again.
     Gone,
+    /// The user asked for a refresh mid-list: start over.
+    Restart,
     /// Won't fix itself (forbidden, not found, ...).
     Permanent { code: u16, msg: String },
     Transient(String),
@@ -355,6 +372,7 @@ impl Fail {
     pub fn message(&self) -> String {
         match self {
             Fail::Gone => "resource version expired".into(),
+            Fail::Restart => "restarting".into(),
             Fail::Permanent { msg, .. } | Fail::Transient(msg) => msg.clone(),
         }
     }
@@ -496,11 +514,18 @@ struct Engine {
     state: LoadState,
     error: Option<Box<str>>,
     error_code: u16,
+    /// `TableStore::refresh_gen` value the current list accounts for.
+    handled_refresh: u64,
+    /// A complete list has succeeded at least once.
+    listed_once: bool,
+    /// The server lets us list but not watch: re-list periodically.
+    poll_only: bool,
 }
 
 enum WatchEnd {
     /// Server closed the stream (normal timeout); resume from `rv`.
-    Resume,
+    /// `productive` is false when it ended almost immediately with nothing.
+    Resume { productive: bool },
     Relist,
     Failed(Fail),
 }
@@ -541,8 +566,14 @@ impl Engine {
         }
     }
 
+    /// Whether the user asked for a refresh since the current list began.
+    fn refresh_requested(&self) -> bool {
+        self.store.refresh_gen.load(Ordering::SeqCst) != self.handled_refresh
+    }
+
     /// Lists everything. Returns (resourceVersion, server speaks Table).
     async fn list(&mut self) -> Result<(String, bool), Fail> {
+        self.handled_refresh = self.store.refresh_gen.load(Ordering::SeqCst);
         let scope = self.store.scope.clone();
         let key = self.store.key.clone();
         let initial = self.rows.is_empty();
@@ -551,17 +582,32 @@ impl Engine {
         let mut cont: Option<String> = None;
         let mut is_table;
         let rv;
+        let query = ListQuery::default();
         loop {
-            let page = fetch_page(
-                &self.client,
-                &key,
-                scope.as_deref(),
-                &ListQuery::default(),
-                cont.as_deref(),
-                &mut plan,
-                PAGE,
-            )
-            .await?;
+            let limit = if cont.is_none() && initial { FIRST_PAGE } else { PAGE };
+            let page = loop {
+                let fetch = fetch_page(
+                    &self.client,
+                    &key,
+                    scope.as_deref(),
+                    &query,
+                    cont.as_deref(),
+                    &mut plan,
+                    limit,
+                );
+                tokio::select! {
+                    res = tokio::time::timeout(LIST_TIMEOUT, fetch) => match res {
+                        Ok(page) => break page?,
+                        Err(_) => return Err(Fail::Transient("timed out waiting for the API server".into())),
+                    },
+                    _ = self.store.relist.notified() => {
+                        if self.refresh_requested() {
+                            return Err(Fail::Restart);
+                        }
+                        // A stale wake-up: ask for the same page again.
+                    }
+                }
+            };
             is_table = page.is_table;
             for row in page.rows {
                 fresh.insert(row.uid.clone(), row);
@@ -581,27 +627,29 @@ impl Engine {
         }
         self.plan = plan;
         self.rows = fresh;
+        self.listed_once = true;
         Ok((rv, is_table))
     }
 
-    fn apply(&mut self, line: &[u8], rv: &mut String) -> Result<bool, Fail> {
+    /// Applies one watch line. Returns (rows changed, was a bookmark).
+    fn apply(&mut self, line: &[u8], rv: &mut String) -> Result<(bool, bool), Fail> {
         let ev: WatchLine = match serde_json::from_slice(line) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::debug!("unparseable watch line: {e}");
-                return Ok(false);
+                return Ok((false, false));
             }
         };
         let plan = match &self.plan {
             Some(p) => p.clone(),
-            None => return Ok(false),
+            None => return Ok((false, false)),
         };
         let env = ev.object;
         match ev.ty.as_str() {
             "ERROR" => {
                 let code = env.code.unwrap_or(0);
                 let msg = env.message.unwrap_or_else(|| "watch error".into());
-                return Err(if code == 410 { Fail::Gone } else { Fail::Transient(msg) });
+                Err(if code == 410 { Fail::Gone } else { Fail::Transient(msg) })
             }
             "BOOKMARK" => {
                 let from_row = env
@@ -615,7 +663,7 @@ impl Engine {
                 if let Some(v) = from_row.or(env.metadata.resource_version.filter(|v| !v.is_empty())) {
                     *rv = v;
                 }
-                return Ok(false);
+                Ok((false, true))
             }
             ty @ ("ADDED" | "MODIFIED" | "DELETED") => {
                 let mut changed = false;
@@ -631,9 +679,9 @@ impl Engine {
                         changed = true;
                     }
                 }
-                Ok(changed)
+                Ok((changed, false))
             }
-            _ => Ok(false),
+            _ => Ok((false, false)),
         }
     }
 
@@ -652,9 +700,11 @@ impl Engine {
             Ok(r) => r,
             Err(e) => return WatchEnd::Failed(Fail::Transient(e)),
         };
-        let reader = match self.client.request_stream(req).await {
-            Ok(r) => r,
-            Err(e) => return WatchEnd::Failed(e.into()),
+        let started = Instant::now();
+        let reader = match tokio::time::timeout(LIST_TIMEOUT, self.client.request_stream(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return WatchEnd::Failed(e.into()),
+            Err(_) => return WatchEnd::Failed(Fail::Transient("timed out opening the watch".into())),
         };
         futures::pin_mut!(reader);
         if self.state != LoadState::Live {
@@ -665,18 +715,40 @@ impl Engine {
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         let mut dirty = false;
         let mut last_publish = Instant::now();
+        // Liveness: a healthy watch delivers events or periodic bookmarks.
+        // Total silence means the connection died without telling us (sleep,
+        // VPN drop, NAT timeout), which no read would ever report.
+        let mut last_data = Instant::now();
+        let mut saw_bookmark = false;
+        let mut lines = 0u64;
         let store = self.store.clone();
         loop {
+            let silence_limit = if saw_bookmark { BOOKMARK_SILENCE } else { WATCH_SILENCE };
+            let until_stalled = silence_limit.saturating_sub(last_data.elapsed());
+            if until_stalled.is_zero() {
+                if dirty {
+                    self.publish();
+                }
+                return WatchEnd::Failed(Fail::Transient("connection stalled".into()));
+            }
             let wait = if dirty {
-                MIN_PUBLISH.saturating_sub(last_publish.elapsed())
+                MIN_PUBLISH.saturating_sub(last_publish.elapsed()).min(until_stalled)
             } else {
-                Duration::from_secs(3600)
+                until_stalled
             };
             // `read_until` keeps partial data in `buf` when cancelled, so
             // timing out here loses nothing.
             let read = tokio::select! {
                 r = tokio::time::timeout(wait, reader.read_until(b'\n', &mut buf)) => r,
-                _ = store.relist.notified() => return WatchEnd::Relist,
+                _ = store.relist.notified() => {
+                    if self.refresh_requested() {
+                        if dirty {
+                            self.publish();
+                        }
+                        return WatchEnd::Relist;
+                    }
+                    continue;
+                }
             };
             match read {
                 Err(_elapsed) => {
@@ -698,12 +770,18 @@ impl Engine {
                         if dirty {
                             self.publish();
                         }
-                        return WatchEnd::Resume;
+                        let productive = lines > 0 || started.elapsed() > Duration::from_secs(5);
+                        return WatchEnd::Resume { productive };
                     }
+                    last_data = Instant::now();
+                    lines += 1;
                     let res = self.apply(&buf, rv);
                     buf.clear();
                     match res {
-                        Ok(changed) => dirty |= changed,
+                        Ok((changed, bookmark)) => {
+                            dirty |= changed;
+                            saw_bookmark |= bookmark;
+                        }
                         Err(Fail::Gone) => return WatchEnd::Relist,
                         Err(f) => return WatchEnd::Failed(f),
                     }
@@ -725,35 +803,40 @@ impl Engine {
     }
 
     async fn run(mut self) {
-        let mut backoff = Duration::from_millis(500);
+        let mut backoff = BACKOFF_START;
         loop {
-            if self.rows.is_empty() {
+            // Loading is shown both for the first list and for a refresh of
+            // existing rows (which stay visible meanwhile), but not for the
+            // routine re-lists of a polled table.
+            if self.state != LoadState::Polling {
                 self.set_state(LoadState::Loading, None);
                 self.publish();
             }
             let (mut rv, is_table) = match self.list().await {
                 Ok(v) => v,
-                Err(Fail::Gone) => continue,
-                Err(f @ Fail::Permanent { .. }) => {
-                    self.rows.clear();
-                    self.set_state(LoadState::Failed, Some(&f));
-                    self.publish();
-                    self.pause(Duration::from_secs(60)).await;
-                    continue;
-                }
+                Err(Fail::Restart) => continue,
                 Err(f) => {
-                    let state = if self.rows.is_empty() { LoadState::Failed } else { LoadState::Reconnecting };
+                    if !self.listed_once {
+                        // A partial first list is not worth showing as data.
+                        self.rows.clear();
+                    }
+                    let permanent = matches!(f, Fail::Permanent { .. });
+                    let state = if self.rows.is_empty() || permanent { LoadState::Failed } else { LoadState::Reconnecting };
+                    if permanent {
+                        self.rows.clear();
+                    }
                     self.set_state(state, Some(&f));
                     self.publish();
-                    self.pause(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    self.pause(if permanent { PERMANENT_RETRY } else { backoff }).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                     continue;
                 }
             };
-            backoff = Duration::from_millis(500);
 
-            if !is_table || rv.is_empty() {
-                // No Table/watch support (some aggregated APIs): poll.
+            if !is_table || rv.is_empty() || self.poll_only {
+                // No Table/watch support (some aggregated APIs), or watching
+                // is not permitted: poll.
+                backoff = BACKOFF_START;
                 self.set_state(LoadState::Polling, None);
                 self.publish();
                 self.pause(POLL_INTERVAL).await;
@@ -766,27 +849,45 @@ impl Engine {
             loop {
                 let started = Instant::now();
                 match self.watch(&mut rv).await {
-                    WatchEnd::Resume => {
+                    WatchEnd::Resume { productive: true } => {
                         failures = 0;
+                        backoff = BACKOFF_START;
+                    }
+                    WatchEnd::Resume { productive: false } => {
+                        // Something between us and the API server ends
+                        // watches immediately: don't spin.
+                        self.pause(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
                     }
                     WatchEnd::Relist => break,
-                    WatchEnd::Failed(Fail::Gone) => break,
+                    WatchEnd::Failed(Fail::Gone) | WatchEnd::Failed(Fail::Restart) => {
+                        // Usually immediate; back off if it keeps happening.
+                        if started.elapsed() < Duration::from_secs(5) {
+                            self.pause(backoff).await;
+                            backoff = (backoff * 2).min(BACKOFF_MAX);
+                        }
+                        break;
+                    }
+                    WatchEnd::Failed(Fail::Permanent { code: 403 | 405, .. }) => {
+                        self.poll_only = true;
+                        break;
+                    }
                     WatchEnd::Failed(f @ Fail::Permanent { .. }) => {
                         self.set_state(LoadState::Failed, Some(&f));
                         self.publish();
-                        self.pause(Duration::from_secs(60)).await;
+                        self.pause(PERMANENT_RETRY).await;
                         break;
                     }
                     WatchEnd::Failed(f) => {
                         if started.elapsed() > Duration::from_secs(30) {
                             failures = 0;
-                            backoff = Duration::from_millis(500);
+                            backoff = BACKOFF_START;
                         }
                         failures += 1;
                         self.set_state(LoadState::Reconnecting, Some(&f));
                         self.publish();
                         self.pause(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
                         if failures >= 3 {
                             break;
                         }
@@ -809,6 +910,9 @@ pub(crate) async fn run(store: Arc<TableStore>, client: Client, notify: Notifier
         state: LoadState::Loading,
         error: None,
         error_code: 0,
+        handled_refresh: 0,
+        listed_once: false,
+        poll_only: false,
     }
     .run()
     .await
@@ -909,22 +1013,25 @@ mod tests {
             state: LoadState::Live,
             error: None,
             error_code: 0,
+            handled_refresh: 0,
+            listed_once: true,
+            poll_only: false,
         };
         let mut rv = "1234".to_string();
 
         let modified = br#"{"type":"MODIFIED","object":{"kind":"Table","rows":[{"cells":["web-1","0/1","Terminating","0","6m","10.0.0.5","node-a","<none>"],"object":{"metadata":{"name":"web-1","namespace":"shop","uid":"u1","resourceVersion":"1300"}}}]}}"#;
-        assert!(eng.apply(modified, &mut rv).unwrap());
+        assert_eq!(eng.apply(modified, &mut rv).unwrap(), (true, false));
         assert_eq!(rv, "1300");
         assert_eq!(eng.rows.len(), 3);
         assert_eq!(eng.rows["u1"].tone, Tone::Warn);
 
         let deleted = br#"{"type":"DELETED","object":{"kind":"Table","rows":[{"cells":["web-1","0/1","Terminating","0","6m","","",""],"object":{"metadata":{"name":"web-1","namespace":"shop","uid":"u1","resourceVersion":"1301"}}}]}}"#;
-        assert!(eng.apply(deleted, &mut rv).unwrap());
+        assert_eq!(eng.apply(deleted, &mut rv).unwrap(), (true, false));
         assert_eq!(eng.rows.len(), 2);
         assert_eq!(rv, "1301");
 
         let bookmark = br#"{"type":"BOOKMARK","object":{"kind":"Table","metadata":{"resourceVersion":"1400"},"rows":[{"cells":["","","","","","","",""],"object":{"metadata":{"resourceVersion":"1400"}}}]}}"#;
-        assert!(!eng.apply(bookmark, &mut rv).unwrap());
+        assert_eq!(eng.apply(bookmark, &mut rv).unwrap(), (false, true));
         assert_eq!(rv, "1400");
         assert_eq!(eng.rows.len(), 2);
 

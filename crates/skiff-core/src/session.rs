@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,8 @@ use crate::watch::{self, ListQuery};
 
 /// Stores nobody has looked at for this long stop watching.
 const IDLE_EVICT_SECS: i64 = 180;
+/// The same, while the UI is not painting at all (hidden or minimised).
+const HIDDEN_EVICT_SECS: i64 = 900;
 const METRICS_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +129,8 @@ pub struct Session {
     metrics_wanted: AtomicI64,
     forwards: Mutex<Vec<Arc<PortForward>>>,
     tasks: Mutex<Vec<AbortHandle>>,
+    /// Number of connection attempts started.
+    conn_gen: AtomicU64,
 }
 
 async fn build_client(context: &str) -> Result<Client, String> {
@@ -245,6 +249,7 @@ impl Session {
             metrics_wanted: AtomicI64::new(0),
             forwards: Mutex::new(Vec::new()),
             tasks: Mutex::new(Vec::new()),
+            conn_gen: AtomicU64::new(0),
         });
         session.start_connect();
         session.start_janitor();
@@ -262,47 +267,51 @@ impl Session {
     fn start_connect(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let context = self.context.clone();
+        // Only the newest attempt may publish its outcome; a slow older one
+        // must not overwrite a newer result.
+        let attempt = self.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.spawn_tracked(async move {
-            let result = build_client(&context).await;
-            let Some(s) = weak.upgrade() else { return };
-            let client = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    s.status.store(Arc::new(ConnStatus::Failed(e.clone())));
-                    let _ = s.client_tx.send(Some(Err(e)));
+            let current = |s: &Session| s.conn_gen.load(Ordering::SeqCst) == attempt;
+            let fail = |s: &Session, msg: String| {
+                if current(s) {
+                    s.status.store(Arc::new(ConnStatus::Failed(msg.clone())));
+                    s.client_tx.send_replace(Some(Err(msg)));
                     s.notify.ping();
-                    return;
                 }
             };
-            // Hand the client out immediately so tables start loading in
-            // parallel with the version probe and discovery.
-            let _ = s.client_tx.send(Some(Ok(client.clone())));
-            let version = tokio::time::timeout(Duration::from_secs(15), client.apiserver_version()).await;
-            match version {
-                Ok(Ok(v)) => s
-                    .status
-                    .store(Arc::new(ConnStatus::Connected { version: v.git_version })),
-                Ok(Err(e)) => {
-                    let msg = friendly(&e);
-                    s.status.store(Arc::new(ConnStatus::Failed(msg.clone())));
-                    let _ = s.client_tx.send(Some(Err(msg)));
-                    s.notify.ping();
-                    return;
+            let result = build_client(&context).await;
+            let client = {
+                let Some(s) = weak.upgrade() else { return };
+                match result {
+                    Ok(c) if current(&s) => {
+                        // Hand the client out immediately so tables start
+                        // loading in parallel with the version probe.
+                        s.client_tx.send_replace(Some(Ok(c.clone())));
+                        c
+                    }
+                    Ok(_) => return,
+                    Err(e) => return fail(&s, e),
                 }
-                Err(_) => {
-                    let msg = "timed out connecting to the API server".to_string();
-                    s.status.store(Arc::new(ConnStatus::Failed(msg.clone())));
-                    let _ = s.client_tx.send(Some(Err(msg)));
-                    s.notify.ping();
-                    return;
+            };
+            let version = tokio::time::timeout(Duration::from_secs(15), client.apiserver_version()).await;
+            {
+                let Some(s) = weak.upgrade() else { return };
+                match version {
+                    Ok(Ok(v)) if current(&s) => {
+                        s.status.store(Arc::new(ConnStatus::Connected { version: v.git_version }));
+                        s.notify.ping();
+                    }
+                    Ok(Ok(_)) => return,
+                    Ok(Err(e)) => return fail(&s, friendly(&e)),
+                    Err(_) => return fail(&s, "timed out connecting to the API server".to_string()),
                 }
             }
-            s.notify.ping();
-            drop(s);
             let found = discover(&client).await;
             if let (Some(s), Ok(found)) = (weak.upgrade(), found) {
-                s.discovered.store(Arc::new(found));
-                s.notify.ping();
+                if current(&s) {
+                    s.discovered.store(Arc::new(found));
+                    s.notify.ping();
+                }
             }
         });
     }
@@ -310,46 +319,110 @@ impl Session {
     fn start_janitor(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         self.spawn_tracked(async move {
+            const TICK: Duration = Duration::from_secs(5);
+            let mut wall = std::time::SystemTime::now();
+            let mut ticks = 0u32;
             loop {
-                tokio::time::sleep(Duration::from_secs(20)).await;
+                tokio::time::sleep(TICK).await;
                 let Some(s) = weak.upgrade() else { return };
-                s.stores.lock().retain(|_, store| {
-                    let keep = store.idle_secs() < IDLE_EVICT_SECS;
-                    if !keep {
-                        store.stop();
+
+                // The monotonic clock stops while the machine sleeps but the
+                // wall clock does not: a jump means we just woke up, and
+                // every open connection is probably dead.
+                let now = std::time::SystemTime::now();
+                let jumped = now.duration_since(wall).map(|d| d > TICK + Duration::from_secs(20)).unwrap_or(false);
+                wall = now;
+                if jumped {
+                    for store in s.stores.lock().values() {
+                        store.refresh();
                     }
-                    keep
-                });
-                s.forwards.lock().retain(|f| f.is_active());
+                }
+
+                ticks += 1;
+                if ticks % 4 == 0 {
+                    let mut stores = s.stores.lock();
+                    // While the UI is painting, tables it stopped asking for
+                    // are unused. If nothing is asked for at all the window
+                    // is hidden; keep its tables warm for longer.
+                    let ui_active = stores.values().any(|st| st.idle_secs() < 15);
+                    let limit = if ui_active { IDLE_EVICT_SECS } else { HIDDEN_EVICT_SECS };
+                    stores.retain(|_, store| {
+                        let keep = store.idle_secs() < limit;
+                        if !keep {
+                            store.stop();
+                        }
+                        keep
+                    });
+                    drop(stores);
+                    s.forwards.lock().retain(|f| f.is_active());
+                }
             }
         });
     }
 
     fn start_metrics(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        let client = self.client();
+        let mut rx = self.client_tx.subscribe();
         self.spawn_tracked(async move {
-            let Ok(client) = client.await else { return };
             let mut generation = 0u64;
-            let mut missing_until = 0i64;
             loop {
-                let Some(s) = weak.upgrade() else { return };
-                let wanted = now_unix() - s.metrics_wanted.load(Ordering::Relaxed) < 30;
-                if wanted && now_unix() >= missing_until {
-                    generation += 1;
-                    match sample_metrics(&client, generation).await {
-                        Ok(m) => {
-                            s.metrics.store(Arc::new(m));
-                            s.notify.ping();
+                // Follow the session's client across reconnects.
+                let client = loop {
+                    let current = rx.borrow_and_update().clone();
+                    match current {
+                        Some(Ok(c)) => break c,
+                        _ => {
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
                         }
-                        // No metrics API on this cluster: check back rarely.
-                        Err(_) => missing_until = now_unix() + 120,
                     }
-                    drop(s);
-                    tokio::time::sleep(METRICS_INTERVAL).await;
-                } else {
-                    drop(s);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                };
+                let mut missing_until = 0i64;
+                let mut failures = 0u32;
+                loop {
+                    let wanted = match weak.upgrade() {
+                        Some(s) => now_unix() - s.metrics_wanted.load(Ordering::Relaxed) < 30,
+                        None => return,
+                    };
+                    let delay = if wanted && now_unix() >= missing_until {
+                        generation += 1;
+                        let sample =
+                            tokio::time::timeout(Duration::from_secs(20), sample_metrics(&client, generation)).await;
+                        let Some(s) = weak.upgrade() else { return };
+                        match sample {
+                            Ok(Ok(m)) => {
+                                failures = 0;
+                                s.metrics.store(Arc::new(m));
+                                s.notify.ping();
+                            }
+                            other => {
+                                failures += 1;
+                                let no_api = matches!(&other, Ok(Err(kube::Error::Api(st))) if st.code == 404);
+                                if no_api {
+                                    // No metrics-server here: check back rarely.
+                                    missing_until = now_unix() + 120;
+                                }
+                                // Never present old numbers as current.
+                                if (no_api || failures >= 2) && s.metrics.load().available {
+                                    s.metrics.store(Arc::new(Metrics { generation, ..Default::default() }));
+                                    s.notify.ping();
+                                }
+                            }
+                        }
+                        METRICS_INTERVAL
+                    } else {
+                        Duration::from_secs(1)
+                    };
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -378,7 +451,9 @@ impl Session {
     /// pick up refreshed credentials).
     pub fn reconnect(self: &Arc<Self>) {
         self.status.store(Arc::new(ConnStatus::Connecting));
-        let _ = self.client_tx.send(None);
+        // `send_replace` stores the value even when nobody is subscribed
+        // right now; `send` would silently keep the old client.
+        self.client_tx.send_replace(None);
         self.start_connect();
         self.notify.ping();
     }

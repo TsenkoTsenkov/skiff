@@ -61,6 +61,8 @@ pub struct Detail {
     edit: Option<EditState>,
     want_edit: bool,
     revealed: HashSet<String>,
+    /// The live table no longer lists this object.
+    gone: bool,
 }
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -115,7 +117,12 @@ impl Detail {
             edit: None,
             want_edit: false,
             revealed: HashSet::new(),
+            gone: false,
         }
+    }
+
+    pub fn set_gone(&mut self, gone: bool) {
+        self.gone = gone;
     }
 
     pub fn is_for(&self, key: &ResourceKey, ns: &str, name: &str) -> bool {
@@ -301,8 +308,15 @@ impl Detail {
             }
             return actions;
         };
-        if let Some(e) = &self.obj_error {
-            // The object existed but a refresh failed: usually it was deleted.
+        if self.gone {
+            Frame::new()
+                .fill(pal.tint(pal.warn, 0.12))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("This object no longer exists. Showing its last known state.").color(pal.warn));
+                });
+        } else if let Some(e) = &self.obj_error {
             ui.label(RichText::new(format!("Refresh failed: {e}")).color(pal.warn).size(12.0));
         }
 

@@ -20,14 +20,21 @@ pub enum ExecState {
     Failed(String),
 }
 
+/// State shared with the background task. The task holds only this, never
+/// the `ExecSession` handle, so dropping the handle ends the remote process.
+struct Shared {
+    output: Mutex<Vec<u8>>,
+    state: Mutex<ExecState>,
+}
+
 /// A running exec. Output bytes accumulate until the terminal widget drains
 /// them; input and resize requests are queued to the remote process.
+/// Dropping it (or calling `close`) terminates the session.
 pub struct ExecSession {
     pub namespace: String,
     pub pod: String,
     pub container: String,
-    output: Mutex<Vec<u8>>,
-    state: Mutex<ExecState>,
+    shared: Arc<Shared>,
     input: mpsc::UnboundedSender<Vec<u8>>,
     resize: mpsc::UnboundedSender<(u16, u16)>,
     abort: Mutex<Option<AbortHandle>>,
@@ -45,18 +52,18 @@ impl ExecSession {
 
     /// Removes and returns everything the process printed since last call.
     pub fn take_output(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.output.lock())
+        std::mem::take(&mut *self.shared.output.lock())
     }
 
     pub fn state(&self) -> ExecState {
-        self.state.lock().clone()
+        self.shared.state.lock().clone()
     }
 
     pub fn close(&self) {
         if let Some(h) = self.abort.lock().take() {
             h.abort();
         }
-        let mut s = self.state.lock();
+        let mut s = self.shared.state.lock();
         if matches!(*s, ExecState::Connecting | ExecState::Running) {
             *s = ExecState::Exited("closed".into());
         }
@@ -80,22 +87,29 @@ pub fn default_shell() -> Vec<String> {
     ]
 }
 
+struct Target {
+    namespace: String,
+    pod: String,
+    container: String,
+}
+
 async fn drive(
-    session: Arc<ExecSession>,
+    shared: Arc<Shared>,
+    target: Target,
     client: Client,
     command: Vec<String>,
     mut input: mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize: mpsc::UnboundedReceiver<(u16, u16)>,
     notify: Notifier,
 ) -> Result<String, String> {
-    let pods: Api<Pod> = Api::namespaced(client, &session.namespace);
-    let ap = AttachParams::interactive_tty().container(session.container.clone());
-    let mut proc = pods.exec(&session.pod, command, &ap).await.map_err(|e| friendly(&e))?;
+    let pods: Api<Pod> = Api::namespaced(client, &target.namespace);
+    let ap = AttachParams::interactive_tty().container(target.container.clone());
+    let mut proc = pods.exec(&target.pod, command, &ap).await.map_err(|e| friendly(&e))?;
     let mut stdin = proc.stdin().ok_or("no stdin")?;
     let mut stdout = proc.stdout().ok_or("no stdout")?;
     let mut size_tx = proc.terminal_size();
     let status = proc.take_status();
-    *session.state.lock() = ExecState::Running;
+    *shared.state.lock() = ExecState::Running;
     notify.ping();
 
     let mut buf = vec![0u8; 16 * 1024];
@@ -105,7 +119,7 @@ async fn drive(
                 match n {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        session.output.lock().extend_from_slice(&buf[..n]);
+                        shared.output.lock().extend_from_slice(&buf[..n]);
                         notify.ping();
                     }
                 }
@@ -148,20 +162,21 @@ pub(crate) fn open(
 ) -> Arc<ExecSession> {
     let (in_tx, in_rx) = mpsc::unbounded_channel();
     let (rs_tx, rs_rx) = mpsc::unbounded_channel();
+    let shared = Arc::new(Shared { output: Mutex::new(Vec::new()), state: Mutex::new(ExecState::Connecting) });
     let session = Arc::new(ExecSession {
         namespace: namespace.into(),
         pod: pod.into(),
         container: container.into(),
-        output: Mutex::new(Vec::new()),
-        state: Mutex::new(ExecState::Connecting),
+        shared: shared.clone(),
         input: in_tx,
         resize: rs_tx,
         abort: Mutex::new(None),
     });
-    let s = session.clone();
+    let target = Target { namespace: namespace.into(), pod: pod.into(), container: container.into() };
+    let s = shared;
     let task = handle.spawn(async move {
         let result = match client.await {
-            Ok(c) => drive(s.clone(), c, command, in_rx, rs_rx, notify.clone()).await,
+            Ok(c) => drive(s.clone(), target, c, command, in_rx, rs_rx, notify.clone()).await,
             Err(e) => Err(e),
         };
         *s.state.lock() = match result {

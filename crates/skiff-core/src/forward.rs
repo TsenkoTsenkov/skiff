@@ -1,7 +1,7 @@
 //! Local TCP port forwarding to pods.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::Pod;
@@ -27,6 +27,9 @@ pub struct PortForward {
     pub connections: AtomicU64,
     pub last_error: Mutex<Option<String>>,
     abort: Mutex<Option<AbortHandle>>,
+    /// Tasks serving established connections.
+    conns: Mutex<Vec<AbortHandle>>,
+    stopped: AtomicBool,
 }
 
 impl PortForward {
@@ -34,14 +37,24 @@ impl PortForward {
         format!("http://localhost:{}", self.local_port)
     }
 
+    /// Stops listening and closes every established connection.
     pub fn stop(&self) {
+        // Set the flag under the lock the accept loop registers under, so a
+        // connection accepted concurrently is either drained here or
+        // aborted there.
+        let mut conns = self.conns.lock();
+        self.stopped.store(true, Ordering::SeqCst);
+        for h in conns.drain(..) {
+            h.abort();
+        }
+        drop(conns);
         if let Some(h) = self.abort.lock().take() {
             h.abort();
         }
     }
 
     pub fn is_active(&self) -> bool {
-        self.abort.lock().is_some()
+        !self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -90,6 +103,8 @@ pub(crate) async fn start(
         connections: AtomicU64::new(0),
         last_error: Mutex::new(None),
         abort: Mutex::new(None),
+        conns: Mutex::new(Vec::new()),
+        stopped: AtomicBool::new(false),
     });
     let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let weak = Arc::downgrade(&fwd);
@@ -101,7 +116,7 @@ pub(crate) async fn start(
             fwd.connections.fetch_add(1, Ordering::Relaxed);
             let (pods, pod, notify) = (pods.clone(), pod.clone(), notify.clone());
             let weak = weak.clone();
-            h.spawn(async move {
+            let conn_task = h.spawn(async move {
                 if let Err(e) = serve_one(pods, pod, remote_port, conn).await {
                     if let Some(fwd) = weak.upgrade() {
                         *fwd.last_error.lock() = Some(e);
@@ -109,6 +124,13 @@ pub(crate) async fn start(
                 }
                 notify.ping();
             });
+            let mut conns = fwd.conns.lock();
+            conns.retain(|c| !c.is_finished());
+            if fwd.stopped.load(Ordering::SeqCst) {
+                conn_task.abort();
+                break;
+            }
+            conns.push(conn_task.abort_handle());
         }
     });
     *fwd.abort.lock() = Some(task.abort_handle());

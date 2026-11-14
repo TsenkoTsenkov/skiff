@@ -329,6 +329,8 @@ pub enum RowAction {
     Forward,
     Cordon,
     Uncordon,
+    Suspend,
+    Resume,
 }
 
 /// Which actions make sense for a resource type.
@@ -355,6 +357,10 @@ pub fn actions_for(key: &ResourceKey) -> Vec<(RowAction, egui_material_icons::Ma
     if key.is("", "nodes") {
         v.push((RowAction::Cordon, icons::ICON_BLOCK, "Cordon"));
         v.push((RowAction::Uncordon, icons::ICON_CHECK_CIRCLE, "Uncordon"));
+    }
+    if key.is("batch", "cronjobs") {
+        v.push((RowAction::Suspend, icons::ICON_PAUSE, "Suspend"));
+        v.push((RowAction::Resume, icons::ICON_PLAY_ARROW, "Resume"));
     }
     v.push((RowAction::Edit, icons::ICON_EDIT, "Edit YAML"));
     v.push((RowAction::CopyName, icons::ICON_CONTENT_COPY, "Copy name"));

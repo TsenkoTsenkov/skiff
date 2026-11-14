@@ -192,8 +192,14 @@ impl LogsTab {
                 if !failed.is_empty() {
                     widgets::pill(ui, &format!("{} failed", failed.len()), pal.err, pal).on_hover_text(failed.join("\n"));
                 }
+                let retrying = states.iter().filter(|s| matches!(s, SourceState::Reconnecting)).count();
+                if retrying > 0 {
+                    widgets::pill(ui, &format!("reconnecting {retrying}"), pal.warn, pal);
+                }
                 if live > 0 {
                     widgets::pill(ui, &format!("streaming {live}/{}", states.len()), pal.ok, pal);
+                } else if retrying > 0 {
+                    // Covered by the pill above.
                 } else if states.iter().any(|s| matches!(s, SourceState::Connecting)) {
                     ui.spinner();
                 } else {

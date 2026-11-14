@@ -40,6 +40,7 @@ fn parse_args() -> Result<AppOptions, String> {
 }
 
 fn main() -> eframe::Result<()> {
+    skiff::app::mark_process_start();
     let opts = match parse_args() {
         Ok(o) => o,
         Err(e) => {

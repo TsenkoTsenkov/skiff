@@ -28,6 +28,7 @@ pub enum Command {
     ToggleTheme,
     ToggleSidebar,
     PortForwards,
+    CreateResource,
     Reconnect,
 }
 
@@ -166,6 +167,7 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
     push(icons::ICON_DARK_MODE, "Toggle light / dark theme".into(), "Action".into(), Command::ToggleTheme, 0, &[]);
     push(icons::ICON_MENU, "Toggle sidebar".into(), "Action".into(), Command::ToggleSidebar, 0, &[]);
     push(icons::ICON_SWAP_HORIZ, "Port forwards".into(), "Action".into(), Command::PortForwards, 0, &[]);
+    push(icons::ICON_ADD, "Create resource from YAML".into(), "Action".into(), Command::CreateResource, 0, &["apply", "new"]);
     push(icons::ICON_REFRESH, "Reconnect to cluster".into(), "Action".into(), Command::Reconnect, 0, &[]);
 
     // Objects in tables that are already loaded: instant, no extra requests.
