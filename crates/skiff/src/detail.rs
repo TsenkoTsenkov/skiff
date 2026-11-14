@@ -201,8 +201,15 @@ impl Detail {
         }
         let events_due = self.events_at.is_none_or(|t| t.elapsed() > REFRESH);
         if events_due && self.events_job.is_none() && !self.key.is("", "events") {
-            self.events_at = Some(Instant::now());
-            self.events_job = Some(session.events_for(&self.ns, &self.key.kind, &self.name));
+            // Match on the UID so a recreated object of the same name does
+            // not inherit its predecessor's events. (Node events are
+            // recorded against the node name instead.)
+            if let Some(obj) = &self.obj {
+                let uid = s(&obj.value, "/metadata/uid");
+                let uid = if self.key.is("", "nodes") { None } else { Some(uid) };
+                self.events_at = Some(Instant::now());
+                self.events_job = Some(session.events_for(&self.ns, &self.key.kind, &self.name, uid));
+            }
         }
 
         if let Some(job) = &self.pods_job {
@@ -241,7 +248,6 @@ impl Detail {
 
     pub fn ui(&mut self, ui: &mut Ui, pal: &Palette, session: &Arc<Session>) -> Vec<DetailAction> {
         let mut actions = Vec::new();
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
 
         // Header.
         ui.horizontal(|ui| {
@@ -259,8 +265,23 @@ impl Detail {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            // Offer only the half of a toggle that applies right now.
+            let flag = |path: &str| {
+                self.obj
+                    .as_ref()
+                    .map(|o| o.value.pointer(path).and_then(|v| v.as_bool()).unwrap_or(false))
+            };
+            let (cordoned, suspended) = (flag("/spec/unschedulable"), flag("/spec/suspend"));
             for (action, ic, label) in actions_for(&self.key) {
-                if action == RowAction::Edit && self.edit.is_some() {
+                let redundant = match action {
+                    RowAction::Edit => self.edit.is_some(),
+                    RowAction::Cordon => cordoned == Some(true),
+                    RowAction::Uncordon => cordoned == Some(false),
+                    RowAction::Suspend => suspended == Some(true),
+                    RowAction::Resume => suspended == Some(false),
+                    _ => false,
+                };
+                if redundant {
                     continue;
                 }
                 let color = if action == RowAction::Delete { pal.err } else { pal.text };
@@ -493,28 +514,33 @@ impl Detail {
         conditions(ui, pal, v);
         self.related_pods(ui, pal, actions);
 
-        // Anything without a tailored view still gets its full spec/status.
-        let tailored = kinds::builtin(&self.key.group, &self.key.plural).is_some()
-            && !self.key.is("apiextensions.k8s.io", "customresourcedefinitions");
-        for field in ["spec", "status", "data", "rules", "subjects", "roleRef", "webhooks"] {
-            let Some(val) = v.get(field) else { continue };
-            let shown_elsewhere = tailored
-                && matches!(field, "status" | "data")
-                || (tailored && field == "spec" && self.has_tailored_spec());
-            if shown_elsewhere {
-                continue;
+        // Kinds without a tailored view (most config kinds and every custom
+        // resource) get all of their fields: scalars as rows, the rest as
+        // collapsible trees.
+        if !self.has_tailored_view() {
+            let Some(fields) = v.as_object() else { return };
+            let rest = || fields.iter().filter(|(k, _)| !matches!(k.as_str(), "apiVersion" | "kind" | "metadata"));
+            for (k, val) in rest() {
+                if !val.is_object() && !val.is_array() {
+                    widgets::kv_text(ui, k, &scalar_text(val), pal);
+                }
             }
-            widgets::section(ui, field, pal);
-            json_tree(ui, pal, val, &format!("/{field}"), 0);
+            for (k, val) in rest() {
+                let empty = val.as_object().is_some_and(|o| o.is_empty()) || val.as_array().is_some_and(|a| a.is_empty());
+                if (val.is_object() || val.is_array()) && !empty {
+                    widgets::section(ui, k, pal);
+                    json_tree(ui, pal, val, &format!("/{k}"), 0);
+                }
+            }
         }
     }
 
-    fn has_tailored_spec(&self) -> bool {
+    fn has_tailored_view(&self) -> bool {
         matches!(
             (&*self.key.group, &*self.key.plural),
             ("", "pods" | "services" | "nodes" | "configmaps" | "secrets" | "persistentvolumeclaims" | "events")
-                | ("apps", _)
-                | ("batch", _)
+                | ("apps", "deployments" | "statefulsets" | "daemonsets" | "replicasets")
+                | ("batch", "jobs" | "cronjobs")
                 | ("networking.k8s.io", "ingresses")
         )
     }
@@ -564,7 +590,7 @@ impl Detail {
         if let Some(ann) = v.pointer("/metadata/annotations").and_then(|l| l.as_object()) {
             if !ann.is_empty() {
                 widgets::kv(ui, "Annotations", pal, |ui| {
-                    egui::CollapsingHeader::new(RichText::new(format!("{} annotations", ann.len())).color(pal.muted))
+                    egui::CollapsingHeader::new(RichText::new(widgets::plural(ann.len(), "annotation")).color(pal.muted))
                         .id_salt("annotations")
                         .show(ui, |ui| {
                             for (k, val) in ann {
@@ -787,7 +813,7 @@ impl Detail {
                 }
                 let env = arr(spec, "/env");
                 if !env.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new(format!("{} environment variables", env.len())).color(pal.muted).size(12.0))
+                    egui::CollapsingHeader::new(RichText::new(widgets::plural(env.len(), "environment variable")).color(pal.muted).size(12.0))
                         .id_salt(("env", &name))
                         .show(ui, |ui| {
                             for e in env {
@@ -818,7 +844,7 @@ impl Detail {
                 }
                 let mounts = arr(spec, "/volumeMounts");
                 if !mounts.is_empty() {
-                    egui::CollapsingHeader::new(RichText::new(format!("{} mounts", mounts.len())).color(pal.muted).size(12.0))
+                    egui::CollapsingHeader::new(RichText::new(widgets::plural(mounts.len(), "mount")).color(pal.muted).size(12.0))
                         .id_salt(("mounts", &name))
                         .show(ui, |ui| {
                             for m in mounts {
@@ -1020,11 +1046,23 @@ impl Detail {
         for a in arr(v, "/status/addresses") {
             widgets::kv_text(ui, s(a, "/type"), s(a, "/address"), pal);
         }
-        if v.pointer("/spec/unschedulable").and_then(|x| x.as_bool()).unwrap_or(false) {
-            widgets::kv(ui, "Scheduling", pal, |ui| {
-                widgets::pill(ui, "Cordoned", pal.warn, pal);
+        let ready = arr(v, "/status/conditions")
+            .iter()
+            .find(|c| s(c, "/type") == "Ready")
+            .map(|c| s(c, "/status"));
+        let cordoned = v.pointer("/spec/unschedulable").and_then(|x| x.as_bool()).unwrap_or(false);
+        widgets::kv(ui, "Status", pal, |ui| {
+            ui.horizontal(|ui| {
+                match ready {
+                    Some("True") => widgets::pill(ui, "Ready", pal.ok, pal),
+                    Some("False") => widgets::pill(ui, "NotReady", pal.err, pal),
+                    _ => widgets::pill(ui, "Unknown", pal.warn, pal),
+                };
+                if cordoned {
+                    widgets::pill(ui, "Cordoned", pal.warn, pal);
+                }
             });
-        }
+        });
         widgets::kv_text(ui, "Kubelet", info("kubeletVersion"), pal);
         widgets::kv_text(ui, "OS", &format!("{} ({})", info("osImage"), info("architecture")), pal);
         widgets::kv_text(ui, "Kernel", info("kernelVersion"), pal);
@@ -1067,7 +1105,7 @@ impl Detail {
             ui.label(RichText::new("No data").color(pal.muted));
             return;
         };
-        widgets::section(ui, &format!("Data · {} keys", data.len()), pal);
+        widgets::section(ui, &format!("Data · {}", widgets::plural(data.len(), "key")), pal);
         for (k, val) in data {
             let text = val.as_str().unwrap_or("");
             data_entry(ui, pal, k, text, true, actions);
@@ -1080,13 +1118,13 @@ impl Detail {
             ui.label(RichText::new("No data").color(pal.muted));
             return;
         };
-        widgets::section(ui, &format!("Data · {} keys", data.len()), pal);
+        widgets::section(ui, &format!("Data · {}", widgets::plural(data.len(), "key")), pal);
         for (k, val) in data {
             let encoded = val.as_str().unwrap_or("");
             let revealed = self.revealed.contains(k);
             ui.horizontal(|ui| {
                 ui.label(widgets::semibold(k, 13.0).color(pal.text));
-                ui.label(RichText::new(format!("{} bytes", encoded.len() * 3 / 4)).color(pal.faint).size(12.0));
+                ui.label(RichText::new(widgets::plural(widgets::base64_len(encoded), "byte")).color(pal.faint).size(12.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icons::ICON_CONTENT_COPY, "Copy decoded value").clicked() {
                         let decoded = decode_secret(encoded);

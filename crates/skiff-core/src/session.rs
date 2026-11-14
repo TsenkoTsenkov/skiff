@@ -133,7 +133,8 @@ pub struct Session {
     conn_gen: AtomicU64,
 }
 
-async fn build_client(context: &str) -> Result<Client, String> {
+/// Builds a client for a kubeconfig context; also returns the server URL.
+async fn build_client(context: &str) -> Result<(Client, String), String> {
     let kc = Kubeconfig::read().map_err(|e| format!("cannot read kubeconfig: {e}"))?;
     let opts = KubeConfigOptions { context: Some(context.to_string()), ..Default::default() };
     let mut cfg = Config::from_custom_kubeconfig(kc, &opts)
@@ -141,7 +142,9 @@ async fn build_client(context: &str) -> Result<Client, String> {
         .map_err(|e| format!("kubeconfig context {context:?}: {e}"))?;
     // Fail fast on unreachable clusters instead of hanging the UI.
     cfg.connect_timeout = Some(Duration::from_secs(8));
-    Client::try_from(cfg).map_err(|e| friendly(&e))
+    let server = cfg.cluster_url.to_string();
+    let client = Client::try_from(cfg).map_err(|e| friendly(&e))?;
+    Ok((client, server))
 }
 
 async fn discover(client: &Client) -> Result<Vec<Discovered>, String> {
@@ -280,19 +283,20 @@ impl Session {
                 }
             };
             let result = build_client(&context).await;
-            let client = {
+            let (client, server) = {
                 let Some(s) = weak.upgrade() else { return };
                 match result {
-                    Ok(c) if current(&s) => {
+                    Ok((c, server)) if current(&s) => {
                         // Hand the client out immediately so tables start
                         // loading in parallel with the version probe.
                         s.client_tx.send_replace(Some(Ok(c.clone())));
-                        c
+                        (c, server)
                     }
                     Ok(_) => return,
                     Err(e) => return fail(&s, e),
                 }
             };
+            let server = server.trim_end_matches('/').to_string();
             let version = tokio::time::timeout(Duration::from_secs(15), client.apiserver_version()).await;
             {
                 let Some(s) = weak.upgrade() else { return };
@@ -302,8 +306,8 @@ impl Session {
                         s.notify.ping();
                     }
                     Ok(Ok(_)) => return,
-                    Ok(Err(e)) => return fail(&s, friendly(&e)),
-                    Err(_) => return fail(&s, "timed out connecting to the API server".to_string()),
+                    Ok(Err(e)) => return fail(&s, format!("Cannot reach {server}: {}", friendly(&e))),
+                    Err(_) => return fail(&s, format!("Cannot reach {server}: no response within 15 seconds")),
                 }
             }
             let found = discover(&client).await;
@@ -618,9 +622,14 @@ impl Session {
         })
     }
 
-    /// Events that refer to the given object.
-    pub fn events_for(&self, ns: &str, kind: &str, name: &str) -> Job<Arc<Snapshot>> {
-        let mut selector = format!("involvedObject.name={name},involvedObject.kind={kind}");
+    /// Events that refer to the given object. With a `uid` only events of
+    /// this incarnation match (a recreated pod of the same name has its own);
+    /// node events are recorded against the node name, so pass `None` there.
+    pub fn events_for(&self, ns: &str, kind: &str, name: &str, uid: Option<&str>) -> Job<Arc<Snapshot>> {
+        let mut selector = match uid.filter(|u| !u.is_empty()) {
+            Some(uid) => format!("involvedObject.uid={uid}"),
+            None => format!("involvedObject.name={name},involvedObject.kind={kind}"),
+        };
         if !ns.is_empty() {
             selector.push_str(&format!(",involvedObject.namespace={ns}"));
         }

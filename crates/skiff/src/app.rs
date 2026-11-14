@@ -130,9 +130,11 @@ pub struct SkiffApp {
     pub last_ui: Duration,
     empty_metrics: Arc<Metrics>,
     trace: StartupTrace,
+    /// How soon the next repaint is needed if nothing else happens.
+    tick: Duration,
 }
 
-fn kind_icon(key: &ResourceKey) -> MaterialIcon {
+pub fn kind_icon(key: &ResourceKey) -> MaterialIcon {
     match (&*key.group, &*key.plural) {
         ("", "nodes") => icons::ICON_DNS,
         ("", "namespaces") => icons::ICON_FOLDER,
@@ -262,6 +264,7 @@ impl SkiffApp {
             last_ui: Duration::ZERO,
             empty_metrics: Arc::new(Metrics::default()),
             trace: StartupTrace::from_env(),
+            tick: Duration::from_secs(30),
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
         let initial = opts
@@ -613,6 +616,7 @@ impl SkiffApp {
     pub fn ui(&mut self, ui: &mut Ui) {
         let started = Instant::now();
         let ctx = ui.ctx().clone();
+        self.tick = Duration::from_secs(30);
         self.poll();
         self.shortcuts(&ctx);
 
@@ -642,8 +646,10 @@ impl SkiffApp {
         self.dialog_ui(&ctx);
         self.toasts_ui(&ctx);
 
-        // Keep relative ages ticking without spinning the CPU.
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Background changes wake us through the notifier. Otherwise repaint
+        // only as often as the relative times on screen can change, so an
+        // idle window costs nothing.
+        ctx.request_repaint_after(self.tick);
         self.last_ui = started.elapsed();
         self.trace_startup(&ctx);
     }
@@ -787,7 +793,7 @@ impl SkiffApp {
                 if self.contexts.items.is_empty() && self.contexts_error.is_none() {
                     ui.label(RichText::new("No contexts in kubeconfig").color(pal.muted));
                 }
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(360.0).min_scrolled_height(360.0).show(ui, |ui| {
                     for c in &self.contexts.items {
                         let is_active = self.active.as_deref() == Some(c.name.as_str());
                         let connected = self.sessions.get(&c.name).map(|s| s.status());
@@ -867,7 +873,7 @@ impl SkiffApp {
                 let mut names: Vec<&str> = snap.rows.iter().map(|r| &*r.name).collect();
                 names.sort_unstable();
                 let needle = self.ns_search.to_lowercase();
-                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(340.0).min_scrolled_height(340.0).show(ui, |ui| {
                     for name in names.into_iter().filter(|n| needle.is_empty() || n.contains(&needle)) {
                         let mut on = self.ns_filter.contains(name);
                         if ui.checkbox(&mut on, name).changed() {
@@ -984,7 +990,7 @@ impl SkiffApp {
                             .on_hover_text("Only resource types you have opened are watched; idle ones stop after 3 minutes.");
                         let forwards = s.forwards().len();
                         if forwards > 0 {
-                            let text = format!("{forwards} port forward(s)");
+                            let text = widgets::plural(forwards, "port forward");
                             let ic = widgets::icon(icons::ICON_SWAP_HORIZ, 13.0).color(pal.muted);
                             if ui.add(egui::Button::new((ic, small(text))).frame(false)).clicked() {
                                 self.dock.show_forwards();
@@ -1010,6 +1016,7 @@ impl SkiffApp {
             self.no_cluster(ui);
             return;
         };
+        self.tick = self.tick.min(Duration::from_secs(5));
         if let Some(action) = overview::show(ui, &self.pal, &session, &self.ns_filter) {
             match action {
                 overview::Action::Go(key) => self.go(View::Resource(key)),
@@ -1095,6 +1102,14 @@ impl SkiffApp {
                                 tui.col_visible.insert(col.title.to_string(), on);
                             }
                         }
+                        if key.is("", "pods") && metrics.available {
+                            for title in ["CPU", "Memory"] {
+                                let mut on = tui.col_visible.get(title).copied().unwrap_or(true);
+                                if ui.checkbox(&mut on, title).changed() {
+                                    tui.col_visible.insert(title.to_string(), on);
+                                }
+                            }
+                        }
                     });
                 let id = egui::Id::unique("table-filter");
                 let filter = widgets::search_box(ui, &mut tui.filter, "Filter  ( / )", 240.0, id);
@@ -1171,10 +1186,10 @@ impl SkiffApp {
             });
             if let Some(step) = step {
                 let cur = tui.selected.as_deref().and_then(|uid| self.cache.position(uid));
-                let next = match cur {
-                    Some(c) => (c as i64).saturating_add(step).clamp(0, shown as i64 - 1) as usize,
-                    None => 0,
-                };
+                // With nothing selected, moving down starts at the top and
+                // moving up (or End) starts from the bottom.
+                let base = cur.map(|c| c as i64).unwrap_or(if step < 0 { shown as i64 } else { -1 });
+                let next = base.saturating_add(step).clamp(0, shown as i64 - 1) as usize;
                 if let Some(row) = self.cache.row(next) {
                     tui.selected = Some(row.uid.clone());
                     tui.scroll_to_selected = true;
@@ -1189,6 +1204,7 @@ impl SkiffApp {
         let cols = table_view::display_columns(key, &snap, tui, &metrics, ui.available_width());
         let now = skiff_core::now_unix();
         let out = table_view::show(ui, &pal, key, &self.cache, tui, &cols, &metrics, now);
+        self.tick = self.tick.min(table_view::age_tick(out.youngest));
 
         let mut to_open: Option<Arc<Row>> = None;
         if let Some(row) = out.clicked {
@@ -1229,11 +1245,14 @@ impl SkiffApp {
         let listed = matches!(&self.view, View::Resource(k) if k == &detail.key)
             && self.cache.snap.state == LoadState::Live;
         detail.set_gone(listed && current_rv.is_none());
+        self.tick = self.tick.min(Duration::from_secs(5));
         let mut actions = Vec::new();
+        // Leave the table usable in small windows.
+        let max_width = (ui.available_width() - 340.0).clamp(300.0, 1100.0);
         Panel::right("detail")
             .resizable(true)
-            .default_size(520.0)
-            .size_range(360.0..=1100.0)
+            .default_size(520.0f32.min(max_width))
+            .size_range(300.0f32.min(max_width)..=max_width)
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 14, right: 10, top: 10, bottom: 8 }))
             .show(ui, |ui| {
                 actions = detail.ui(ui, &pal, &session);
@@ -1407,6 +1426,7 @@ impl SkiffApp {
                 Dialog::Forward(d) => {
                     let what = if d.service { "service" } else { "pod" };
                     ui.label(widgets::semibold(format!("Port forward to {what} {}", d.name), 15.0));
+                    ui.label(RichText::new(format!("namespace {}", d.ns)).color(pal.muted).size(12.0));
                     ui.add_space(6.0);
                     match &d.ports {
                         None => {
@@ -1481,11 +1501,12 @@ impl SkiffApp {
         }
         let pal = self.pal;
         egui::Area::new(egui::Id::unique("toasts"))
-            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -40.0))
+            // Top right: clear of the dock and of the tables' action buttons.
+            .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, TOP_BAR_HEIGHT + 10.0))
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
+                ui.with_layout(Layout::top_down(Align::Max), |ui| {
                     for t in self.toasts.iter().rev() {
                         let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
                         Frame::new()

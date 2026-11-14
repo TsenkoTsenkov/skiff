@@ -5,7 +5,23 @@ Rust binary, GPU-rendered UI, no account, no telemetry, no background
 services. It talks to the API server directly, exactly like `kubectl` does,
 using your existing kubeconfig.
 
-<!-- PERF -->
+Measured on a 4-core cloud VM against a local cluster with 100 nodes and
+5,415 pods (release build; see [Development](#development) to reproduce):
+
+| | |
+| --- | --- |
+| First frame after launch | 70–120 ms |
+| All 5,415 pods listed and live | about 0.5 s after launch |
+| Frame cost with the pods table open | about 1 ms |
+| Re-filter / re-sort 5,415 rows | 1–5 ms |
+| Open an object's details | about 20 ms |
+| Switch to another resource type (3,000 rows) | about 0.1 s |
+| Memory held per pod row | under 1 KB (about 4 MB for 5,415 pods) |
+| Binary | 31 MB, no runtime dependencies beyond a GPU driver |
+
+That machine has no GPU, so rendering was done by a CPU rasterizer; process
+memory there was about 165 MB, most of it the rasterizer. Numbers on real
+hardware have not been measured yet.
 
 ## Why it is fast
 

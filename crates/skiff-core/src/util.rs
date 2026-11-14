@@ -109,16 +109,20 @@ pub fn friendly(e: &kube::Error) -> String {
             }
         }
         other => {
-            // Walk to the innermost cause: that's the actionable part
-            // ("connection refused", "certificate has expired", ...).
+            // The innermost cause is the actionable part ("Connection
+            // refused", "certificate has expired", ...); the wrappers around
+            // it ("ServiceError: client error (Connect): ...") are noise.
             let mut msg = other.to_string();
             let mut src = std::error::Error::source(other);
             while let Some(s) = src {
                 let text = s.to_string();
-                if !text.is_empty() && !msg.contains(&text) {
-                    msg = format!("{msg}: {text}");
+                if !text.is_empty() {
+                    msg = text;
                 }
                 src = s.source();
+            }
+            if msg.contains("deadline has elapsed") {
+                msg = "connection timed out".to_string();
             }
             msg
         }

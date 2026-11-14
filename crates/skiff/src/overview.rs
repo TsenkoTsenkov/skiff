@@ -80,7 +80,7 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
             ui.label(widgets::semibold("Overview", 17.0).color(pal.text));
             ui.label(RichText::new(&session.context).color(pal.muted));
             if !ns.is_empty() {
-                widgets::pill(ui, &format!("{} namespace(s) selected", ns.len()), pal.info, pal);
+                widgets::pill(ui, &format!("{} selected", widgets::plural(ns.len(), "namespace")), pal.info, pal);
             }
         });
         ui.add_space(10.0);

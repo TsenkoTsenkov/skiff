@@ -146,6 +146,13 @@ pub(crate) struct Plan {
     pub default_sort: Option<(usize, bool)>,
 }
 
+/// Server columns whose text is a rendered duration such as "48m" (which
+/// would otherwise be read as the quantity 0.048).
+fn is_duration_column(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "duration" || n == "last schedule" || n == "last seen" || n == "first seen" || n.ends_with(" age")
+}
+
 fn has(list: &[&str], name: &str) -> bool {
     list.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
@@ -179,10 +186,12 @@ impl Plan {
                 name_idx = Some(i);
                 continue;
             }
-            if def.name.eq_ignore_ascii_case("age") {
+            // "Age" and "Created At" both restate metadata.creationTimestamp,
+            // which the Age column shows live.
+            if def.name.eq_ignore_ascii_case("age") || def.name.eq_ignore_ascii_case("created at") {
                 continue;
             }
-            let kind = if def.ty == "date" || has(tweaks.time_cols, &def.name) {
+            let kind = if def.ty == "date" || has(tweaks.time_cols, &def.name) || is_duration_column(&def.name) {
                 ColKind::Time
             } else if def.ty == "integer" || def.ty == "number" {
                 ColKind::Number
@@ -1037,6 +1046,32 @@ mod tests {
 
         let gone = br#"{"type":"ERROR","object":{"kind":"Status","code":410,"message":"too old resource version"}}"#;
         assert!(matches!(eng.apply(gone, &mut rv), Err(Fail::Gone)));
+    }
+
+    #[test]
+    fn durations_sort_as_time_not_quantities() {
+        // "48m" in a Duration column is 48 minutes, not 0.048 of something.
+        let text = r#"{"kind":"Table","metadata":{},"columnDefinitions":[
+            {"name":"Name","type":"string","priority":0},
+            {"name":"Status","type":"string","priority":0},
+            {"name":"Duration","type":"string","priority":0},
+            {"name":"Created At","type":"date","priority":0},
+            {"name":"Age","type":"string","priority":0}],
+          "rows":[
+            {"cells":["slow","Running","48m","2024-01-01T00:00:00Z","50m"],"object":{"metadata":{"name":"slow","namespace":"b","uid":"1"}}},
+            {"cells":["fast","Complete","4s","2024-01-01T00:00:00Z","50m"],"object":{"metadata":{"name":"fast","namespace":"b","uid":"2"}}},
+            {"cells":["none","Running","<none>","2024-01-01T00:00:00Z","50m"],"object":{"metadata":{"name":"none","namespace":"b","uid":"3"}}}]}"#;
+        let jobs = kinds::builtin("batch", "jobs").unwrap().key();
+        let (plan, rows) = parse(text, &jobs);
+        let titles: Vec<&str> = plan.columns.iter().map(|c| &*c.title).collect();
+        assert_eq!(titles, ["Name", "Namespace", "Status", "Duration", "Controlled By", "Age"], "Created At duplicates Age");
+        let duration = plan.columns.iter().find(|c| &*c.title == "Duration").unwrap();
+        assert_eq!(duration.kind, ColKind::Time);
+        assert_eq!(rows[0].cell(duration).unwrap().key, 48.0 * 60.0);
+        assert_eq!(rows[1].cell(duration).unwrap().key, 4.0);
+        assert_eq!(crate::table::compare(&rows[1], &rows[0], duration), std::cmp::Ordering::Less);
+        assert!(rows[2].is_blank(duration));
+        assert!(!rows[0].is_blank(duration));
     }
 
     #[test]

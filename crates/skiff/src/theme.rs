@@ -145,7 +145,10 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Applies the palette to the egui style.
 pub fn apply(ctx: &egui::Context, p: &Palette) {
     ctx.set_theme(if p.dark { egui::Theme::Dark } else { egui::Theme::Light });
-    ctx.global_style_mut(|style| {
+    // Style both of egui's theme slots: which one is active can be decided
+    // elsewhere (system preference, windowing backend) after we run, and a
+    // half-applied palette is unreadable.
+    ctx.all_styles_mut(|style| {
         style.text_styles = [
             (TextStyle::Small, FontId::new(11.5, FontFamily::Proportional)),
             (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),

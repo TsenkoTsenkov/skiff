@@ -70,7 +70,8 @@ fn preferred_width(col: &Column) -> (f32, bool) {
         }
         _ => match title.as_str() {
             "message" => return (240.0, true),
-            "node" | "object" => 150.0,
+            "node" => 150.0,
+            "object" => 220.0,
             "ip" | "cluster-ip" | "external-ip" | "internal-ip" => 104.0,
             "restarts" | "up-to-date" | "roles" | "version" | "completions" | "desired" | "current" => 84.0,
             "images" | "selector" | "containers" | "port(s)" | "hosts" => 180.0,
@@ -95,9 +96,12 @@ fn droppability(c: &DCol, snap: &Snapshot) -> u8 {
             let col = &snap.columns[*i];
             match (col.source, col.kind) {
                 (ColSource::Name, _) => 0,
-                (ColSource::Age, _) => 2,
-                (ColSource::Namespace, _) => 3,
+                // Names repeat across namespaces, so keep the namespace
+                // longer than the age or readiness counts.
+                (ColSource::Namespace, _) => 2,
+                (ColSource::Age, _) => 3,
                 (ColSource::Owner, _) => 7,
+                (_, ColKind::Status) if col.title.eq_ignore_ascii_case("ready") => 4,
                 (_, ColKind::Status) => 1,
                 _ if col.title.eq_ignore_ascii_case("message") => 0,
                 _ if col.title.eq_ignore_ascii_case("object") => 2,
@@ -113,10 +117,15 @@ fn droppability(c: &DCol, snap: &Snapshot) -> u8 {
 pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
     let mut out = Vec::with_capacity(snap.columns.len() + 2);
     let pod_metrics = key.is("", "pods") && metrics.available;
+    let shown = |title: &str| tui.col_visible.get(title).copied().unwrap_or(true);
     for (i, col) in snap.columns.iter().enumerate() {
         if pod_metrics && col.source == ColSource::Age {
-            out.push(DCol::PodCpu);
-            out.push(DCol::PodMem);
+            if shown("CPU") {
+                out.push(DCol::PodCpu);
+            }
+            if shown("Memory") {
+                out.push(DCol::PodMem);
+            }
         }
         if col_visible(tui, col) {
             out.push(DCol::Real(i));
@@ -223,7 +232,11 @@ impl ViewCache {
         metrics: &Metrics,
     ) -> Option<Duration> {
         let (sort_title, _) = effective_sort(&latest, tui);
-        let sorting_by_metric = key.is("", "pods") && matches!(sort_title.as_str(), "CPU" | "Memory");
+        // CPU / Memory show live usage (pods: absolute, nodes: share of
+        // allocatable), so that is what they sort by.
+        let sorting_by_metric = metrics.available
+            && (key.is("", "pods") || key.is("", "nodes"))
+            && matches!(sort_title.as_str(), "CPU" | "Memory");
         let inputs_changed = self.key.as_ref() != Some(key)
             || self.filter != tui.filter
             || self.sort != tui.sort
@@ -258,26 +271,51 @@ impl ViewCache {
 
         let (title, desc) = effective_sort(&latest, tui);
         let rows = &latest.rows;
+        use std::cmp::Ordering;
         if sorting_by_metric {
+            let pick = |u: skiff_core::Usage| if title == "CPU" { u.cpu } else { u.memory };
+            let capacity = latest.columns.iter().find(|c| c.title.eq_ignore_ascii_case(&title));
+            let nodes = key.is("", "nodes");
+            // Rows without a sample get NaN and sink to the bottom.
             let keys: Vec<f64> = rows
                 .iter()
                 .map(|r| {
-                    metrics
-                        .pod(&r.namespace, &r.name)
-                        .map(|u| if title == "CPU" { u.cpu } else { u.memory })
-                        .unwrap_or(-1.0)
+                    if nodes {
+                        let cap = capacity.and_then(|c| r.cell(c)).map(|c| c.key).unwrap_or(f64::NAN);
+                        match metrics.node(&r.name) {
+                            Some(u) if cap > 0.0 => pick(u) / cap,
+                            _ => f64::NAN,
+                        }
+                    } else {
+                        metrics.pod(&r.namespace, &r.name).map(pick).unwrap_or(f64::NAN)
+                    }
                 })
                 .collect();
             order.sort_by(|a, b| {
-                let o = keys[*a as usize]
-                    .partial_cmp(&keys[*b as usize])
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                if desc { o.reverse() } else { o }
+                let (ka, kb) = (keys[*a as usize], keys[*b as usize]);
+                match (ka.is_nan(), kb.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => {
+                        let o = ka.partial_cmp(&kb).unwrap_or(Ordering::Equal);
+                        if desc { o.reverse() } else { o }
+                    }
+                }
+                .then_with(|| compare(&rows[*a as usize], &rows[*b as usize], &latest.columns[0]))
             });
         } else if let Some(col) = latest.columns.iter().find(|c| c.title.eq_ignore_ascii_case(&title)) {
             order.sort_by(|a, b| {
-                let o = compare(&rows[*a as usize], &rows[*b as usize], col);
-                if desc { o.reverse() } else { o }
+                let (ra, rb) = (&rows[*a as usize], &rows[*b as usize]);
+                // Missing values go last in either direction.
+                match (ra.is_blank(col), rb.is_blank(col)) {
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => {
+                        let o = compare(ra, rb, col);
+                        if desc { o.reverse() } else { o }
+                    }
+                }
             });
         }
 
@@ -307,6 +345,16 @@ impl ViewCache {
     }
 }
 
+/// How long a relative time stays accurate as displayed: seconds are shown
+/// for the first ten minutes, then minutes, then hours.
+pub fn age_tick(youngest: Option<i64>) -> Duration {
+    match youngest {
+        Some(age) if age < 600 => Duration::from_secs(1),
+        Some(age) if age < 3 * 3600 => Duration::from_secs(20),
+        _ => Duration::from_secs(60),
+    }
+}
+
 /// What the user did in the table this frame.
 #[derive(Default)]
 pub struct TableOutput {
@@ -314,7 +362,9 @@ pub struct TableOutput {
     pub menu: Option<(RowAction, Arc<Row>)>,
     /// (kind, namespace, name) of an owner link that was clicked.
     pub open_owner: Option<(String, String, String)>,
-    pub retry: bool,
+    /// Youngest age (seconds) drawn this frame; decides how soon the table
+    /// needs repainting to keep relative times current.
+    pub youngest: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,7 +452,10 @@ pub fn show(
     for c in cols {
         let (width, flexible) = dcol_width(c, snap);
         builder = builder.column(if flexible {
-            TableColumn::remainder().at_least(width.min(160.0)).clip(true)
+            // Not resizable: a resizable column keeps its stored width, so
+            // it would not give space back when the table gets narrower
+            // (detail panel opening) and would push the rest off-screen.
+            TableColumn::remainder().at_least(width.min(160.0)).clip(true).resizable(false)
         } else {
             TableColumn::initial(width).at_least(36.0).clip(true)
         });
@@ -465,7 +518,13 @@ pub fn show(
                                     ColSource::Name => cell_text(ui, &row.name, base),
                                     ColSource::Namespace => cell_text(ui, &row.namespace, pal.muted),
                                     ColSource::Age => {
-                                        let text = if row.created > 0 { fmt_age(now - row.created) } else { "—".into() };
+                                        let text = if row.created > 0 {
+                                            let age = now - row.created;
+                                            out.youngest = Some(out.youngest.map_or(age, |y| y.min(age)));
+                                            fmt_age(age)
+                                        } else {
+                                            "—".into()
+                                        };
                                         cell_text(ui, &text, pal.muted);
                                     }
                                     ColSource::Owner => match &row.owner {
@@ -485,7 +544,9 @@ pub fn show(
                                         let Some(cell) = row.cells.get(ci) else { return };
                                         if cell.text.is_empty() {
                                             if col.kind == ColKind::Time && !cell.key.is_nan() {
-                                                cell_text(ui, &fmt_age(now - cell.key as i64), pal.muted);
+                                                let age = now - cell.key as i64;
+                                                out.youngest = Some(out.youngest.map_or(age, |y| y.min(age)));
+                                                cell_text(ui, &fmt_age(age), pal.muted);
                                             } else {
                                                 cell_text(ui, "—", pal.faint);
                                             }

@@ -159,6 +159,22 @@ pub fn usage_bar(ui: &mut Ui, fraction: f32, width: f32, pal: &Palette) {
     ui.painter().rect_filled(fill, CornerRadius::same(3), color);
 }
 
+/// "1 mount", "3 mounts".
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{} {noun}s", thousands(n))
+    }
+}
+
+/// Decoded size of a base64 string without decoding it.
+pub fn base64_len(encoded: &str) -> usize {
+    let t = encoded.trim_end();
+    let padding = t.bytes().rev().take_while(|b| *b == b'=').count();
+    (t.len() / 4 * 3).saturating_sub(padding)
+}
+
 /// Formats 12345 as "12,345".
 pub fn thousands(n: usize) -> String {
     let s = n.to_string();
@@ -174,7 +190,18 @@ pub fn thousands(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::thousands;
+    use super::{base64_len, plural, thousands};
+
+    #[test]
+    fn plurals_and_sizes() {
+        assert_eq!(plural(1, "key"), "1 key");
+        assert_eq!(plural(0, "key"), "0 keys");
+        assert_eq!(plural(2500, "line"), "2,500 lines");
+        assert_eq!(base64_len("aGVsbG8="), 5);
+        assert_eq!(base64_len("aGVsbG8h"), 6);
+        assert_eq!(base64_len("YQ=="), 1);
+        assert_eq!(base64_len(""), 0);
+    }
 
     #[test]
     fn groups_digits() {

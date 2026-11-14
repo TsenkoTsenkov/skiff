@@ -74,6 +74,16 @@ impl Row {
         }
     }
 
+    /// Whether the row has no value in this column (drawn as a dash).
+    pub fn is_blank(&self, col: &Column) -> bool {
+        match col.source {
+            ColSource::Name | ColSource::Namespace => false,
+            ColSource::Age => self.created <= 0,
+            ColSource::Owner => self.owner.is_none(),
+            ColSource::Cell(i) => self.cells.get(i).is_none_or(|c| c.text.is_empty() && c.key.is_nan()),
+        }
+    }
+
     pub fn owner_kind(&self) -> &str {
         self.owner.as_ref().map(|o| &*o.0).unwrap_or("")
     }

@@ -8,7 +8,7 @@ use egui_material_icons::{icons, MaterialIcon};
 use skiff_core::kinds;
 use skiff_core::{Contexts, ResourceKey, Session, BUILTINS};
 
-use crate::app::{kind_title, View};
+use crate::app::{kind_icon, kind_title, View};
 use crate::theme::{self, Palette};
 
 #[derive(Default)]
@@ -91,14 +91,6 @@ pub fn fuzzy(query: &str, text: &str) -> Option<i32> {
     Some(score - (t.len() as i32) / 6)
 }
 
-fn kind_icon_for(key: &ResourceKey) -> MaterialIcon {
-    if key.is("", "pods") {
-        icons::ICON_DEPLOYED_CODE
-    } else {
-        icons::ICON_TABLE_ROWS
-    }
-}
-
 fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Option<&Arc<Session>>) -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
     let mut push = |icon, title: String, subtitle: String, cmd, bonus: i32, extra_terms: &[&str]| {
@@ -117,7 +109,7 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
     for b in BUILTINS {
         let key = b.key();
         push(
-            icons::ICON_TABLE_ROWS,
+            kind_icon(&key),
             kind_title(&key),
             b.category.title().to_string(),
             Command::Go(View::Resource(key)),
@@ -182,7 +174,7 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
             for row in snap.rows.iter() {
                 if let Some(score) = fuzzy(query, &row.name) {
                     found.push(Item {
-                        icon: kind_icon_for(&store.key),
+                        icon: kind_icon(&store.key),
                         title: row.name.to_string(),
                         subtitle: if row.namespace.is_empty() {
                             title.clone()
@@ -254,7 +246,7 @@ pub fn show(
             );
             edit.request_focus();
             ui.separator();
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(420.0).min_scrolled_height(420.0).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 if items.is_empty() {
                     ui.add_space(12.0);

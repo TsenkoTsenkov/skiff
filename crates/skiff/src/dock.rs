@@ -181,9 +181,9 @@ impl LogsTab {
                     })
                     .collect();
                 let mut summary = if filtering {
-                    format!("{} of {} lines", widgets::thousands(shown), widgets::thousands(total))
+                    format!("{} of {}", widgets::thousands(shown), widgets::plural(total, "line"))
                 } else {
-                    format!("{} lines", widgets::thousands(total))
+                    widgets::plural(total, "line")
                 };
                 if dropped > 0 {
                     summary.push_str(&format!(" (+{} older dropped)", widgets::thousands(dropped as usize)));
@@ -521,7 +521,7 @@ fn forwards_ui(ui: &mut Ui, pal: &Palette, sessions: &HashMap<String, Arc<Sessio
                     ui.label(format!("{}:{}", f.label, f.remote_port));
                     ui.label(RichText::new(format!("{} / {}", f.namespace, ctx_name)).color(pal.muted).size(12.0));
                     let n = f.connections.load(Ordering::Relaxed);
-                    ui.label(RichText::new(format!("{n} connections")).color(pal.faint).size(12.0));
+                    ui.label(RichText::new(widgets::plural(n as usize, "connection")).color(pal.faint).size(12.0));
                     if let Some(err) = f.last_error.lock().clone() {
                         widgets::pill(ui, "error", pal.err, pal).on_hover_text(err);
                     }
