@@ -10,13 +10,14 @@ Measured on a 4-core cloud VM against a local cluster with 100 nodes and
 
 | | |
 | --- | --- |
-| First frame after launch | 70–120 ms |
-| All 5,415 pods listed and live | about 0.5 s after launch |
+| First frame after launch | 60–120 ms |
+| All 5,415 pods listed and live | 0.4–0.5 s after launch |
 | Frame cost with the pods table open | about 1 ms |
 | Re-filter / re-sort 5,415 rows | 1–5 ms |
 | Open an object's details | about 20 ms |
 | Switch to another resource type (3,000 rows) | about 0.1 s |
 | Memory held per pod row | under 1 KB (about 4 MB for 5,415 pods) |
+| CPU while idle on that table | under 1% of one core |
 | Binary | 31 MB, no runtime dependencies beyond a GPU driver |
 
 That machine has no GPU, so rendering was done by a CPU rasterizer; process
@@ -26,8 +27,8 @@ hardware have not been measured yet.
 ## Why it is fast
 
 - **Native, immediate-mode UI** (egui). There is no web view, no DOM and no
-  JavaScript. A frame is a couple of milliseconds of CPU and the app only
-  repaints when something changed, so it idles at ~0% CPU.
+  JavaScript. A frame is about a millisecond of CPU, and the app repaints
+  only when data changes or a relative time on screen would tick over.
 - **Watches only what you look at.** A resource type is listed and watched
   when you open it and stops three minutes after you leave it. Lens-style
   "watch everything up front" is what makes large clusters painful.
@@ -54,11 +55,13 @@ hardware have not been measured yet.
   services, ingresses, nodes, config maps, secrets with reveal/copy, PVCs,
   cron jobs, events, …), conditions, related pods, object events, and links
   between objects
-- YAML view with syntax highlighting; edit and apply with conflict detection
+- YAML view with syntax highlighting; edit and apply with conflict detection;
+  create or update objects from a manifest (server-side apply)
 - Pod and workload logs: follow, multi-pod merge, filter, timestamps, wrap,
   previous container, level colouring
 - Port forwarding for pods and services, with a list of active forwards
-- Scale, rollout restart, cordon / uncordon, delete (optionally forced)
+- Scale, rollout restart, cordon / uncordon, suspend / resume cron jobs,
+  delete (optionally forced)
 - CPU / memory columns and cluster usage from metrics-server (no Prometheus)
 - Cluster overview: what is broken right now and recent warnings
 - Command palette (`Ctrl/Cmd+K`): jump to any kind (kubectl short names
@@ -131,9 +134,12 @@ cargo test
 ```
 
 The UI tests in `crates/skiff/tests/ui.rs` drive the real app headlessly
-against the `demo` cluster and write screenshots to `target/shots/` (they are
-skipped when the cluster is not running; rendering uses a software Vulkan
-driver, `mesa-vulkan-drivers` on Linux).
+against the `demo` cluster and write screenshots to `target/shots/`, and
+`crates/skiff-core/tests/live.rs` checks that background work really stops
+and reconnects really recover. Both are skipped when the cluster is not
+running; rendering uses a software Vulkan driver (`mesa-vulkan-drivers` on
+Linux). `crates/skiff/tests/qa_flows.rs` holds a larger, slower set of
+exploratory flows that is opt-in (see the note at the top of that file).
 
 Performance numbers come from:
 
@@ -145,8 +151,8 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 
 - Helm releases
 - Node drain, cron job trigger, bulk actions on multiple rows
-- Creating resources from a blank editor
-- Mouse reporting inside the terminal (htop, vim mouse mode)
+- Namespace-scoped watches for accounts that cannot list cluster-wide (the
+  data layer supports them; the UI does not switch to them yet)
 
 ## License
 
