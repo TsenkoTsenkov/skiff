@@ -55,6 +55,8 @@ pub fn pill(ui: &mut Ui, text: &str, color: Color32, pal: &Palette) -> Response 
         ui.painter().rect_filled(rect, CornerRadius::same(9), pal.tint(color, 0.16));
         ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
     }
+    let label = text.to_string();
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
     resp
 }
 

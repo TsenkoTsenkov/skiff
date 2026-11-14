@@ -229,9 +229,11 @@ impl LogsTab {
             let mut area = if wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() }
                 .auto_shrink([false, false])
                 .stick_to_bottom(true);
-            if self.jump_to_end {
-                self.jump_to_end = false;
-                area = area.vertical_scroll_offset(f32::MAX);
+            let jump = std::mem::take(&mut self.jump_to_end);
+            if jump && !wrap {
+                // Any offset past the end is clamped to the last row. (An
+                // "infinite" offset overflows the row arithmetic.)
+                area = area.vertical_scroll_offset(shown as f32 * LOG_ROW);
             }
             let line_job = |ui: &Ui, buf: &skiff_core::logs::LogBuffer, row: usize| -> Option<LayoutJob> {
                 let idx = if filtering { (*self.matched.get(row)? - buf.dropped) as usize } else { row };
@@ -274,6 +276,9 @@ impl LogsTab {
                                 ui.add(egui::Label::new(job).selectable(true));
                             }
                         }
+                        if jump {
+                            ui.scroll_to_cursor(Some(Align::BOTTOM));
+                        }
                     });
                 });
             } else {
@@ -281,9 +286,14 @@ impl LogsTab {
                     stream.with(|buf| {
                         for row in range {
                             if let Some(job) = line_job(ui, buf, row) {
-                                ui.add_sized(
-                                    [ui.available_width().max(1.0), LOG_ROW],
-                                    egui::Label::new(job).selectable(true).extend().halign(Align::Min),
+                                // Fixed-height, left-aligned rows keep the
+                                // virtualized scroll position exact.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width().max(1.0), LOG_ROW),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.add(egui::Label::new(job).selectable(true).extend());
+                                    },
                                 );
                             }
                         }

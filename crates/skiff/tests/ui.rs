@@ -150,3 +150,20 @@ fn light_theme_and_custom_resources() {
     shot(&mut h, "11_crds_light");
     assert!(!h.state().pal.dark);
 }
+
+#[test]
+fn logs_dock_streams_and_filters() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    h.get_by_label("alertmanager-0").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    h.get_by_label("Logs").click();
+    settle(&mut h, "log lines", |h| has_label_containing(h, " lines") && has_label_containing(h, "streaming"));
+    shot(&mut h, "12_logs");
+
+    h.get_by_label("Show timestamps").click();
+    h.get_by_label("Wrap long lines").click();
+    settle(&mut h, "toggles", |_| true);
+    shot(&mut h, "13_logs_wrapped_timestamps");
+}
