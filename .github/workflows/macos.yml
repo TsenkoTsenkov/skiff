@@ -41,6 +41,21 @@ jobs:
           name: Skiff-macos-arm64
           path: target/release/Skiff-*.dmg
           if-no-files-found: error
+      # After the upload, so that a failure here still leaves the image.
+      - name: The app opens a window and draws a frame
+        run: |
+          SKIFF_TRACE_STARTUP=1 KUBECONFIG=/dev/null \
+            target/release/Skiff.app/Contents/MacOS/Skiff > smoke.log 2>&1 &
+          pid=$!
+          sleep 10
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "still running after 10 s"
+            kill "$pid" || true
+          else
+            echo "the app exited by itself:"
+          fi
+          cat smoke.log
+          grep -q "first frame built" smoke.log
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/')
         env:
