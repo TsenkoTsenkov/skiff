@@ -18,7 +18,7 @@ Measured on a 4-core cloud VM against a local cluster with 100 nodes and
 | Switch to another resource type (3,000 rows) | about 0.1 s |
 | Memory held per pod row | under 1 KB (about 4 MB for 5,415 pods) |
 | CPU while idle on that table | under 1% of one core |
-| Binary | 31 MB, no runtime dependencies beyond a GPU driver |
+| Binary | 35 MB, no runtime dependencies beyond a GPU driver |
 
 That machine has no GPU, so rendering was done by a CPU rasterizer; process
 memory there was about 165 MB, most of it the rasterizer. Numbers on real
