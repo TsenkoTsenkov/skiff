@@ -472,7 +472,7 @@ impl Dock {
                         stream.set_visible(shown == Some(i));
                     }
                 }
-                TabKind::Shell(s) => s.poll(),
+                TabKind::Shell(s) => s.poll(ui.ctx()),
                 TabKind::Forwards => {}
             }
         }

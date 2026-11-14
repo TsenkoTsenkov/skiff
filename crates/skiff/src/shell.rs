@@ -92,7 +92,7 @@ impl ShellTab {
         self.exec = Some(self.session.exec(&self.ns, &self.pod, container, default_shell()));
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, ctx: &egui::Context) {
         if let Some(job) = &self.containers_job {
             if let Some(res) = job.take() {
                 self.containers_job = None;
@@ -125,11 +125,18 @@ impl ShellTab {
                     break;
                 }
             }
+            // (Also when nothing new arrived: output held back by the
+            // program is released after a moment.)
+            if let Some(Some(wait)) = self.with_term(|t| t.tick()) {
+                ctx.request_repaint_after(wait);
+            }
             let replies = self.term.take_replies();
             if !replies.is_empty() {
                 exec.write(&replies);
             }
         }
+        #[cfg(not(feature = "terminal"))]
+        let _ = ctx;
     }
 
     /// The text currently on the terminal's screen, one line per row (for

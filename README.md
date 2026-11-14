@@ -205,8 +205,10 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 - Merging your YAML edits into a newer version of the object: when it
   changed while you were typing you are told, and can load the latest
   version, but your changes have to be made again
-- Logs across a backwards step of the node's clock: lines stamped earlier
-  than ones already shown can be missed until the clock catches up
+- Logs while a node's clock is being corrected: after a backwards step,
+  lines can be missed until the clock catches up; after a jump ahead of more
+  than a few seconds that is later undone, a reconnect can show a block of
+  lines a second time
 - Accounts limited to a namespace: tables work once that one namespace is
   selected (`-n <namespace>` or the picker), but the overview page and
   selecting several namespaces still need cluster-wide list rights

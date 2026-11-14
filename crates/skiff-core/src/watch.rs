@@ -585,6 +585,8 @@ struct Engine {
     quiet_check: Option<u64>,
     /// See `QUIET_WATCH_MIN`; a field so that tests need not wait that long.
     quiet_min: Duration,
+    /// The last watch was ended by a connection reset after a quiet spell.
+    cut_off: bool,
 }
 
 /// How a watch behaved that the server (or something in between) closed.
@@ -895,11 +897,13 @@ impl Engine {
                     }
                     // Many proxies and load balancers end an idle
                     // connection by resetting it rather than closing the
-                    // response. For a watch that had been quiet that is the
-                    // same thing; a network that is really down shows on
-                    // the next attempt.
-                    if lines == 0 && started.elapsed() >= self.quiet_min {
-                        return WatchEnd::Resume(Health::Quiet);
+                    // response. After a quiet spell that is the same
+                    // thing as a clean end (a network that is really down
+                    // shows on the next attempt); a watch cut while data
+                    // was flowing is a failure.
+                    if last_data.elapsed() >= self.quiet_min {
+                        self.cut_off = true;
+                        return WatchEnd::Resume(if lines == 0 { Health::Quiet } else { Health::Good });
                     }
                     return WatchEnd::Failed(Fail::Transient(e.to_string()));
                 }
@@ -1019,6 +1023,13 @@ impl Engine {
                         quiet = 0;
                         self.quick_gone = 0;
                         backoff = BACKOFF_START;
+                        if std::mem::take(&mut self.cut_off) {
+                            // (See QUIET_REOPEN_DELAY.)
+                            self.pause(QUIET_REOPEN_DELAY).await;
+                            if self.refresh_requested() {
+                                break;
+                            }
+                        }
                     }
                     WatchEnd::Resume(Health::Quiet) => {
                         // Either nothing happened and something drops idle
@@ -1030,13 +1041,16 @@ impl Engine {
                         self.quick_gone = 0;
                         backoff = BACKOFF_START;
                         quiet += 1;
+                        self.cut_off = false;
+                        // (Before the check as well as before re-opening:
+                        // either request would race the closing connection.)
+                        self.pause(QUIET_REOPEN_DELAY).await;
+                        if self.refresh_requested() {
+                            break;
+                        }
                         if quiet >= QUIET_CHECK_AFTER {
                             self.quiet_check = Some(rows_fingerprint(&self.rows));
                             self.routine_relist = true;
-                            break;
-                        }
-                        self.pause(QUIET_REOPEN_DELAY).await;
-                        if self.refresh_requested() {
                             break;
                         }
                     }
@@ -1147,6 +1161,7 @@ async fn run_with(store: Arc<TableStore>, client: Client, notify: Notifier, quie
         routine_grace: None,
         quiet_check: None,
         quiet_min,
+        cut_off: false,
     }
     .run()
     .await
@@ -1256,6 +1271,7 @@ mod tests {
             routine_grace: None,
             quiet_check: None,
             quiet_min: QUIET_WATCH_MIN,
+            cut_off: false,
         };
         let mut rv = "1234".to_string();
 
@@ -1528,6 +1544,67 @@ mod tests {
         let (lists, watches) = api.counts();
         assert_eq!(*states.lock().unwrap(), [LoadState::Live], "a reset idle watch is not a failure");
         assert!(watches >= 8 && lists >= 3, "{watches} watches, {lists} lists");
+    }
+
+    /// A watch that delivered something, went quiet and was then reset is
+    /// the same story: the table stays live and simply watches on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watches_reset_after_going_quiet_keep_watching() {
+        // One bookmark at once, then silence, then a reset: the fake sends
+        // its body only at the end, so use a clean line-then-reset script
+        // through a tiny custom server instead.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let watches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = watches.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let w = w.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    while !req.windows(4).any(|x| x == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&req);
+                    if head.lines().next().unwrap_or("").contains("watch=1") {
+                        w.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let bookmark = "{\"type\":\"BOOKMARK\",\"object\":{\"kind\":\"Table\",\"metadata\":{\"resourceVersion\":\"6\"},\"rows\":[{\"cells\":[\"\"],\"object\":{\"metadata\":{\"resourceVersion\":\"6\"}}}]}}\n";
+                        let _ = sock.write_all(bookmark.as_bytes()).await;
+                        let _ = sock.flush().await;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        #[allow(deprecated)]
+                        let _ = sock.set_linger(Some(Duration::ZERO));
+                        return;
+                    }
+                    let body = r#"{"kind":"Table","metadata":{"resourceVersion":"5"},"columnDefinitions":[{"name":"Name","type":"string","priority":0}],"rows":[{"cells":["a"],"object":{"metadata":{"name":"a","namespace":"x","uid":"u-a","resourceVersion":"5"}}}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let store = Arc::new(TableStore::new(kinds::builtin("", "configmaps").unwrap().key(), None));
+        let client = Client::try_from(kube::Config::new(format!("http://{addr}").parse().unwrap())).unwrap();
+        // "Quiet" after 100 ms without data for this test.
+        tokio::spawn(run_with(store.clone(), client, Notifier::noop(), Duration::from_millis(100)));
+        until("live", Duration::from_secs(5), || store.peek().state == LoadState::Live).await;
+        let states = record_states(&store);
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(*states.lock().unwrap(), [LoadState::Live], "no reconnecting flashes");
+        assert!(watches.load(Ordering::SeqCst) >= 4, "kept re-opening the watch");
     }
 
     /// ... but a watch that is reset right away is a failure, as before.

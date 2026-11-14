@@ -120,7 +120,7 @@ pub fn encode_key(key: Key, m: Modifiers, mode: KeyMode) -> Option<Vec<u8>> {
         F11 => tilde_key(23, m),
         F12 => tilde_key(24, m),
         Enter => alt_prefix(vec![b'\r']),
-        Tab if m.shift => alt_prefix(b"\x1b[Z".to_vec()),
+        Tab if m.shift => b"\x1b[Z".to_vec(),
         Tab => alt_prefix(vec![b'\t']),
         Escape => alt_prefix(vec![0x1b]),
         Backspace if m.ctrl => alt_prefix(vec![0x08]),
@@ -131,8 +131,11 @@ pub fn encode_key(key: Key, m: Modifiers, mode: KeyMode) -> Option<Vec<u8>> {
         Backslash if m.ctrl => alt_prefix(vec![0x1c]),
         CloseBracket if m.ctrl => alt_prefix(vec![0x1d]),
         Num6 if m.ctrl && m.shift => alt_prefix(vec![0x1e]), // Ctrl+^
-        Minus if m.ctrl => alt_prefix(vec![0x1f]),            // Ctrl+_ (and Ctrl+-)
-        Slash if m.ctrl && m.shift => alt_prefix(vec![0x7f]), // Ctrl+?
+        Minus if m.ctrl && m.shift => alt_prefix(vec![0x1f]), // Ctrl+_
+        Minus if m.ctrl => alt_prefix(vec![b'-']),            // (xterm: unchanged)
+        // Ctrl+? (the key arrives as "?" or as Shift+"/", by platform).
+        Questionmark if m.ctrl => alt_prefix(vec![0x7f]),
+        Slash if m.ctrl && m.shift => alt_prefix(vec![0x7f]),
         Slash if m.ctrl => alt_prefix(vec![0x1f]),
         Num2 if m.ctrl => alt_prefix(vec![0x00]), // Ctrl+@
         // The other digits, as xterm sends them.
@@ -251,7 +254,8 @@ mod tests {
             (Key::Num2, C, NORMAL, Some(b"\x00")),
             (Key::Slash, C, NORMAL, Some(b"\x1f")),
             (Key::Minus, cs, NORMAL, Some(b"\x1f")),
-            (Key::Minus, C, NORMAL, Some(b"\x1f")),
+            (Key::Minus, C, NORMAL, Some(b"-")),
+            (Key::Questionmark, cs, NORMAL, Some(b"\x7f")),
             (Key::Slash, cs, NORMAL, Some(b"\x7f")),
             (Key::Num3, C, NORMAL, Some(b"\x1b")),
             (Key::Num4, C, NORMAL, Some(b"\x1c")),
@@ -259,7 +263,7 @@ mod tests {
             (Key::Num6, C, NORMAL, Some(b"\x1e")),
             (Key::Num7, C, NORMAL, Some(b"\x1f")),
             (Key::Num8, C, NORMAL, Some(b"\x7f")),
-            (Key::Tab, S.plus(A), NORMAL, Some(b"\x1b\x1b[Z")),
+            (Key::Tab, S.plus(A), NORMAL, Some(b"\x1b[Z")),
             (Key::Num6, cs, NORMAL, Some(b"\x1e")),
             (Key::X, cs, NORMAL, Some(b"\x18")),
             // Delivered as Event::Text instead:

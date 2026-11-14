@@ -450,7 +450,10 @@ async fn pump(
         // Whether this attempt got anywhere: it delivered a line, or the
         // connection was established and stayed up for a while.
         let mut healthy = false;
-        let opening = match tokio::time::timeout(OPEN_TIMEOUT, pods.log_stream(&target.pod, &lp)).await {
+        // (Later attempts wait longer: a server that needs more than the
+        // first allowance every time is slow, and should still be heard.)
+        let patience = OPEN_TIMEOUT * (attempt + 1).min(4);
+        let opening = match tokio::time::timeout(patience, pods.log_stream(&target.pod, &lp)).await {
             Ok(Ok(reader)) => Ok(reader),
             Ok(Err(e)) => Err((is_gone(&e), false, friendly(&e))),
             Err(_) => Err((false, true, "no response from the API server".to_string())),

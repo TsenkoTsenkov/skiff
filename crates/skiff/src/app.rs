@@ -1858,9 +1858,12 @@ impl SkiffApp {
             .interactable(false)
             .show(ctx, |ui| {
                 ui.set_width(widest);
-                ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                    for (t, galley) in self.toasts.iter().zip(galleys) {
-                        let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
+                for (t, galley) in self.toasts.iter().zip(galleys) {
+                    let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
+                    let width = galley.size().x + 8.0 + 6.0 + 24.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(((widest - width) / 2.0).max(0.0));
                         Frame::new()
                             .fill(pal.raised)
                             .stroke(Stroke::new(1.0, pal.border))
@@ -1873,9 +1876,9 @@ impl SkiffApp {
                                     ui.add(egui::Label::new(galley));
                                 });
                             });
-                        ui.add_space(6.0);
-                    }
-                });
+                    });
+                    ui.add_space(6.0);
+                }
             });
         ctx.request_repaint_after(Duration::from_millis(500));
     }

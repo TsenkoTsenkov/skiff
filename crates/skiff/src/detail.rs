@@ -512,6 +512,12 @@ impl Detail {
                     };
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
+                // While a save is on its way the text is what was sent:
+                // anything typed then would vanish when it succeeds. The
+                // field itself stays as it is (making it read-only would
+                // take the keyboard away, and after a refused save the
+                // next keys would go somewhere else).
+                let sent = saving.then(|| edit.text.clone());
                 ui.add(
                     egui::TextEdit::multiline(&mut edit.text)
                         .id(edit.id)
@@ -519,11 +525,13 @@ impl Detail {
                         .desired_width(f32::INFINITY)
                         .desired_rows(30)
                         .frame(egui::Frame::NONE)
-                        // Read-only while a save is on its way: what is
-                        // typed then would vanish when it succeeds.
-                        .interactive(!saving)
                         .layouter(&mut layouter),
                 );
+                if let Some(sent) = sent {
+                    if edit.text != sent {
+                        edit.text = sent;
+                    }
+                }
             });
             if apply && !saving {
                 edit.error = None;

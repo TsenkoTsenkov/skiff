@@ -835,6 +835,15 @@ fn yaml_editor_follows_or_flags_changes_on_the_server() {
     steps(&mut h, 3);
     assert!(editor_text(&h).contains("# mine more/"), "typing continues in the editor: {:?}", editor_text(&h).lines().next());
     assert_eq!(h.state().table_stats().0, 1, "the table's filter is untouched");
+    // Applying now is refused by the server (the object moved on). The
+    // editor must still have the keyboard afterwards, text intact.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    settle(&mut h, "the refusal", |h| has_label_containing(h, "(409)"));
+    assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the editor keeps the keyboard after a refused save");
+    h.get_by_role(Role::MultilineTextInput).type_text("again/");
+    steps(&mut h, 3);
+    assert!(editor_text(&h).contains("# mine more/again/"), "typing continues after the refusal");
+    assert_eq!(h.state().table_stats().0, 1, "the table's filter is still untouched");
     h.get_by_label("Load the latest version").click();
     settle(&mut h, "latest version", |h| editor_text(h).contains("skiff-test/two"));
     assert!(!h.state().detail.as_ref().unwrap().has_unsaved_edit());
@@ -1016,5 +1025,21 @@ fn shell_colours_in_both_themes() {
             h.state().dock.shell_screen().unwrap_or_default().lines().any(|l| l.trim() == "colours-done")
         });
         shot(&mut h, name);
+    }
+}
+
+#[test]
+fn notifications_are_centred_each() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1);
+    h.state_mut().toast("Short", skiff_core::Tone::Ok);
+    h.state_mut().toast("A considerably longer notification than the first one", skiff_core::Tone::Ok);
+    steps(&mut h, 3);
+    shot(&mut h, "34_toast_stack");
+    for text in ["Short", "A considerably longer notification than the first one"] {
+        let x = h.get_by_label(text).rect().center().x;
+        // (The text sits right of a small dot, hence the allowance.)
+        assert!((x - 720.0).abs() < 12.0, "{text:?} is centred at x={x:.0}, not in the middle of the window");
     }
 }

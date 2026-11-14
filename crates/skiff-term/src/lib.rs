@@ -42,13 +42,19 @@ const WHEEL_LINES: f32 = 3.0;
 const MAX_OSC_BYTES: usize = 64 * 1024;
 /// Combining characters kept (and drawn) per cell; the emulator would stack
 /// any number onto one cell.
-const MAX_ZEROWIDTH: usize = 16;
-/// After this many zero-width characters the grid is searched for cells
-/// that collected too many.
-const ZEROWIDTH_SWEEP: usize = 50_000;
+const MAX_ZEROWIDTH: usize = 8;
+/// After this many zero-width characters the screen is searched for cells
+/// that collected too many. (Only cells on the screen can collect them, so
+/// that is all there is to search; and since at most this many arrive
+/// between two searches, a line cannot carry more into the scrollback.)
+const ZEROWIDTH_SWEEP: usize = 256;
 /// Replies to the remote (cursor position reports, colour answers, ...)
 /// waiting to be collected. More than this is not answered.
 const MAX_PENDING_REPLIES: usize = 64 * 1024;
+/// A "synchronized update" (output held back until the program says the
+/// frame is complete) is honoured up to this size; a bigger one is shown as
+/// it comes. Held-back output is out of reach of the limits above.
+const MAX_SYNC_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -140,6 +146,8 @@ pub struct TerminalView {
     /// Style seen by the last `ui` call (to answer OSC colour queries).
     style: TermStyle,
     guard: Guard,
+    /// (fg, bg, dim) -> the fg to draw with, for the current style.
+    legible: std::cell::RefCell<std::collections::HashMap<(Color32, Color32, bool), Color32>>,
 }
 
 /// Follows the byte stream just closely enough to enforce the limits above.
@@ -152,7 +160,15 @@ struct Guard {
     /// point so far (plain text only, to count zero-width characters).
     utf8_need: u8,
     utf8_acc: u32,
+    /// Zero-width characters scanned and not yet handed to the parser.
     zero_width: usize,
+    /// Zero-width characters that went to the primary and to the alternate
+    /// screen since each was last searched. (Output is handed to the parser
+    /// in stretches that end before anything that could switch screens, so
+    /// each stretch belongs to one screen.)
+    unswept: [usize; 2],
+    /// Zero-width characters inside the synchronized update being held.
+    held: usize,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -161,6 +177,8 @@ enum Scan {
     Ground,
     /// After ESC.
     Esc,
+    /// Inside a CSI sequence (`ESC [` ...), before its final byte.
+    Csi,
     /// Inside an OSC string.
     Osc,
 }
@@ -234,6 +252,14 @@ fn luminance(c: Color32) -> f32 {
 pub fn contrast(a: Color32, b: Color32) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Characters that are drawn as areas of colour rather than read as text:
+/// box drawing and block elements (bars, half-block "pixels"), Braille
+/// patterns (graphs), the powerline separators and the legacy-computing
+/// block. Their colour is the picture; it is not adjusted for contrast.
+fn is_fill_glyph(c: char) -> bool {
+    matches!(c, '\u{2500}'..='\u{259f}' | '\u{2800}'..='\u{28ff}' | '\u{e0a0}'..='\u{e0d7}' | '\u{1fb00}'..='\u{1fbff}')
 }
 
 /// `fg`, moved towards black or white just far enough to stand out from
@@ -344,6 +370,7 @@ impl TerminalView {
             scroll_accum: 0.0,
             style: TermStyle::default(),
             guard: Guard::default(),
+            legible: Default::default(),
         }
     }
 
@@ -362,10 +389,9 @@ impl TerminalView {
                         self.guard.state = Scan::Esc;
                         self.guard.utf8_need = 0;
                     } else if b >= 0x80 && self.guard.text_byte(b) && self.guard.zero_width >= ZEROWIDTH_SWEEP {
+                        // (`advance` searches the screen when it is due.)
                         self.advance(&bytes[start..=i]);
                         start = i + 1;
-                        self.trim_zero_width();
-                        self.guard.zero_width = 0;
                     }
                 }
                 Scan::Esc => {
@@ -374,10 +400,33 @@ impl TerminalView {
                             self.guard.osc_len = 0;
                             Scan::Osc
                         }
-                        0x1b => Scan::Esc,
+                        b'[' => Scan::Csi,
+                        // CAN and SUB abort the escape sequence.
+                        0x18 | 0x1a => Scan::Ground,
+                        // The parser stays "after ESC" across other control
+                        // characters, DEL and bytes above 0x7f (a `]` after
+                        // them still starts a string), and so must this.
+                        0x00..=0x1f | 0x7f..=0xff => Scan::Esc,
                         _ => Scan::Ground,
                     };
                 }
+                Scan::Csi => match b {
+                    0x1b => self.guard.state = Scan::Esc,
+                    0x18 | 0x1a => self.guard.state = Scan::Ground,
+                    0x40..=0x7e => {
+                        // The final byte. "Set mode" and "reset mode" can
+                        // switch between the primary and the alternate
+                        // screen: what came before goes to the parser
+                        // first, while it is clear which screen it was for.
+                        if b == b'h' || b == b'l' {
+                            self.advance(&bytes[start..i]);
+                            start = i;
+                        }
+                        self.guard.state = Scan::Ground;
+                    }
+                    // Parameters, intermediates and control characters.
+                    _ => {}
+                },
                 Scan::Osc => match b {
                     // BEL ends it; CAN and SUB abort it.
                     0x07 | 0x18 | 0x1a => self.guard.state = Scan::Ground,
@@ -402,11 +451,53 @@ impl TerminalView {
         if bytes.is_empty() {
             return;
         }
+        let (offset_before, history_before) = {
+            let grid = self.term.grid();
+            (grid.display_offset(), grid.history_size())
+        };
         self.parser.advance(&mut self.term, bytes);
-        // The emulator can leave the viewport scrolled back further than
-        // there is history (output scrolling a region while the user reads
-        // scrollback); drawing that would index past the grid.
-        self.term.grid_mut().scroll_display(Scroll::Delta(0));
+
+        // Repairs to states the emulator can be left in that it (or the
+        // drawing code) does not cope with:
+        let grid = self.term.grid_mut();
+        // The viewport scrolled back further than there is history (output
+        // scrolling a region while the user reads scrollback). Put it back
+        // where the user was, moved only by what really entered history.
+        if grid.display_offset() > grid.history_size() {
+            let grown = grid.history_size().saturating_sub(history_before);
+            let wanted = (offset_before + grown).min(grid.history_size());
+            let delta = wanted as i32 - grid.display_offset() as i32;
+            grid.scroll_display(Scroll::Delta(delta));
+        }
+        // A wide character's second half left behind in the first column.
+        let cursor = grid.cursor.point;
+        if cursor.column.0 == 0 {
+            grid[cursor.line][Column(0)].flags.remove(Flags::WIDE_CHAR_SPACER);
+        }
+
+        // Combining characters: see ZEROWIDTH_SWEEP.
+        let n = std::mem::take(&mut self.guard.zero_width);
+        let screen = usize::from(self.term.mode().contains(TermMode::ALT_SCREEN));
+        self.guard.unswept[screen] += n;
+        // A synchronized update keeps its bytes from the emulator until it
+        // ends, and so from the search below. One that is large, or full
+        // of combining characters, is not held back.
+        if self.parser.sync_timeout().sync_timeout().is_some() {
+            self.guard.held += n;
+            if self.guard.held >= ZEROWIDTH_SWEEP || self.parser.sync_bytes_count() > MAX_SYNC_BYTES {
+                self.parser.stop_sync(&mut self.term);
+                self.guard.held = 0;
+                self.guard.unswept = [ZEROWIDTH_SWEEP; 2];
+            }
+        } else if self.guard.held > 0 {
+            // It ended by itself: what it held is on the grid now.
+            self.guard.held = 0;
+            self.guard.unswept = [ZEROWIDTH_SWEEP; 2];
+        }
+        if self.guard.unswept[screen] >= ZEROWIDTH_SWEEP {
+            self.trim_zero_width();
+            self.guard.unswept[screen] = 0;
+        }
     }
 
     /// A synchronized update ("draw nothing until I say so") that was never
@@ -415,14 +506,27 @@ impl TerminalView {
         if self.parser.sync_timeout().sync_timeout().is_some_and(|at| at <= Instant::now()) {
             self.parser.stop_sync(&mut self.term);
             self.term.grid_mut().scroll_display(Scroll::Delta(0));
+            if std::mem::take(&mut self.guard.held) > 0 {
+                self.trim_zero_width();
+            }
             self.drain_term_events();
         }
     }
 
-    /// Cuts cells that collected more combining characters than are kept.
+    /// Housekeeping that does not depend on new output: call it once per
+    /// frame also while the widget is not shown. Returns how soon it wants
+    /// to be called again, if it is waiting for something.
+    pub fn tick(&mut self) -> Option<std::time::Duration> {
+        self.expire_sync();
+        let at = self.parser.sync_timeout().sync_timeout()?;
+        Some(at.saturating_duration_since(Instant::now()))
+    }
+
+    /// Cuts cells on the (active) screen that collected more combining
+    /// characters than are kept.
     fn trim_zero_width(&mut self) {
         let grid = self.term.grid_mut();
-        let (top, bottom, cols) = (grid.topmost_line().0, grid.bottommost_line().0, grid.columns());
+        let (top, bottom, cols) = (0, grid.bottommost_line().0, grid.columns());
         for line in top..=bottom {
             let row = &mut grid[Line(line)];
             for col in 0..cols {
@@ -592,6 +696,7 @@ impl TerminalView {
     pub fn ui(&mut self, ui: &mut egui::Ui, style: &TermStyle) -> TermOutput {
         if *style != self.style {
             self.style = style.clone();
+            self.legible.borrow_mut().clear();
         }
         let ctx = ui.ctx().clone();
         let is_mac = ctx.os() == egui::os::OperatingSystem::Mac;
@@ -833,8 +938,12 @@ impl TerminalView {
         let selection = content.selection;
 
         let mut runs: Vec<Run> = Vec::with_capacity(usize::from(self.rows) * 2);
-        // (fg, bg, dim) -> fg to draw with; the same pairs recur all over.
-        let mut legible: std::collections::HashMap<(Color32, Color32, bool), Color32> = std::collections::HashMap::new();
+        // (fg, bg, dim) -> fg to draw with; the same pairs recur all over
+        // and from frame to frame.
+        let mut legible = self.legible.borrow_mut();
+        if legible.len() > 16 * 1024 {
+            legible.clear();
+        }
         for cell in content.display_iter {
             let flags = cell.flags;
             if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -866,7 +975,7 @@ impl TerminalView {
                 fg = style.bg;
                 bg = style.cursor;
             }
-            if style.min_contrast > 1.0 && fg != bg {
+            if style.min_contrast > 1.0 && fg != bg && !is_fill_glyph(cell.c) {
                 // (Dim text is meant to recede: it gets half the margin.)
                 let dim = flags.contains(Flags::DIM);
                 let ratio = if dim { (style.min_contrast / 2.0).max(1.0) } else { style.min_contrast };
@@ -1196,6 +1305,103 @@ mod tests {
         assert!(stacked <= 1 + ZEROWIDTH_SWEEP + MAX_ZEROWIDTH, "{stacked} characters on one cell");
         t.feed(marks.as_bytes());
         assert!(t.row_text(1).chars().count() <= 1 + MAX_ZEROWIDTH);
+    }
+
+    #[test]
+    fn osc_limit_holds_after_stray_bytes_following_esc() {
+        // The parser stays "after ESC" across control characters, DEL and
+        // high bytes, and a `]` after them still starts a string.
+        for stray in [&b"\x00"[..], b"\n", b"\x7f", b"\x80", b"\x07", b"\x00\x01\x02"] {
+            let mut t = TerminalView::new();
+            t.feed(b"\x1b");
+            t.feed(stray);
+            t.feed(b"]0;");
+            let chunk = vec![b'A'; 1 << 20];
+            for _ in 0..4 {
+                t.feed(&chunk);
+            }
+            t.feed(b"\x07after\r\n");
+            let title = t.title().map(str::len).unwrap_or(0);
+            assert!(title <= MAX_OSC_BYTES, "{stray:?}: the title grew to {title} bytes");
+            assert!((0..24).any(|r| t.row_text(r) == "after"), "{stray:?}: output after the string is shown");
+        }
+        // CAN and SUB end the escape sequence: no string follows.
+        let mut t = TerminalView::new();
+        t.feed(b"\x1b\x18]0;not a title\x07");
+        assert_eq!(t.title(), None);
+    }
+
+    fn marks_on(t: &TerminalView, row: i32, col: usize) -> usize {
+        t.term.grid()[Line(row)][Column(col)].zerowidth().map_or(0, <[char]>::len)
+    }
+
+    #[test]
+    fn combining_marks_cannot_hide_on_the_other_screen() {
+        // Pile marks onto a cell of the primary screen, a few at a time,
+        // switching to the alternate screen in between so that the search
+        // for overfull cells would always find the alternate screen in
+        // front. Every cycle arrives as one piece, and its last mark (the
+        // one that makes a search due) goes to the alternate screen.
+        let mut t = TerminalView::new();
+        t.feed(b"a");
+        let mut cycle = Vec::new();
+        cycle.extend_from_slice(b"\x1b[?1049l");
+        cycle.extend_from_slice("\u{301}".repeat(ZEROWIDTH_SWEEP - 1).as_bytes());
+        cycle.extend_from_slice(b"\x1b[?1049hb");
+        cycle.extend_from_slice("\u{301}".as_bytes());
+        for _ in 0..200 {
+            t.feed(&cycle);
+        }
+        // All 200 cycles in one piece, too.
+        t.feed(&cycle.repeat(200));
+        t.feed(b"\x1b[?1049l");
+        let marks = marks_on(&t, 0, 0);
+        assert!(marks <= MAX_ZEROWIDTH + ZEROWIDTH_SWEEP, "{marks} marks on one cell");
+    }
+
+    #[test]
+    fn combining_marks_cannot_hide_in_a_held_back_update() {
+        // Output inside a synchronized update is kept from the emulator
+        // until the update ends; one stuffed with marks is not held back.
+        let mut t = TerminalView::new();
+        t.feed(b"\x1b[?2026ha");
+        let marks = "\u{301}".repeat(20_000);
+        t.feed(marks.as_bytes());
+        t.feed(b"\x1b[?2026l");
+        t.feed("\u{301}".repeat(ZEROWIDTH_SWEEP).as_bytes());
+        assert!(marks_on(&t, 0, 0) <= MAX_ZEROWIDTH, "{} marks on one cell", marks_on(&t, 0, 0));
+        // A very large update is shown as it comes rather than held.
+        let mut t = TerminalView::new();
+        t.feed(b"\x1b[?2026h");
+        let line = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n";
+        for _ in 0..(MAX_SYNC_BYTES / line.len() + 2) {
+            t.feed(line);
+        }
+        assert!(!t.row_text(0).is_empty(), "shown without waiting for the end of the update");
+    }
+
+    #[test]
+    fn scrolled_back_view_stays_put_when_a_region_scrolls() {
+        let mut t = TerminalView::new();
+        for i in 0..30 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll_lines(3);
+        let (offset, top) = (t.display_offset(), t.row_text(0));
+        t.feed(b"\x1b[2;24r\x1b[24;1H");
+        t.feed("\n".repeat(3000).as_bytes());
+        assert_eq!(t.display_offset(), offset, "the view must not jump to the oldest line");
+        assert_eq!(t.row_text(0), top);
+    }
+
+    #[test]
+    fn fill_glyphs_keep_their_colours() {
+        for c in ['\u{2580}', '\u{2588}', '\u{2502}', '\u{e0b0}', '\u{28ff}'] {
+            assert!(is_fill_glyph(c), "{c:?}");
+        }
+        for c in ['a', '#', '\u{e9}', '\u{4e2d}', '\u{25cf}'] {
+            assert!(!is_fill_glyph(c), "{c:?}");
+        }
     }
 
     #[test]
