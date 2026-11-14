@@ -150,8 +150,9 @@ Opened from the Finder or the Dock, the app asks your login shell for its
 `PATH`, so that the credential helpers your kubeconfig calls (`aws`,
 `gke-gcloud-auth-plugin`, `kubelogin`, …) are found.
 
-The code compiles for Apple Silicon (checked by cross-compiling everything
-up to the link step), but it has not been run on a Mac yet.
+That workflow also checks the build on its Apple Silicon runner: the app
+starts, opens a window and draws. Beyond that it has not been used on a Mac
+yet.
 
 ## Keyboard
 
