@@ -86,7 +86,9 @@ enum Pending {
     /// A manifest apply whose dialog was closed before it finished. The
     /// manifest is kept so that a failure can hand it back, on the cluster
     /// it was meant for.
-    Apply { job: Job<Vec<String>>, text: String, context: String },
+    /// `told`: the user has been told that it failed (it may be waiting for
+    /// them to come back to that cluster).
+    Apply { job: Job<Vec<String>>, text: String, context: String, told: bool },
 }
 
 /// Modal dialogs.
@@ -443,7 +445,7 @@ impl SkiffApp {
         let dialog_free = self.dialog.is_none() && self.palette.is_none() && !self.overlay_at_start;
         let active = self.active.clone();
         let mut reopen: Option<(String, String, String)> = None;
-        self.pending.retain(|p| match p {
+        self.pending.retain_mut(|p| match p {
             Pending::Simple { job, ok } => match job.take() {
                 None => true,
                 Some(Ok(())) => {
@@ -455,7 +457,7 @@ impl SkiffApp {
                     false
                 }
             },
-            Pending::Apply { job, text, context } => {
+            Pending::Apply { job, text, context, told } => {
                 let elsewhere = active.as_deref() != Some(context.as_str());
                 let failed = job.peek(|r| matches!(r, Some(Err(_))));
                 if failed && !sessions.contains_key(context) {
@@ -469,6 +471,11 @@ impl SkiffApp {
                 }
                 if failed && (elsewhere || !dialog_free || reopen.is_some()) {
                     // Wait until the user is back on that cluster and free.
+                    if elsewhere && !*told {
+                        *told = true;
+                        let msg = format!("Applying the manifest to {context} failed. Switch back to {context} for the report.");
+                        toasts.push((msg, Tone::Err));
+                    }
                     return true;
                 }
                 match job.take() {
@@ -479,8 +486,10 @@ impl SkiffApp {
                         false
                     }
                     Some(Err(e)) => {
-                        toasts.push(("Applying the manifest failed".to_string(), Tone::Err));
-                        reopen = Some((text.clone(), context.clone(), e));
+                        if !*told {
+                            toasts.push(("Applying the manifest failed".to_string(), Tone::Err));
+                        }
+                        reopen = Some((std::mem::take(text), context.clone(), e));
                         false
                     }
                 }
@@ -1716,6 +1725,7 @@ impl SkiffApp {
                                     job: running,
                                     text: std::mem::take(text),
                                     context: context.clone(),
+                                    told: false,
                                 });
                             }
                             close = true;

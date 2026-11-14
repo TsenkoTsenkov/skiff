@@ -735,11 +735,14 @@ fn a_failed_background_apply_returns_on_its_own_cluster() {
     // On another cluster the failure must not bring the dialog back: its
     // Apply button would send the manifest to the wrong cluster.
     h.state_mut().switch_context("scale");
+    let mut told = false;
     for _ in 0..160 {
         std::thread::sleep(Duration::from_millis(50));
         h.step();
         assert!(h.state().dialog.is_none(), "the dialog must not reopen on another cluster");
+        told |= has_label_containing(&h, "Switch back to demo");
     }
+    assert!(told, "the failure is announced where the user is");
 
     // Back on its own cluster it returns, manifest and report included.
     h.state_mut().switch_context("demo");
