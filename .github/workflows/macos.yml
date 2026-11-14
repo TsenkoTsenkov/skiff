@@ -25,9 +25,11 @@ permissions:
 jobs:
   dmg:
     name: Skiff.app and disk image (Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: This is an Apple Silicon machine
+        run: sw_vers && test "$(uname -m)" = arm64
       - name: Rust toolchain
         run: rustup update stable && rustup default stable
       - name: Build
@@ -51,7 +53,7 @@ jobs:
   tests:
     name: Unit tests on macOS
     if: github.event_name == 'workflow_dispatch' && inputs.run_tests
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain
