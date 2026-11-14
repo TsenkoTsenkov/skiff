@@ -889,13 +889,17 @@ fn shell_runs_commands_in_a_container() {
         steps(&mut h, 3);
         assert!(h.state().palette.is_some(), "Ctrl+Shift+K opens the palette from a shell");
         h.key_press(egui::Key::Escape);
-        steps(&mut h, 3);
+        steps(&mut h, 4);
         assert!(h.state().palette.is_none());
+        // Leaving the palette gives the keyboard back to the shell: what is
+        // typed next must not run the table's shortcuts instead.
+        assert!(h.get_by_label("Terminal").is_focused(), "the keyboard returns to the shell");
+    } else {
+        h.get_by_label("Terminal").click();
+        steps(&mut h, 2);
     }
     // Clear the half-typed line (Ctrl+U), then print something after a
     // delay, while another dock tab is in front.
-    h.get_by_label("Terminal").click();
-    steps(&mut h, 2);
     h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::U);
     h.get_by_label("Terminal").type_text("sleep 1; echo late-$((40+2))");
     h.key_press(egui::Key::Enter);
@@ -905,11 +909,28 @@ fn shell_runs_commands_in_a_container() {
     assert!(h.query_by_label("Terminal").is_none(), "the logs tab is in front");
     settle(&mut h, "output while hidden", |h| shows(h, "late-42"));
 
-    // Leaving the shell ends the session.
+    // Choosing the shell's tab is asking for the shell: it has the keyboard
+    // without a further click.
     h.get_all_by_label_contains("alertmanager-0").find(|n| n.rect().top() > 400.0).expect("the shell's tab").click();
     settle(&mut h, "shell tab in front", |h| h.query_by_label("Terminal").is_some());
-    h.get_by_label("Terminal").click();
-    steps(&mut h, 2);
+    assert!(h.get_by_label("Terminal").is_focused(), "a shell's tab gives the shell the keyboard");
+
+    // A program that prints a lot (15 MB here) must not stall the app:
+    // every frame stays short while it is being taken in, and the end of
+    // the output arrives.
+    h.get_by_label("Terminal").type_text("seq 1 2000000");
+    h.key_press(egui::Key::Enter);
+    let mut slowest = Duration::ZERO;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !shows(&h, "2000000") {
+        assert!(Instant::now() < deadline, "the output never finished");
+        let t = Instant::now();
+        h.step();
+        slowest = slowest.max(t.elapsed());
+    }
+    assert!(slowest < Duration::from_millis(250), "a frame took {slowest:?} during heavy output");
+
+    // Leaving the shell ends the session.
     h.get_by_label("Terminal").type_text("exit");
     h.key_press(egui::Key::Enter);
     settle(&mut h, "shell to end", |h| has_label(h, "ended"));
@@ -936,4 +957,64 @@ fn detail_panel_and_table_do_not_overlap_in_a_small_window() {
     h.get_by_label("Logs").click();
     settle(&mut h, "logs to open", |h| has_label_containing(h, "streaming"));
     assert_eq!(h.state().detail.as_ref().unwrap().name, "alertmanager-0", "the click must not land on a table row");
+}
+
+#[cfg(feature = "terminal")]
+#[test]
+fn ctrl_s_in_a_shell_does_not_apply_an_open_edit() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    h.get_by_label("alertmanager-0").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    h.get_by_label("Edit YAML").click();
+    settle(&mut h, "editor", |h| has_label(h, "Cancel"));
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).type_text("# half-finished ");
+    steps(&mut h, 3);
+    assert!(h.state().detail.as_ref().unwrap().has_unsaved_edit());
+
+    // Into the pod's shell, where Ctrl+S is just a key for the remote
+    // program (it must not save what is open in the panel).
+    h.get_by_label("Shell").click();
+    settle(&mut h, "shell to connect", |h| has_label(h, "connected"));
+    assert!(h.get_by_label("Terminal").is_focused());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::S);
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(20));
+        h.step();
+    }
+    let detail = h.state().detail.as_ref().unwrap();
+    assert!(detail.editing() && detail.has_unsaved_edit(), "the edit must still be open and unsaved");
+    assert!(!has_label_containing(&h, "Saved"), "nothing was sent to the API server");
+    h.get_by_label("Cancel").click();
+    steps(&mut h, 3);
+}
+
+#[cfg(feature = "terminal")]
+#[test]
+fn shell_colours_in_both_themes() {
+    let Some(ctx) = test_context() else { return };
+    for (light, name) in [(false, "32_shell_colours_dark"), (true, "33_shell_colours_light")] {
+        let mut h = harness_with(&ctx, "pods", [1280.0, 760.0], light);
+        settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+        h.get_by_label("alertmanager-0").click();
+        settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+        h.get_by_label("Shell").click();
+        settle(&mut h, "shell to connect", |h| has_label(h, "connected"));
+        // The 16 colours as text, as text on black / white / blue, and as
+        // backgrounds under default text: the pairs programs really use.
+        let script = concat!(
+            r#"for i in 0 1 2 3 4 5 6 7; do printf '\033[3%sm text%s \033[9%sm bright%s \033[0m' $i $i $i $i; done; echo; "#,
+            r#"for i in 0 1 2 3 4 5 6 7; do printf '\033[4%sm on-bg%s \033[0m\033[30;4%sm blk \033[97;4%sm wht \033[0m' $i $i $i $i; done; echo; "#,
+            r#"printf '\033[37;44m white-on-blue \033[0m \033[30;47m black-on-white \033[0m \033[2m dim \033[0m \033[1m bold \033[0m \033[7m inverse \033[0m\n'; echo colours-done"#,
+        );
+        h.get_by_label("Terminal").type_text(script);
+        h.key_press(egui::Key::Enter);
+        settle(&mut h, "colour table", |h| {
+            h.state().dock.shell_screen().unwrap_or_default().lines().any(|l| l.trim() == "colours-done")
+        });
+        shot(&mut h, name);
+    }
 }

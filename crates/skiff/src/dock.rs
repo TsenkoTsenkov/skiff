@@ -388,6 +388,8 @@ pub struct Dock {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+    /// The dock was drawn in the previous frame.
+    was_shown: bool,
 }
 
 #[derive(Default)]
@@ -431,6 +433,17 @@ impl Dock {
         self.open = true;
     }
 
+    /// Gives the keyboard to the shell in the front tab, if the dock is open
+    /// and that tab is a shell.
+    pub fn focus_shell(&mut self) {
+        if !self.open {
+            return;
+        }
+        if let Some(Tab { kind: TabKind::Shell(s), .. }) = self.tabs.get_mut(self.active) {
+            s.focus();
+        }
+    }
+
     /// What the first shell tab's terminal currently shows, whether or not
     /// that tab is in front (for tests and diagnostics).
     #[cfg(feature = "terminal")]
@@ -464,10 +477,15 @@ impl Dock {
             }
         }
         if !self.open || self.tabs.is_empty() {
+            self.was_shown = false;
             return out;
         }
         let mut close: Option<usize> = None;
         let mut hide = false;
+        // Choosing a shell's tab, or bringing the dock back with a shell in
+        // front, is asking for that shell: it gets the keyboard.
+        let mut focus_shell = !self.was_shown;
+        self.was_shown = true;
         Panel::bottom("dock")
             .resizable(true)
             .default_size(300.0)
@@ -486,6 +504,7 @@ impl Dock {
                             let label = (widgets::icon(ic, 14.0), tab.title.as_str());
                             if ui.add(egui::Button::selectable(i == self.active, label)).clicked() {
                                 self.active = i;
+                                focus_shell = true;
                             }
                             let x = egui::Button::new(widgets::icon(icons::ICON_CLOSE, 13.0).color(pal.muted))
                                 .frame_when_inactive(false)
@@ -505,6 +524,11 @@ impl Dock {
                 ui.add_space(2.0);
                 let active = self.active.min(self.tabs.len() - 1);
                 let tab = &mut self.tabs[active];
+                if focus_shell {
+                    if let TabKind::Shell(s) = &mut tab.kind {
+                        s.focus();
+                    }
+                }
                 ui.push_id(tab.id, |ui| match &mut tab.kind {
                     TabKind::Logs(l) => l.ui(ui, pal, &mut out.toasts),
                     TabKind::Shell(s) => out.terminal_focused = s.ui(ui, pal),

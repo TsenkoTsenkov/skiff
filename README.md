@@ -44,6 +44,12 @@ hardware have not been measured yet.
 - **Small core.** `skiff-core` (the data layer) knows nothing about the UI
   and runs on two I/O threads.
 
+What runs in a container is not trusted with the app's health: a shell's
+output is taken in a few milliseconds per frame however fast it arrives,
+queues between the app and the cluster are bounded in both directions, and
+the terminal emulator runs behind a guard, so output it cannot digest costs
+that one screen a reset rather than the whole app.
+
 ## Features
 
 - Every resource type the cluster serves, including custom resources, with
@@ -127,11 +133,17 @@ macOS and Windows need nothing extra.
 
 Right-click a row for its actions.
 
-In a shell, keys go to the shell (including `Esc`, `Tab` and `Ctrl+K`).
-`Ctrl+Shift+C` copies the selection and `Ctrl+Shift+V` (or `Ctrl+V`) pastes;
-on macOS `Cmd+C` / `Cmd+V`. From a shell the command palette is on
-`Ctrl+Shift+K` (`Cmd+K` on macOS). Click outside the terminal to give the
-keyboard back to the rest of the app.
+In a shell, keys go to the shell and nowhere else (including `Esc`, `Tab`,
+`Ctrl+K` and `Ctrl+S`). `Ctrl+Shift+C` copies the selection and
+`Ctrl+Shift+V` (or `Ctrl+V`) pastes; on macOS `Cmd+C` / `Cmd+V`.
+`Shift+PageUp` / `Shift+PageDown` page through the scrollback; double-click
+selects a word, triple-click a line. From a shell the command palette is on
+`Ctrl+Shift+K` (`Cmd+K` on macOS), and the keyboard returns to the shell
+when the palette closes. Click outside the terminal to give the keyboard
+back to the rest of the app; choosing a shell's tab gives it to that shell.
+
+Because `Ctrl+V` pastes, programs that use it themselves need their other
+binding (in vim, `Ctrl+Q` starts a visual block).
 
 ## Layout
 
@@ -186,6 +198,9 @@ cargo test --release -p skiff --test perf -- --ignored --nocapture
 ## Not there yet
 
 - Helm releases
+- In the terminal: mouse support for programs that ask for it (vim, htop:
+  the wheel works, clicks are not passed on), input methods for CJK text,
+  and glyphs outside the bundled fonts (CJK and emoji show as boxes)
 - Node drain, cron job trigger, bulk actions on multiple rows
 - Merging your YAML edits into a newer version of the object: when it
   changed while you were typing you are told, and can load the latest

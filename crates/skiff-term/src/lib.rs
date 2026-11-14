@@ -9,6 +9,7 @@
 pub mod keys;
 
 use std::sync::mpsc;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -33,6 +34,22 @@ const PAD: f32 = 4.0;
 /// Lines scrolled per mouse-wheel "line" notch.
 const WHEEL_LINES: f32 = 3.0;
 
+// What a container prints is not trusted. The emulator bounds the grid and
+// the scrollback, but not everything:
+/// Longest OSC string (title, colour query, ...) handed to the parser, which
+/// would otherwise buffer one that never ends without limit. The rest of
+/// such a string is skipped up to its terminator.
+const MAX_OSC_BYTES: usize = 64 * 1024;
+/// Combining characters kept (and drawn) per cell; the emulator would stack
+/// any number onto one cell.
+const MAX_ZEROWIDTH: usize = 16;
+/// After this many zero-width characters the grid is searched for cells
+/// that collected too many.
+const ZEROWIDTH_SWEEP: usize = 50_000;
+/// Replies to the remote (cursor position reports, colour answers, ...)
+/// waiting to be collected. More than this is not answered.
+const MAX_PENDING_REPLIES: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -52,6 +69,11 @@ pub struct TermStyle {
     /// JetBrains Mono turn `--` / `->` into ligatures). Off by default: `ls -l`
     /// permission strings like `-rw-r--r--` should look literal.
     pub ligatures: bool,
+    /// Smallest contrast ratio (as WCAG defines it, 1.0 to 21.0) between a
+    /// character and its background. Programs pick colour pairs for their
+    /// own idea of the palette; where a pair comes out closer than this, the
+    /// character is drawn darker or lighter until it does not. 1.0 = off.
+    pub min_contrast: f32,
 }
 
 impl Default for TermStyle {
@@ -82,6 +104,7 @@ impl Default for TermStyle {
                 Color32::from_rgb(0xff, 0xff, 0xff),
             ],
             ligatures: false,
+            min_contrast: 1.0,
         }
     }
 }
@@ -116,6 +139,30 @@ pub struct TerminalView {
     scroll_accum: f32,
     /// Style seen by the last `ui` call (to answer OSC colour queries).
     style: TermStyle,
+    guard: Guard,
+}
+
+/// Follows the byte stream just closely enough to enforce the limits above.
+#[derive(Default)]
+struct Guard {
+    state: Scan,
+    /// Bytes of the current OSC string handed to the parser so far.
+    osc_len: usize,
+    /// Continuation bytes still expected of a UTF-8 sequence, and the code
+    /// point so far (plain text only, to count zero-width characters).
+    utf8_need: u8,
+    utf8_acc: u32,
+    zero_width: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Scan {
+    #[default]
+    Ground,
+    /// After ESC.
+    Esc,
+    /// Inside an OSC string.
+    Osc,
 }
 
 impl Default for TerminalView {
@@ -168,6 +215,54 @@ struct Run {
 
 fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.r, c.g, c.b)
+}
+
+/// Relative luminance (WCAG).
+fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// Contrast ratio (WCAG) between two colours.
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `fg`, moved towards black or white just far enough to stand out from
+/// `bg` by `ratio` (or as far as it goes).
+fn ensure_contrast(fg: Color32, bg: Color32, ratio: f32) -> Color32 {
+    if ratio <= 1.0 || contrast(fg, bg) >= ratio {
+        return fg;
+    }
+    let towards = |target: Color32| {
+        (1..=10).map(|step| lerp(fg, target, step as f32 / 10.0)).find(|c| contrast(*c, bg) >= ratio)
+    };
+    let (darker, lighter) = (towards(Color32::BLACK), towards(Color32::WHITE));
+    match (darker, lighter) {
+        (Some(d), Some(l)) => {
+            if luminance(bg) > 0.4 {
+                d
+            } else {
+                l
+            }
+        }
+        (Some(c), None) | (None, Some(c)) => c,
+        (None, None) => {
+            if contrast(Color32::BLACK, bg) >= contrast(Color32::WHITE, bg) {
+                Color32::BLACK
+            } else {
+                Color32::WHITE
+            }
+        }
+    }
 }
 
 fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -248,14 +343,115 @@ impl TerminalView {
             focus_requested: false,
             scroll_accum: 0.0,
             style: TermStyle::default(),
+            guard: Guard::default(),
         }
     }
 
     /// Feed a chunk of remote stdout/stderr. Call `ctx.request_repaint()` afterwards
-    /// if you feed from outside the UI thread.
+    /// if you feed from outside the UI thread. Replies the terminal owes the remote
+    /// are collected with [`Self::take_replies`] (or by the next `ui` call).
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        self.expire_sync();
+        // Hand the bytes to the parser in stretches, leaving out what exceeds
+        // the limits (see the constants at the top).
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            match self.guard.state {
+                Scan::Ground => {
+                    if b == 0x1b {
+                        self.guard.state = Scan::Esc;
+                        self.guard.utf8_need = 0;
+                    } else if b >= 0x80 && self.guard.text_byte(b) && self.guard.zero_width >= ZEROWIDTH_SWEEP {
+                        self.advance(&bytes[start..=i]);
+                        start = i + 1;
+                        self.trim_zero_width();
+                        self.guard.zero_width = 0;
+                    }
+                }
+                Scan::Esc => {
+                    self.guard.state = match b {
+                        b']' => {
+                            self.guard.osc_len = 0;
+                            Scan::Osc
+                        }
+                        0x1b => Scan::Esc,
+                        _ => Scan::Ground,
+                    };
+                }
+                Scan::Osc => match b {
+                    // BEL ends it; CAN and SUB abort it.
+                    0x07 | 0x18 | 0x1a => self.guard.state = Scan::Ground,
+                    // ESC ends it too (normally as the start of ST, `ESC \`).
+                    0x1b => self.guard.state = Scan::Esc,
+                    _ => {
+                        self.guard.osc_len += 1;
+                        if self.guard.osc_len > MAX_OSC_BYTES {
+                            // Too long: skip this byte.
+                            self.advance(&bytes[start..i]);
+                            start = i + 1;
+                        }
+                    }
+                },
+            }
+        }
+        self.advance(&bytes[start..]);
         self.drain_term_events();
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.parser.advance(&mut self.term, bytes);
+        // The emulator can leave the viewport scrolled back further than
+        // there is history (output scrolling a region while the user reads
+        // scrollback); drawing that would index past the grid.
+        self.term.grid_mut().scroll_display(Scroll::Delta(0));
+    }
+
+    /// A synchronized update ("draw nothing until I say so") that was never
+    /// ended must not freeze the screen: after its timeout, show what came.
+    fn expire_sync(&mut self) {
+        if self.parser.sync_timeout().sync_timeout().is_some_and(|at| at <= Instant::now()) {
+            self.parser.stop_sync(&mut self.term);
+            self.term.grid_mut().scroll_display(Scroll::Delta(0));
+            self.drain_term_events();
+        }
+    }
+
+    /// Cuts cells that collected more combining characters than are kept.
+    fn trim_zero_width(&mut self) {
+        let grid = self.term.grid_mut();
+        let (top, bottom, cols) = (grid.topmost_line().0, grid.bottommost_line().0, grid.columns());
+        for line in top..=bottom {
+            let row = &mut grid[Line(line)];
+            for col in 0..cols {
+                let cell = &mut row[Column(col)];
+                if cell.zerowidth().is_none_or(|z| z.len() <= MAX_ZEROWIDTH) {
+                    continue;
+                }
+                let keep: Vec<char> = cell.zerowidth().unwrap_or(&[])[..MAX_ZEROWIDTH].to_vec();
+                let (underline, link) = (cell.underline_color(), cell.hyperlink());
+                cell.extra = None;
+                for c in keep {
+                    cell.push_zerowidth(c);
+                }
+                if underline.is_some() {
+                    cell.set_underline_color(underline);
+                }
+                if link.is_some() {
+                    cell.set_hyperlink(link);
+                }
+            }
+        }
+    }
+
+    /// Replies the terminal owes the remote (answers to cursor-position, device
+    /// and colour queries) since the last call. Write them to the remote stdin
+    /// promptly, also while the widget is not shown: answers that arrive late
+    /// end up as input to whatever is running by then.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_input)
     }
 
     /// Give the terminal keyboard focus on the next `ui` call.
@@ -282,15 +478,20 @@ impl TerminalView {
     /// Mostly useful for tests and accessibility.
     pub fn row_text(&self, row: usize) -> String {
         let grid = self.term.grid();
+        if row >= grid.screen_lines() {
+            return String::new();
+        }
         let line = Line(row as i32 - grid.display_offset() as i32);
-        let mut s: String = grid[line]
-            .into_iter()
-            .filter(|c| {
-                !c.flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            })
-            .map(|c| c.c)
-            .collect();
+        let mut s = String::new();
+        for cell in &grid[line] {
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            // (The emulator marks the start of a tab stop with a tab
+            // character; on screen that cell is blank.)
+            s.push(if cell.c.is_control() { ' ' } else { cell.c });
+            s.extend(cell.zerowidth().unwrap_or(&[]).iter().take(MAX_ZEROWIDTH));
+        }
         s.truncate(s.trim_end().len());
         s
     }
@@ -322,6 +523,13 @@ impl TerminalView {
 
     fn drain_term_events(&mut self) {
         while let Ok(ev) = self.events.try_recv() {
+            // A program that asks faster than its answers are collected does
+            // not get to fill our memory with them.
+            if self.pending_input.len() > MAX_PENDING_REPLIES
+                && matches!(ev, TermEvent::PtyWrite(_) | TermEvent::ColorRequest(..) | TermEvent::TextAreaSizeRequest(_))
+            {
+                continue;
+            }
             match ev {
                 TermEvent::PtyWrite(s) => self.pending_input.extend_from_slice(s.as_bytes()),
                 TermEvent::Title(t) => self.title = Some(t),
@@ -387,7 +595,13 @@ impl TerminalView {
         }
         let ctx = ui.ctx().clone();
         let is_mac = ctx.os() == egui::os::OperatingSystem::Mac;
+        let is_windows = ctx.os() == egui::os::OperatingSystem::Windows;
         let mut out = TermOutput::default();
+        self.expire_sync();
+        if let Some(at) = self.parser.sync_timeout().sync_timeout() {
+            // Come back when a pending synchronized update runs out.
+            ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+        }
 
         // ---- layout & resize ------------------------------------------------
         let (cell_w, cell_h) =
@@ -436,7 +650,12 @@ impl TerminalView {
         out.has_focus = has_focus;
 
         // ---- mouse: selection --------------------------------------------------
-        if resp.double_clicked() {
+        if resp.triple_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let (p, side) = self.point_at(grid_origin, pos);
+                self.term.selection = Some(Selection::new(SelectionType::Lines, p, side));
+            }
+        } else if resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let (p, side) = self.point_at(grid_origin, pos);
                 self.term.selection = Some(Selection::new(SelectionType::Semantic, p, side));
@@ -527,7 +746,17 @@ impl TerminalView {
                             || (is_mac && m.mac_cmd && key == Key::C);
                         let paste = (m.ctrl && m.shift && key == Key::V)
                             || (is_mac && m.mac_cmd && key == Key::V);
-                        if copy {
+                        // Shift+PageUp / PageDown page through the scrollback
+                        // (not in full-screen programs, which have none).
+                        let page = m.shift
+                            && !m.ctrl
+                            && !m.alt
+                            && matches!(key, Key::PageUp | Key::PageDown)
+                            && !self.term.mode().contains(TermMode::ALT_SCREEN);
+                        if page {
+                            let rows = i32::from(self.rows.max(2)) - 1;
+                            self.term.scroll_display(Scroll::Delta(if key == Key::PageUp { rows } else { -rows }));
+                        } else if copy {
                             self.copy_selection(&ctx);
                         } else if paste {
                             // eframe answers with Event::Paste on the next frame.
@@ -540,9 +769,16 @@ impl TerminalView {
                     }
                     // eframe turns Ctrl+C / Ctrl+X into Copy / Cut on Linux & Windows
                     // (Cmd+C / Cmd+X on macOS) before we see a Key event.
+                    // On Windows the same event also stands for Ctrl+Insert,
+                    // which must not interrupt the remote program: there,
+                    // with text selected it copies (and clears the selection,
+                    // so that pressing Ctrl+C again does interrupt).
                     Event::Copy => {
                         if is_mac {
                             self.copy_selection(&ctx);
+                        } else if is_windows && self.selection_text().is_some() {
+                            self.copy_selection(&ctx);
+                            self.term.selection = None;
                         } else {
                             keyboard.push(0x03);
                         }
@@ -560,6 +796,14 @@ impl TerminalView {
                 self.term.scroll_display(Scroll::Bottom);
                 typed.extend(keyboard);
             }
+            // What was typed here was typed for the remote: nothing drawn
+            // after this widget may also act on it (a Ctrl+S that saves, a
+            // letter that is a shortcut).
+            ui.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(e, Event::Key { .. } | Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut)
+                });
+            });
         }
 
         // ---- terminal events ------------------------------------------------------
@@ -589,6 +833,8 @@ impl TerminalView {
         let selection = content.selection;
 
         let mut runs: Vec<Run> = Vec::with_capacity(usize::from(self.rows) * 2);
+        // (fg, bg, dim) -> fg to draw with; the same pairs recur all over.
+        let mut legible: std::collections::HashMap<(Color32, Color32, bool), Color32> = std::collections::HashMap::new();
         for cell in content.display_iter {
             let flags = cell.flags;
             if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -620,18 +866,27 @@ impl TerminalView {
                 fg = style.bg;
                 bg = style.cursor;
             }
-            let c = if flags.contains(Flags::HIDDEN) {
+            if style.min_contrast > 1.0 && fg != bg {
+                // (Dim text is meant to recede: it gets half the margin.)
+                let dim = flags.contains(Flags::DIM);
+                let ratio = if dim { (style.min_contrast / 2.0).max(1.0) } else { style.min_contrast };
+                fg = *legible.entry((fg, bg, dim)).or_insert_with(|| ensure_contrast(fg, bg, ratio));
+            }
+            // Control characters have no glyph (the emulator leaves a tab
+            // character where a tab stop began): such a cell is blank.
+            let c = if flags.contains(Flags::HIDDEN) || cell.c.is_control() {
                 ' '
             } else {
                 cell.c
             };
+            let marks = if flags.contains(Flags::HIDDEN) { &[] } else { cell.zerowidth().unwrap_or(&[]) };
             let wide = flags.contains(Flags::WIDE_CHAR);
             let style_flags =
                 flags & (Flags::BOLD | Flags::ITALIC | Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
 
             // Extend the previous run if possible: same row/style, contiguous,
             // ASCII only (so egui's glyph advance == our cell width), not the cursor.
-            let ascii = c.is_ascii() && !wide && !at_cursor;
+            let ascii = c.is_ascii() && !wide && !at_cursor && marks.is_empty();
             if let Some(last) = runs.last_mut() {
                 if ascii
                     && last.row == row
@@ -649,6 +904,8 @@ impl TerminalView {
             }
             let mut text = String::new();
             text.push(c);
+            // Combining characters belong to the glyph before them.
+            text.extend(marks.iter().take(MAX_ZEROWIDTH));
             runs.push(Run {
                 row,
                 col,
@@ -791,6 +1048,33 @@ fn section(byte_range: std::ops::Range<usize>, fmt: &TextFormat) -> egui::text::
     }
 }
 
+impl Guard {
+    /// Takes one byte (>= 0x80) of plain text; returns whether it completed a
+    /// zero-width character.
+    fn text_byte(&mut self, b: u8) -> bool {
+        use unicode_width::UnicodeWidthChar as _;
+        if b >= 0xc0 {
+            // Lead byte of a 2-, 3- or 4-byte sequence.
+            self.utf8_need = if b >= 0xf0 { 3 } else if b >= 0xe0 { 2 } else { 1 };
+            self.utf8_acc = u32::from(b) & (0x3f >> self.utf8_need);
+            return false;
+        }
+        if self.utf8_need == 0 {
+            return false;
+        }
+        self.utf8_acc = (self.utf8_acc << 6) | (u32::from(b) & 0x3f);
+        self.utf8_need -= 1;
+        if self.utf8_need > 0 {
+            return false;
+        }
+        let zero = char::from_u32(self.utf8_acc).is_some_and(|c| c.width() == Some(0));
+        if zero {
+            self.zero_width += 1;
+        }
+        zero
+    }
+}
+
 impl Run {
     /// Runs holding the block cursor are flagged HIDDEN (never extended).
     fn cursor_like(&self) -> bool {
@@ -847,6 +1131,112 @@ mod tests {
         assert_eq!(t.row_text(0), "line 67");
         t.scroll_lines(-1000);
         assert_eq!(t.display_offset(), 0);
+    }
+
+    #[test]
+    fn region_scroll_while_scrolled_back_does_not_panic() {
+        // Output scrolling a region that starts below the first row, while
+        // the user has scrolled back: the emulator used to leave the
+        // viewport further back than there is history.
+        let mut t = TerminalView::new();
+        for i in 0..30 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll_lines(3);
+        t.feed(b"\x1b[2;24r\x1b[24;1H");
+        t.feed("\n".repeat(3000).as_bytes());
+        assert!(t.display_offset() <= t.term.grid().history_size());
+        for row in 0..24 {
+            let _ = t.row_text(row);
+        }
+        let _ = t.term.renderable_content().display_iter.count();
+    }
+
+    #[test]
+    fn unterminated_sync_update_expires() {
+        let mut t = TerminalView::new();
+        t.feed(b"before\r\n\x1b[?2026hafter\r\n");
+        assert_eq!(t.row_text(1), "", "held back while the update is pending");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        t.feed(b"");
+        assert_eq!(t.row_text(1), "after", "shown once the update timed out");
+    }
+
+    #[test]
+    fn endless_osc_strings_are_cut_off() {
+        let mut t = TerminalView::new();
+        t.feed(b"\x1b]0;");
+        let chunk = vec![b'A'; 1 << 20];
+        for _ in 0..8 {
+            t.feed(&chunk);
+        }
+        assert!(t.guard.osc_len > MAX_OSC_BYTES, "the scanner is still inside the string");
+        // The terminator arrives: the title is the part that was kept, and
+        // what follows is ordinary output again.
+        t.feed(b"\x07visible\r\n");
+        // (The limit counts the whole string, "0;" included.)
+        assert_eq!(t.title().map(str::len), Some(MAX_OSC_BYTES - 2));
+        assert_eq!(t.row_text(0), "visible");
+        // A normal title still works, split across feeds.
+        t.feed(b"\x1b]0;my ");
+        t.feed(b"title\x1b\\");
+        assert_eq!(t.title(), Some("my title"));
+    }
+
+    #[test]
+    fn combining_marks_are_kept_but_bounded() {
+        let mut t = TerminalView::new();
+        t.feed("e\u{301} ok\r\n".as_bytes());
+        assert_eq!(t.row_text(0), "e\u{301} ok", "combining characters are part of the text");
+        // A cell cannot collect them without limit.
+        t.feed(b"a");
+        let marks = "\u{301}".repeat(ZEROWIDTH_SWEEP * 3);
+        t.feed(marks.as_bytes());
+        let stacked = t.row_text(1).chars().count();
+        assert!(stacked <= 1 + ZEROWIDTH_SWEEP + MAX_ZEROWIDTH, "{stacked} characters on one cell");
+        t.feed(marks.as_bytes());
+        assert!(t.row_text(1).chars().count() <= 1 + MAX_ZEROWIDTH);
+    }
+
+    #[test]
+    fn tabs_leave_blank_cells() {
+        let mut t = TerminalView::new();
+        t.feed(b"a\tb\r\n");
+        assert_eq!(t.row_text(0), "a       b");
+    }
+
+    #[test]
+    fn replies_are_collected_without_drawing_and_bounded() {
+        let mut t = TerminalView::new();
+        t.feed(b"\x1b[6n");
+        assert_eq!(t.take_replies(), b"\x1b[1;1R");
+        assert!(t.take_replies().is_empty(), "each reply is handed out once");
+        // A program that keeps asking does not fill memory with answers.
+        let queries = b"\x1b[6n".repeat(200_000);
+        t.feed(&queries);
+        assert!(t.take_replies().len() <= MAX_PENDING_REPLIES + 64);
+    }
+
+    #[test]
+    fn low_contrast_pairs_are_made_legible() {
+        let white = Color32::WHITE;
+        let dark = Color32::from_rgb(0x10, 0x12, 0x18);
+        // Already fine: untouched.
+        assert_eq!(ensure_contrast(Color32::BLACK, white, 4.5), Color32::BLACK);
+        // Yellow on white, grey on white, dark blue on a dark background,
+        // mid grey on blue: all end up at the asked-for ratio.
+        for (fg, bg) in [
+            (Color32::from_rgb(0xe5, 0xe5, 0x10), white),
+            (Color32::from_rgb(0x9a, 0xa3, 0xb2), white),
+            (Color32::from_rgb(0x1a, 0x1e, 0x25), dark),
+            (Color32::from_rgb(0x24, 0x72, 0xc8), dark),
+            (Color32::from_rgb(0x5e, 0x68, 0x78), Color32::from_rgb(0x2f, 0x6f, 0xeb)),
+        ] {
+            let fixed = ensure_contrast(fg, bg, 4.5);
+            assert!(contrast(fixed, bg) >= 4.5, "{fg:?} on {bg:?} -> {fixed:?} = {:.2}", contrast(fixed, bg));
+        }
+        // Off by default.
+        assert_eq!(ensure_contrast(Color32::from_rgb(250, 250, 250), white, 1.0), Color32::from_rgb(250, 250, 250));
     }
 
     #[test]

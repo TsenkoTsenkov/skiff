@@ -21,7 +21,19 @@ pub struct ShellTab {
     error: Option<String>,
     #[cfg(feature = "terminal")]
     term: skiff_term::TerminalView,
+    /// The terminal had to be started afresh because the emulator failed on
+    /// something the container printed.
+    display_reset: bool,
 }
+
+/// Output is fed to the terminal a slice at a time and for at most this long
+/// per frame, so that a process which prints without end cannot stall the
+/// rest of the app. What is left stays queued in the exec session (whose
+/// cap then holds the remote back) until the next frame.
+#[cfg(feature = "terminal")]
+const FEED_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+#[cfg(feature = "terminal")]
+const FEED_SLICE: usize = 32 * 1024;
 
 impl ShellTab {
     fn blank(session: &Arc<Session>, ns: &str, pod: &str) -> Self {
@@ -36,7 +48,19 @@ impl ShellTab {
             error: None,
             #[cfg(feature = "terminal")]
             term: skiff_term::TerminalView::new(),
+            display_reset: false,
         }
+    }
+
+    /// Runs something on the terminal emulator. The emulator digests
+    /// whatever a container prints; should that ever make it panic, the
+    /// damage stays here: the screen starts afresh and everything else in
+    /// the app (other shells, edits, port forwards) carries on.
+    #[cfg(feature = "terminal")]
+    fn with_term<R>(&mut self, f: impl FnOnce(&mut skiff_term::TerminalView) -> R) -> Option<R> {
+        let result = contained(&mut self.term, f);
+        self.display_reset |= result.is_none();
+        result
     }
 
     /// Looks up the pod's containers first, then opens the first one.
@@ -59,6 +83,7 @@ impl ShellTab {
         }
         self.container = Some(container.to_string());
         self.error = None;
+        self.display_reset = false;
         #[cfg(feature = "terminal")]
         {
             self.term = skiff_term::TerminalView::new();
@@ -83,13 +108,26 @@ impl ShellTab {
                 }
             }
         }
-        // Output is consumed on every frame, shown or not: the terminal
-        // keeps a bounded scrollback, the raw byte queue does not.
+        // Output is consumed on every frame, shown or not, and what the
+        // terminal answers (cursor position, colours, ...) goes back at
+        // once: an answer delivered later would be typed into whatever is
+        // running by then.
         #[cfg(feature = "terminal")]
-        if let Some(exec) = &self.exec {
-            let bytes = exec.take_output();
-            if !bytes.is_empty() {
-                self.term.feed(&bytes);
+        if let Some(exec) = self.exec.clone() {
+            let started = std::time::Instant::now();
+            loop {
+                let bytes = exec.take_output_up_to(FEED_SLICE);
+                if bytes.is_empty() {
+                    break;
+                }
+                self.with_term(|t| t.feed(&bytes));
+                if started.elapsed() >= FEED_BUDGET {
+                    break;
+                }
+            }
+            let replies = self.term.take_replies();
+            if !replies.is_empty() {
+                exec.write(&replies);
             }
         }
     }
@@ -100,6 +138,12 @@ impl ShellTab {
     pub fn screen_text(&self) -> String {
         let (_, rows) = self.term.size();
         (0..usize::from(rows)).map(|r| self.term.row_text(r)).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Gives the terminal the keyboard on the next frame.
+    pub fn focus(&mut self) {
+        #[cfg(feature = "terminal")]
+        self.term.request_focus();
     }
 
     /// Draws the tab; returns whether the terminal has keyboard focus.
@@ -115,7 +159,9 @@ impl ShellTab {
         let state = exec.state();
         let mut switch_to: Option<String> = None;
         let mut reconnect = false;
-        ui.horizontal(|ui| {
+        // (Wrapping: with several containers or a narrow window, the state
+        // and the Reconnect button must not end up outside the window.)
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("{}/{}", self.ns, self.pod)).color(pal.muted).size(12.0));
             if self.containers.len() > 1 {
                 for c in &self.containers {
@@ -147,6 +193,13 @@ impl ShellTab {
         if let ExecState::Failed(err) = &state {
             ui.add(egui::Label::new(RichText::new(err).color(pal.err)).wrap().selectable(true));
         }
+        if self.display_reset {
+            ui.label(
+                RichText::new("The display was reset: the program printed something the terminal could not show. The session itself is unaffected.")
+                    .color(pal.warn)
+                    .size(12.0),
+            );
+        }
         let focused = self.terminal(ui, pal, &exec);
         if let Some(c) = switch_to {
             self.connect(&c);
@@ -161,7 +214,7 @@ impl ShellTab {
     #[cfg(feature = "terminal")]
     fn terminal(&mut self, ui: &mut Ui, pal: &Palette, exec: &Arc<ExecSession>) -> bool {
         let style = term_style(pal);
-        let out = self.term.ui(ui, &style);
+        let Some(out) = self.with_term(|t| t.ui(ui, &style)) else { return false };
         if !out.input.is_empty() {
             exec.write(&out.input);
         }
@@ -184,6 +237,37 @@ impl ShellTab {
     }
 }
 
+/// Runs `f` on the terminal; if it panics, the terminal is replaced by a
+/// fresh one and `None` is returned.
+#[cfg(feature = "terminal")]
+fn contained<R>(term: &mut skiff_term::TerminalView, f: impl FnOnce(&mut skiff_term::TerminalView) -> R) -> Option<R> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *term)));
+    if result.is_err() {
+        *term = skiff_term::TerminalView::new();
+    }
+    result.ok()
+}
+
+#[cfg(all(test, feature = "terminal"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_emulator_is_replaced_not_fatal() {
+        let mut term = skiff_term::TerminalView::new();
+        term.feed(b"before");
+        assert_eq!(contained(&mut term, |t| t.row_text(0)), Some("before".to_string()));
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result: Option<()> = contained(&mut term, |_| panic!("the emulator fell over"));
+        std::panic::set_hook(quiet);
+        assert!(result.is_none());
+        assert_eq!(term.row_text(0), "", "a fresh screen");
+        term.feed(b"after");
+        assert_eq!(term.row_text(0), "after", "and it keeps working");
+    }
+}
+
 #[cfg(feature = "terminal")]
 fn term_style(pal: &Palette) -> skiff_term::TermStyle {
     use egui::Color32;
@@ -194,9 +278,11 @@ fn term_style(pal: &Palette) -> skiff_term::TermStyle {
             0x5FD498, 0xF2BD68, 0x82B4FF, 0xD9B0F5, 0x7CCBF2, 0xF2F4F8,
         ]
     } else {
+        // Dark enough to read on white; 7 and 15 ("white") are greys, so
+        // that white text is visible and still works as a background.
         [
-            0x1C2330, 0xD43F4E, 0x1E9E5A, 0xB7791F, 0x2F6FEB, 0x8250DF, 0x1E88C8, 0x5E6878, 0x9AA3B2, 0xE0525F,
-            0x26B56A, 0xC98A28, 0x4C86F5, 0x9567EA, 0x2A9BDB, 0x1C2330,
+            0x24292F, 0xCF222E, 0x116329, 0x7D4E00, 0x0969DA, 0x8250DF, 0x1B7C83, 0x6E7781, 0x57606A, 0xA40E26,
+            0x1A7F37, 0x633C01, 0x1F6FD0, 0x8B5CF0, 0x1A7F8E, 0x8C959F,
         ]
     };
     skiff_term::TermStyle {
@@ -204,8 +290,11 @@ fn term_style(pal: &Palette) -> skiff_term::TermStyle {
         fg: pal.text,
         bg: pal.bg,
         cursor: pal.accent,
-        selection_bg: pal.selected,
+        selection_bg: pal.tint(pal.accent, if pal.dark { 0.38 } else { 0.28 }),
         ansi: ansi.map(c),
         ligatures: false,
+        // Programs choose colour pairs for a classic dark terminal; whatever
+        // they choose stays readable in both themes.
+        min_contrast: 4.5,
     }
 }

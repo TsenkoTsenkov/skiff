@@ -285,3 +285,56 @@ fn undrained_shell_output_is_capped() {
     flood.close();
     wait_for("server-side exec to close", Duration::from_secs(5), || held_open("exec") <= before);
 }
+
+/// Input and output of a shell are pumped independently: a large paste into
+/// a program that answers with as much output must neither deadlock (each
+/// side waiting for the other to read) nor lose or reorder a byte, and the
+/// session must still close promptly in the middle of it.
+#[test]
+fn large_input_and_output_flow_together() {
+    let Some(kc) = kubeconfig() else { return };
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("KUBECONFIG", &kc) };
+    let core = Core::new(Notifier::noop()).unwrap();
+    let session = connected(&core, "demo");
+    let (ns, pod) = some_running_pod(&session);
+    let containers = session.pod_containers(&ns, &pod);
+    wait_for("containers", Duration::from_secs(10), || containers.is_done());
+    let container = containers.take().unwrap().unwrap().remove(0).name;
+    let before = held_open("exec");
+
+    // `cat` sends back everything it is sent. (Plain pipes: the test
+    // cluster's simulated terminal mode drops bytes under load, with
+    // kubectl just the same.)
+    let echo = session.exec_with(&ns, &pod, &container, vec!["cat".into()], false);
+    wait_for("cat", Duration::from_secs(15), || echo.state() == ExecState::Running);
+    let chunk: Vec<u8> = (0..1024 * 1024u32).map(|i| b'a' + (i % 23) as u8).collect();
+    let chunks = 24;
+    // Queue input as fast as it is accepted, without reading any output
+    // for a while: more than the output cap comes back.
+    let mut sent = 0;
+    let mut received: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let reading_from = Instant::now() + Duration::from_secs(2);
+    while received.len() < chunks * chunk.len() {
+        assert!(Instant::now() < deadline, "stuck after {} of {} bytes", received.len(), chunks * chunk.len());
+        if sent < chunks && echo.write(&chunk) {
+            sent += 1;
+        }
+        if Instant::now() >= reading_from {
+            received.extend(echo.take_output_up_to(256 * 1024));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(received.len(), chunks * chunk.len());
+    assert_eq!(echo.pending(), (0, 0), "nothing is left queued");
+    assert!(received.chunks(chunk.len()).all(|c| c == &chunk[..]), "bytes arrived altered or out of order");
+
+    // In the middle of another exchange, close: prompt, and final.
+    for _ in 0..6 {
+        echo.write(&chunk);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    echo.close();
+    wait_for("server-side exec to close", Duration::from_secs(5), || held_open("exec") <= before);
+}

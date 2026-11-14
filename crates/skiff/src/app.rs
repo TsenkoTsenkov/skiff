@@ -159,6 +159,12 @@ pub struct SkiffApp {
     /// Whether a dialog, the palette or a menu was open when this frame
     /// began.
     overlay_at_start: bool,
+    /// `overlay_at_start` of the previous frame.
+    overlay_before: bool,
+    /// A shell had the keyboard when the current overlay opened.
+    shell_had_keyboard: bool,
+    /// A mouse button was used during the previous frame.
+    pointer_used: bool,
     /// (context, resource id) pairs whose cluster-wide list was refused.
     forbidden: std::collections::HashSet<(String, String)>,
 }
@@ -296,6 +302,9 @@ impl SkiffApp {
             tick: Duration::from_secs(30),
             dialog_frames: 0,
             overlay_at_start: false,
+            overlay_before: false,
+            shell_had_keyboard: false,
+            pointer_used: false,
             forbidden: std::collections::HashSet::new(),
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
@@ -759,6 +768,19 @@ impl SkiffApp {
         // Sampled before anything is drawn: a key that closes a menu this
         // frame was meant for that menu, not for the table underneath.
         self.overlay_at_start = self.overlay_open(&ctx);
+        // The palette, a dialog or a menu takes the keyboard while it is
+        // open. If the keyboard was in a shell before, it goes back there
+        // afterwards (unless the overlay was left by clicking somewhere,
+        // which says where the user wants to be).
+        if self.overlay_at_start && !self.overlay_before {
+            self.shell_had_keyboard = self.terminal_focused;
+        } else if !self.overlay_at_start && self.overlay_before {
+            if self.shell_had_keyboard && !self.pointer_used {
+                self.dock.focus_shell();
+            }
+            self.shell_had_keyboard = false;
+        }
+        self.overlay_before = self.overlay_at_start;
         self.poll();
         self.shortcuts(&ctx);
 
@@ -792,6 +814,7 @@ impl SkiffApp {
         // only as often as the relative times on screen can change, so an
         // idle window costs nothing.
         ctx.request_repaint_after(self.tick);
+        self.pointer_used = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released());
         self.last_ui = started.elapsed();
         self.trace_startup(&ctx);
     }
@@ -1470,9 +1493,12 @@ impl SkiffApp {
             && self.cache.snap.state == LoadState::Live;
         detail.set_gone(listed && current_rv.is_none());
         self.tick = self.tick.min(Duration::from_secs(5));
+        // (A shell with the keyboard counts: Ctrl+S typed there is for the
+        // remote program, not a request to apply an open YAML edit.)
         let overlay = self.overlay_at_start
             || self.palette.is_some()
             || self.dialog.is_some()
+            || self.terminal_focused
             || egui::Popup::is_any_open(ui.ctx());
         let mut actions = Vec::new();
         // Leave the table usable in small windows.

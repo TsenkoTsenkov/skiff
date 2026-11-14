@@ -734,7 +734,13 @@ impl Session {
     }
 
     pub fn exec(&self, ns: &str, pod: &str, container: &str, command: Vec<String>) -> Arc<ExecSession> {
-        let session = exec::open(&self.handle, self.client(), ns, pod, container, command, self.notify.clone());
+        self.exec_with(ns, pod, container, command, true)
+    }
+
+    /// Like [`Self::exec`]; with `tty` false the process gets plain pipes
+    /// instead of a terminal (its input and output pass through unchanged).
+    pub fn exec_with(&self, ns: &str, pod: &str, container: &str, command: Vec<String>, tty: bool) -> Arc<ExecSession> {
+        let session = exec::open(&self.handle, self.client(), ns, pod, container, command, tty, self.notify.clone());
         let mut open = self.execs.lock();
         open.retain(|w| w.strong_count() > 0);
         open.push(Arc::downgrade(&session));

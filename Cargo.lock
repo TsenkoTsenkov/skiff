@@ -4336,6 +4336,7 @@ dependencies = [
  "alacritty_terminal",
  "egui",
  "egui_kittest",
+ "unicode-width",
 ]
 
 [[package]]

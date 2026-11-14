@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 egui = "0.37"
 alacritty_terminal = { version = "0.26", default-features = false }
+unicode-width = "0.2"
 
 [dev-dependencies]
 egui = { version = "0.37", features = ["default_fonts"] }
