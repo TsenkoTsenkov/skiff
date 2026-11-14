@@ -7,7 +7,7 @@ use kube::api::{Api, AttachParams, TerminalSize};
 use kube::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::AbortHandle;
 
 use crate::util::{friendly, Notifier};
@@ -37,7 +37,10 @@ pub struct ExecSession {
     shared: Arc<Shared>,
     input: mpsc::UnboundedSender<Vec<u8>>,
     resize: mpsc::UnboundedSender<(u16, u16)>,
+    /// Asks the task to end the session cleanly.
+    closing: Arc<Notify>,
     abort: Mutex<Option<AbortHandle>>,
+    handle: tokio::runtime::Handle,
 }
 
 impl ExecSession {
@@ -59,10 +62,11 @@ impl ExecSession {
         self.shared.state.lock().clone()
     }
 
+    /// Ends the session: the remote process gets end-of-input (so a shell
+    /// exits instead of being orphaned), then the connection is closed. The
+    /// task finishes on its own within about a second.
     pub fn close(&self) {
-        if let Some(h) = self.abort.lock().take() {
-            h.abort();
-        }
+        self.end();
         let mut s = self.shared.state.lock();
         if matches!(*s, ExecState::Connecting | ExecState::Running) {
             *s = ExecState::Exited("closed".into());
@@ -70,11 +74,23 @@ impl ExecSession {
     }
 }
 
+impl ExecSession {
+    fn end(&self) {
+        self.closing.notify_one();
+        // Backstop in case the task is stuck somewhere that cannot see the
+        // request (for example a write the remote side never reads).
+        if let Some(task) = self.abort.lock().take() {
+            self.handle.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                task.abort();
+            });
+        }
+    }
+}
+
 impl Drop for ExecSession {
     fn drop(&mut self) {
-        if let Some(h) = self.abort.lock().take() {
-            h.abort();
-        }
+        self.end();
     }
 }
 
@@ -100,11 +116,15 @@ async fn drive(
     command: Vec<String>,
     mut input: mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize: mpsc::UnboundedReceiver<(u16, u16)>,
+    closing: Arc<Notify>,
     notify: Notifier,
 ) -> Result<String, String> {
     let pods: Api<Pod> = Api::namespaced(client, &target.namespace);
     let ap = AttachParams::interactive_tty().container(target.container.clone());
-    let mut proc = pods.exec(&target.pod, command, &ap).await.map_err(|e| friendly(&e))?;
+    let mut proc = tokio::select! {
+        p = pods.exec(&target.pod, command, &ap) => p.map_err(|e| friendly(&e))?,
+        _ = closing.notified() => return Ok("closed".into()),
+    };
     let mut stdin = proc.stdin().ok_or("no stdin")?;
     let mut stdout = proc.stdout().ok_or("no stdout")?;
     let mut size_tx = proc.terminal_size();
@@ -115,6 +135,14 @@ async fn drive(
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         tokio::select! {
+            _ = closing.notified() => {
+                // End of input first, so the remote shell sees EOF and
+                // exits; then give the connection a moment to wind down
+                // before it is dropped.
+                drop(stdin);
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(800), proc.join()).await;
+                return Ok("closed".into());
+            }
             n = stdout.read(&mut buf) => {
                 match n {
                     Ok(0) | Err(_) => break,
@@ -163,6 +191,7 @@ pub(crate) fn open(
     let (in_tx, in_rx) = mpsc::unbounded_channel();
     let (rs_tx, rs_rx) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared { output: Mutex::new(Vec::new()), state: Mutex::new(ExecState::Connecting) });
+    let closing = Arc::new(Notify::new());
     let session = Arc::new(ExecSession {
         namespace: namespace.into(),
         pod: pod.into(),
@@ -170,19 +199,26 @@ pub(crate) fn open(
         shared: shared.clone(),
         input: in_tx,
         resize: rs_tx,
+        closing: closing.clone(),
         abort: Mutex::new(None),
+        handle: handle.clone(),
     });
     let target = Target { namespace: namespace.into(), pod: pod.into(), container: container.into() };
     let s = shared;
     let task = handle.spawn(async move {
         let result = match client.await {
-            Ok(c) => drive(s.clone(), target, c, command, in_rx, rs_rx, notify.clone()).await,
+            Ok(c) => drive(s.clone(), target, c, command, in_rx, rs_rx, closing, notify.clone()).await,
             Err(e) => Err(e),
         };
-        *s.state.lock() = match result {
-            Ok(reason) => ExecState::Exited(reason),
-            Err(e) => ExecState::Failed(e),
-        };
+        let mut state = s.state.lock();
+        // `close()` already recorded why the session ended.
+        if !matches!(*state, ExecState::Exited(_)) {
+            *state = match result {
+                Ok(reason) => ExecState::Exited(reason),
+                Err(e) => ExecState::Failed(e),
+            };
+        }
+        drop(state);
         notify.ping();
     });
     *session.abort.lock() = Some(task.abort_handle());

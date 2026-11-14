@@ -242,7 +242,9 @@ impl LogsTab {
                 area = area.vertical_scroll_offset(shown as f32 * LOG_ROW);
             }
             let line_job = |ui: &Ui, buf: &skiff_core::logs::LogBuffer, row: usize| -> Option<LayoutJob> {
-                let idx = if filtering { (*self.matched.get(row)? - buf.dropped) as usize } else { row };
+                // The stream may have evicted lines since the filter was
+                // brought up to date; such rows simply are not drawn.
+                let idx = if filtering { self.matched.get(row)?.checked_sub(buf.dropped)? as usize } else { row };
                 let line = buf.lines.get(idx)?;
                 let mut job = LayoutJob::default();
                 if wrap {
@@ -265,27 +267,28 @@ impl LogsTab {
                 Some(job)
             };
             if wrap {
-                // Wrapped lines have varying heights, so only the tail is laid out.
-                const WRAP_WINDOW: usize = 3000;
+                // Wrapped lines have varying heights, so only the tail is laid
+                // out. The jobs are built under the buffer lock and laid out
+                // after releasing it, so the stream is never blocked on text
+                // layout.
+                const WRAP_WINDOW: usize = 1000;
                 let first = shown.saturating_sub(WRAP_WINDOW);
                 area.show(ui, |ui| {
-                    stream.with(|buf| {
-                        if first > 0 {
-                            ui.label(
-                                RichText::new(format!("{} earlier lines hidden while wrapping", widgets::thousands(first)))
-                                    .color(pal.faint)
-                                    .size(11.5),
-                            );
-                        }
-                        for row in first..shown {
-                            if let Some(job) = line_job(ui, buf, row) {
-                                ui.add(egui::Label::new(job).selectable(true));
-                            }
-                        }
-                        if jump {
-                            ui.scroll_to_cursor(Some(Align::BOTTOM));
-                        }
-                    });
+                    let jobs: Vec<LayoutJob> =
+                        stream.with(|buf| (first..shown).filter_map(|row| line_job(ui, buf, row)).collect());
+                    if first > 0 {
+                        ui.label(
+                            RichText::new(format!("{} earlier lines hidden while wrapping", widgets::thousands(first)))
+                                .color(pal.faint)
+                                .size(11.5),
+                        );
+                    }
+                    for job in jobs {
+                        ui.add(egui::Label::new(job).selectable(true));
+                    }
+                    if jump {
+                        ui.scroll_to_cursor(Some(Align::BOTTOM));
+                    }
                 });
             } else {
                 area.show_rows(ui, LOG_ROW, shown, |ui, range| {
@@ -319,7 +322,8 @@ impl LogsTab {
             };
             if filtering {
                 for seq in &self.matched {
-                    if let Some(line) = buf.lines.get((*seq - buf.dropped) as usize) {
+                    let line = seq.checked_sub(buf.dropped).and_then(|i| buf.lines.get(i as usize));
+                    if let Some(line) = line {
                         push(line);
                     }
                 }
@@ -434,9 +438,17 @@ impl Dock {
 
     pub fn ui(&mut self, ui: &mut Ui, pal: &Palette, sessions: &HashMap<String, Arc<Session>>) -> DockOutput {
         let mut out = DockOutput::default();
-        for tab in &mut self.tabs {
+        let shown = if self.open { Some(self.active.min(self.tabs.len().saturating_sub(1))) } else { None };
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
             match &mut tab.kind {
-                TabKind::Logs(l) => l.poll(),
+                TabKind::Logs(l) => {
+                    l.poll();
+                    // Streams that are not on screen keep collecting lines
+                    // but need not wake the UI for each one.
+                    if let Some(stream) = &l.stream {
+                        stream.set_visible(shown == Some(i));
+                    }
+                }
                 TabKind::Shell(s) => s.poll(),
                 TabKind::Forwards => {}
             }

@@ -443,7 +443,9 @@ pub fn show(
 
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut builder = TableBuilder::new(ui)
-        .id_salt(("resource-table", key.id(), cols.len()))
+        // Keyed on the resource only: the scroll position must survive the
+        // column set changing (the table drops stale widths by itself).
+        .id_salt(("resource-table", key.id()))
         .striped(false)
         .resizable(true)
         .sense(Sense::click())

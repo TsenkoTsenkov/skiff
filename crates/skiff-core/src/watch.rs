@@ -30,16 +30,22 @@ pub(crate) const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s
 const FIRST_PAGE: usize = 250;
 const PAGE: usize = 2000;
 const MIN_PUBLISH: Duration = Duration::from_millis(80);
-const WATCH_TIMEOUT_SECS: u32 = 290;
+/// The server ends each watch after this long and we resume. Kept short so
+/// that silence always has a tight upper bound (see `WATCH_SILENCE`).
+const WATCH_TIMEOUT_SECS: u32 = 120;
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Longest a single list page or watch handshake may take.
-const LIST_TIMEOUT: Duration = Duration::from_secs(60);
-/// A watch that has shown bookmarks (sent about once a minute) and then goes
-/// silent this long is dead.
-const BOOKMARK_SILENCE: Duration = Duration::from_secs(150);
-/// Without bookmarks the only guaranteed traffic is the server ending the
-/// watch at `WATCH_TIMEOUT_SECS`.
+/// Longest we wait for the response headers of a list page or watch. Short,
+/// so a request sent down a dead pooled connection is abandoned quickly.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest a list page body may take to arrive once it has started.
+const BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// A healthy watch is never silent for longer than `WATCH_TIMEOUT_SECS`
+/// (the server ends it then, and usually sends bookmarks before that), so
+/// more silence than this means the connection died without telling us.
 const WATCH_SILENCE: Duration = Duration::from_secs(WATCH_TIMEOUT_SECS as u64 + 30);
+/// After watches keep ending immediately we poll, and try watching again
+/// this much later.
+const WATCH_RETRY_AFTER: Duration = Duration::from_secs(300);
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const PERMANENT_RETRY: Duration = Duration::from_secs(60);
@@ -451,8 +457,30 @@ async fn fetch_page(
         url.push_str(&enc(c));
     }
     let req = get_request(&url, Some(TABLE_ACCEPT)).map_err(Fail::Transient)?;
-    let text = client.request_text(req).await?;
-    let env: Envelope = serde_json::from_str(&text)
+    let res = tokio::time::timeout(HEADER_TIMEOUT, client.send(req.map(kube::client::Body::from)))
+        .await
+        .map_err(|_| Fail::Transient("no response from the API server".into()))??;
+    let status = res.status();
+    let bytes = tokio::time::timeout(BODY_TIMEOUT, res.into_body().collect_bytes())
+        .await
+        .map_err(|_| Fail::Transient("timed out reading the response".into()))??;
+    if !status.is_success() {
+        // The body is a Status object describing the failure.
+        return Err(match serde_json::from_slice::<kube::core::Status>(&bytes) {
+            Ok(st) => kube::Error::Api(Box::new(st)).into(),
+            Err(_) => {
+                let msg = format!("HTTP {}", status.as_u16());
+                match status.as_u16() {
+                    410 => Fail::Gone,
+                    400 | 401 | 403 | 404 | 405 | 406 | 415 | 422 => Fail::Permanent { code: status.as_u16(), msg },
+                    _ => Fail::Transient(msg),
+                }
+            }
+        });
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| Fail::Permanent { code: 0, msg: format!("unexpected response: {e}") })?;
+    let env: Envelope = serde_json::from_str(text)
         .map_err(|e| Fail::Permanent { code: 0, msg: format!("unexpected response: {e}") })?;
     let is_table = env.kind == "Table";
     if plan.is_none() {
@@ -527,8 +555,11 @@ struct Engine {
     handled_refresh: u64,
     /// A complete list has succeeded at least once.
     listed_once: bool,
-    /// The server lets us list but not watch: re-list periodically.
+    /// Watching does not work here (not permitted, or something between us
+    /// and the server cuts watches short): re-list periodically.
     poll_only: bool,
+    /// When to give watching another try while `poll_only`.
+    watch_retry_at: Option<Instant>,
 }
 
 enum WatchEnd {
@@ -605,10 +636,7 @@ impl Engine {
                     limit,
                 );
                 tokio::select! {
-                    res = tokio::time::timeout(LIST_TIMEOUT, fetch) => match res {
-                        Ok(page) => break page?,
-                        Err(_) => return Err(Fail::Transient("timed out waiting for the API server".into())),
-                    },
+                    res = fetch => break res?,
                     _ = self.store.relist.notified() => {
                         if self.refresh_requested() {
                             return Err(Fail::Restart);
@@ -710,7 +738,7 @@ impl Engine {
             Err(e) => return WatchEnd::Failed(Fail::Transient(e)),
         };
         let started = Instant::now();
-        let reader = match tokio::time::timeout(LIST_TIMEOUT, self.client.request_stream(req)).await {
+        let reader = match tokio::time::timeout(HEADER_TIMEOUT, self.client.request_stream(req)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return WatchEnd::Failed(e.into()),
             Err(_) => return WatchEnd::Failed(Fail::Transient("timed out opening the watch".into())),
@@ -728,12 +756,10 @@ impl Engine {
         // Total silence means the connection died without telling us (sleep,
         // VPN drop, NAT timeout), which no read would ever report.
         let mut last_data = Instant::now();
-        let mut saw_bookmark = false;
         let mut lines = 0u64;
         let store = self.store.clone();
         loop {
-            let silence_limit = if saw_bookmark { BOOKMARK_SILENCE } else { WATCH_SILENCE };
-            let until_stalled = silence_limit.saturating_sub(last_data.elapsed());
+            let until_stalled = WATCH_SILENCE.saturating_sub(last_data.elapsed());
             if until_stalled.is_zero() {
                 if dirty {
                     self.publish();
@@ -787,12 +813,16 @@ impl Engine {
                     let res = self.apply(&buf, rv);
                     buf.clear();
                     match res {
-                        Ok((changed, bookmark)) => {
-                            dirty |= changed;
-                            saw_bookmark |= bookmark;
+                        Ok((changed, _bookmark)) => dirty |= changed,
+                        // This is how the API server reports an expired
+                        // resourceVersion. Report it as a failure so that
+                        // the caller backs off if it keeps happening.
+                        Err(f) => {
+                            if dirty {
+                                self.publish();
+                            }
+                            return WatchEnd::Failed(f);
                         }
-                        Err(Fail::Gone) => return WatchEnd::Relist,
-                        Err(f) => return WatchEnd::Failed(f),
                     }
                     if dirty && last_publish.elapsed() >= MIN_PUBLISH {
                         self.publish();
@@ -814,12 +844,17 @@ impl Engine {
     async fn run(mut self) {
         let mut backoff = BACKOFF_START;
         loop {
-            // Loading is shown both for the first list and for a refresh of
-            // existing rows (which stay visible meanwhile), but not for the
-            // routine re-lists of a polled table.
-            if self.state != LoadState::Polling {
+            // Loading is shown for the first list and for a refresh of
+            // existing rows (which stay visible meanwhile). Routine re-lists
+            // of a polled table and retries after a failure keep their
+            // state, so the UI does not flicker between messages.
+            if !matches!(self.state, LoadState::Polling | LoadState::Reconnecting | LoadState::Failed) {
                 self.set_state(LoadState::Loading, None);
                 self.publish();
+            }
+            if self.poll_only && self.watch_retry_at.is_some_and(|t| Instant::now() >= t) {
+                self.poll_only = false;
+                self.watch_retry_at = None;
             }
             let (mut rv, is_table) = match self.list().await {
                 Ok(v) => v,
@@ -855,18 +890,30 @@ impl Engine {
             self.publish();
 
             let mut failures = 0u32;
+            let mut unproductive = 0u32;
             loop {
                 let started = Instant::now();
                 match self.watch(&mut rv).await {
                     WatchEnd::Resume { productive: true } => {
                         failures = 0;
+                        unproductive = 0;
                         backoff = BACKOFF_START;
                     }
                     WatchEnd::Resume { productive: false } => {
                         // Something between us and the API server ends
-                        // watches immediately: don't spin.
+                        // watches immediately. Don't spin, and don't claim
+                        // to be live either: fall back to polling.
+                        unproductive += 1;
+                        if unproductive >= 3 {
+                            self.poll_only = true;
+                            self.watch_retry_at = Some(Instant::now() + WATCH_RETRY_AFTER);
+                            break;
+                        }
                         self.pause(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_MAX);
+                        if self.refresh_requested() {
+                            break;
+                        }
                     }
                     WatchEnd::Relist => break,
                     WatchEnd::Failed(Fail::Gone) | WatchEnd::Failed(Fail::Restart) => {
@@ -897,7 +944,9 @@ impl Engine {
                         self.publish();
                         self.pause(backoff).await;
                         backoff = (backoff * 2).min(BACKOFF_MAX);
-                        if failures >= 3 {
+                        // A refresh asked for during the pause must not be
+                        // lost to another watch attempt.
+                        if failures >= 3 || self.refresh_requested() {
                             break;
                         }
                     }
@@ -922,6 +971,7 @@ pub(crate) async fn run(store: Arc<TableStore>, client: Client, notify: Notifier
         handled_refresh: 0,
         listed_once: false,
         poll_only: false,
+        watch_retry_at: None,
     }
     .run()
     .await
@@ -1025,6 +1075,7 @@ mod tests {
             handled_refresh: 0,
             listed_once: true,
             poll_only: false,
+            watch_retry_at: None,
         };
         let mut rv = "1234".to_string();
 
@@ -1072,6 +1123,122 @@ mod tests {
         assert_eq!(crate::table::compare(&rows[1], &rows[0], duration), std::cmp::Ordering::Less);
         assert!(rows[2].is_blank(duration));
         assert!(!rows[0].is_blank(duration));
+    }
+
+    /// A minimal API server: answers list requests with a one-row Table and
+    /// watch requests with whatever `watch_body` returns, then closes the
+    /// connection. Counts requests.
+    struct FakeApi {
+        addr: std::net::SocketAddr,
+        lists: Arc<std::sync::atomic::AtomicUsize>,
+        watches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeApi {
+        async fn start(watch_body: &'static str) -> FakeApi {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let watches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (l, w) = (lists.clone(), watches.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else { return };
+                    let (l, w) = (l.clone(), w.clone());
+                    tokio::spawn(async move {
+                        let mut req = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !req.windows(4).any(|x| x == b"\r\n\r\n") {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => req.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&req);
+                        let body = if head.lines().next().unwrap_or("").contains("watch=1") {
+                            w.fetch_add(1, Ordering::SeqCst);
+                            watch_body.to_string()
+                        } else {
+                            l.fetch_add(1, Ordering::SeqCst);
+                            r#"{"kind":"Table","metadata":{"resourceVersion":"5"},"columnDefinitions":[{"name":"Name","type":"string","priority":0}],"rows":[{"cells":["a"],"object":{"metadata":{"name":"a","namespace":"x","uid":"u-a","resourceVersion":"5"}}}]}"#.to_string()
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                    });
+                }
+            });
+            FakeApi { addr, lists, watches }
+        }
+
+        fn store(&self) -> Arc<TableStore> {
+            let store = Arc::new(TableStore::new(kinds::builtin("", "configmaps").unwrap().key(), None));
+            let client = Client::try_from(kube::Config::new(format!("http://{}", self.addr).parse().unwrap())).unwrap();
+            tokio::spawn(run(store.clone(), client, Notifier::noop()));
+            store
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (self.lists.load(Ordering::SeqCst), self.watches.load(Ordering::SeqCst))
+        }
+    }
+
+    async fn until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The API server reports an expired resourceVersion as an in-stream
+    /// ERROR event on a 200 response. If that keeps happening the engine
+    /// must back off instead of listing and watching in a tight loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_watches_back_off() {
+        let api = FakeApi::start(
+            "{\"type\":\"ERROR\",\"object\":{\"kind\":\"Status\",\"code\":410,\"reason\":\"Expired\",\"message\":\"too old resource version\"}}\n",
+        )
+        .await;
+        let store = api.store();
+        until("first rows", Duration::from_secs(5), || !store.peek().rows.is_empty()).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let (lists, watches) = api.counts();
+        // Backoff of 0.5 s, 1 s, 2 s ... allows only a handful in 3 s.
+        assert!(lists <= 6 && watches <= 6, "tight loop: {lists} lists and {watches} watches in 3 s");
+        assert!(lists >= 2, "it must keep retrying: {lists} lists");
+        assert_eq!(store.peek().rows.len(), 1, "rows stay available meanwhile");
+    }
+
+    /// Something between us and the server that ends every watch at once:
+    /// stop claiming to be live and poll instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watches_that_end_immediately_fall_back_to_polling() {
+        let api = FakeApi::start("").await;
+        let store = api.store();
+        until("polling", Duration::from_secs(8), || store.peek().state == LoadState::Polling).await;
+        let (_, watches) = api.counts();
+        assert!(watches <= 4, "gave up watching after a few attempts, not {watches}");
+        assert_eq!(store.peek().rows.len(), 1);
+    }
+
+    /// A refresh requested while the engine is pausing between watch
+    /// attempts must cause a new list, not just another watch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_during_backoff_relists() {
+        let api = FakeApi::start("").await;
+        let store = api.store();
+        // Wait until the first watch has ended and the engine is pausing.
+        until("first watch", Duration::from_secs(5), || api.counts().1 >= 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lists_before = api.counts().0;
+        store.refresh();
+        until("relist after refresh", Duration::from_secs(2), || api.counts().0 > lists_before).await;
     }
 
     #[test]

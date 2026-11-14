@@ -63,6 +63,9 @@ pub struct Detail {
     revealed: HashSet<String>,
     /// The live table no longer lists this object.
     gone: bool,
+    /// Highlighted YAML for (resourceVersion, dark theme), so switching
+    /// tabs or repainting does not re-run the highlighter.
+    yaml_job: Option<(String, bool, egui::text::LayoutJob)>,
 }
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -118,6 +121,7 @@ impl Detail {
             want_edit: false,
             revealed: HashSet::new(),
             gone: false,
+            yaml_job: None,
         }
     }
 
@@ -133,8 +137,20 @@ impl Detail {
         self.edit.is_some()
     }
 
+    /// Whether the YAML editor holds changes that have not been applied.
+    pub fn has_unsaved_edit(&self) -> bool {
+        match (&self.edit, &self.obj) {
+            (Some(edit), Some(obj)) => edit.text != obj.yaml,
+            _ => false,
+        }
+    }
+
     pub fn start_edit(&mut self) {
         self.tab = DetailTab::Yaml;
+        if self.edit.is_some() {
+            // Already editing: keep what the user typed.
+            return;
+        }
         match &self.obj {
             Some(obj) => self.edit = Some(EditState { text: obj.yaml.clone(), job: None, error: None }),
             None => self.want_edit = true,
@@ -246,7 +262,9 @@ impl Detail {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, pal: &Palette, session: &Arc<Session>) -> Vec<DetailAction> {
+    /// `overlay_open`: a dialog, the palette or a menu is on top, so keys
+    /// pressed this frame are not meant for the panel.
+    pub fn ui(&mut self, ui: &mut Ui, pal: &Palette, session: &Arc<Session>, overlay_open: bool) -> Vec<DetailAction> {
         let mut actions = Vec::new();
 
         // Header.
@@ -350,7 +368,7 @@ impl Detail {
                     ui.add_space(16.0);
                 });
             }
-            DetailTab::Yaml => self.yaml_tab(ui, pal, session, &mut actions),
+            DetailTab::Yaml => self.yaml_tab(ui, pal, session, overlay_open, &mut actions),
             DetailTab::Events => self.events_tab(ui, pal),
         }
         actions
@@ -360,7 +378,19 @@ impl Detail {
     // YAML
     // ------------------------------------------------------------------
 
-    fn yaml_tab(&mut self, ui: &mut Ui, pal: &Palette, session: &Arc<Session>, actions: &mut Vec<DetailAction>) {
+    fn yaml_tab(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        session: &Arc<Session>,
+        overlay_open: bool,
+        actions: &mut Vec<DetailAction>,
+    ) {
+        // Highlighting is linear in the document and runs on the UI thread:
+        // fine for ordinary objects, too slow to redo on every keystroke or
+        // at all for very large ones.
+        const HIGHLIGHT_VIEW_MAX: usize = 300_000;
+        const HIGHLIGHT_EDIT_MAX: usize = 60_000;
         let theme = if pal.dark { CodeTheme::dark(12.5) } else { CodeTheme::light(12.5) };
         let Some(obj) = &self.obj else { return };
         if let Some(edit) = &mut self.edit {
@@ -391,15 +421,26 @@ impl Detail {
                         ui.add(egui::Label::new(RichText::new(err).color(pal.err)).wrap().selectable(true));
                     });
             }
-            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
+            if !overlay_open && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
                 apply = true;
             }
-            if ui.input(|i| i.key_pressed(Key::Escape)) {
+            // Esc leaves edit mode only when nothing would be lost and the
+            // key was not meant for a dialog or menu on top.
+            if !overlay_open && edit.text == obj.yaml && ui.input(|i| i.key_pressed(Key::Escape)) {
                 cancel = true;
             }
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
-                    let job = highlight(ui.ctx(), ui.style(), &theme, text.as_str(), "yaml");
+                    let job = if text.as_str().len() <= HIGHLIGHT_EDIT_MAX {
+                        highlight(ui.ctx(), ui.style(), &theme, text.as_str(), "yaml")
+                    } else {
+                        egui::text::LayoutJob::simple(
+                            text.as_str().to_owned(),
+                            theme::mono(12.5),
+                            pal.text,
+                            f32::INFINITY,
+                        )
+                    };
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
                 ui.add(
@@ -429,8 +470,17 @@ impl Detail {
                 }
                 ui.label(RichText::new("managedFields hidden").color(pal.faint).size(11.5));
             });
+            let cached = self.yaml_job.as_ref().is_some_and(|(rv, dark, _)| *rv == obj.rv && *dark == pal.dark);
+            if !cached {
+                let job = if obj.yaml.len() <= HIGHLIGHT_VIEW_MAX {
+                    highlight(ui.ctx(), ui.style(), &theme, &obj.yaml, "yaml")
+                } else {
+                    egui::text::LayoutJob::simple(obj.yaml.clone(), theme::mono(12.5), pal.text, f32::INFINITY)
+                };
+                self.yaml_job = Some((obj.rv.clone(), pal.dark, job));
+            }
+            let job = self.yaml_job.as_ref().map(|(_, _, job)| job.clone()).unwrap_or_default();
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                let job = highlight(ui.ctx(), ui.style(), &theme, &obj.yaml, "yaml");
                 ui.add(egui::Label::new(job).selectable(true).extend());
             });
         }

@@ -364,3 +364,124 @@ fn restricted_account_can_work_in_its_namespace() {
     settle(&mut h, "picker", |h| has_label_containing(h, "can't be listed"));
     shot(&mut h, "19_restricted_picker");
 }
+
+fn kubectl(args: &[&str]) -> String {
+    let out = std::process::Command::new("kubectl")
+        .args(["--context", "demo"])
+        .args(args)
+        .output()
+        .expect("kubectl is needed for this test");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn unsaved_yaml_edits_block_navigation() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 3);
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    let editing = h.state().detail.as_ref().unwrap().name.clone();
+    h.get_by_label("Edit YAML").click();
+    settle(&mut h, "editor", |h| has_label(h, "Cancel"));
+    // Focus through the accessibility tree: the editor is taller than the
+    // window, so a click at its centre would land off-screen.
+    h.get_by_role(Role::MultilineTextInput).focus();
+    h.step();
+    h.get_by_role(Role::MultilineTextInput).type_text("# unsaved ");
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.state().detail.as_ref().unwrap().has_unsaved_edit(), "typing should modify the YAML");
+
+    // Clicking another row must not throw the edit away.
+    let (other, _) = h.state().row_at(2).expect("a third row");
+    assert_ne!(other, editing);
+    h.get_all_by_label(&other).next().expect("row label").click();
+    for _ in 0..4 {
+        h.step();
+    }
+    let detail = h.state().detail.as_ref().expect("detail stays open");
+    assert_eq!(detail.name, editing, "the edited object must stay open");
+    assert!(detail.has_unsaved_edit(), "the edit must survive");
+    assert!(has_label_containing(&h, "Apply or cancel"), "the user is told why");
+    shot(&mut h, "20_unsaved_edit_guard");
+
+    // Esc must not discard typed text either; Cancel does.
+    h.key_press(egui::Key::Escape);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.state().detail.as_ref().is_some_and(|d| d.has_unsaved_edit()), "Esc must not drop changes");
+    h.get_by_label("Cancel").click();
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(!h.state().detail.as_ref().unwrap().editing());
+}
+
+#[test]
+fn scale_dialog_starts_from_the_real_replica_count() {
+    let Some(ctx) = test_context() else { return };
+    // ReplicaSets show READY as a bare number, which used to make the dialog
+    // start at 1 whatever the real size was.
+    let mut h = harness_with(&ctx, "replicasets.apps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    h.get_by_label("Desired").click();
+    h.step();
+    h.get_by_label("Desired").click(); // descending: a set with several replicas first
+    for _ in 0..3 {
+        h.step();
+    }
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    let (name, ns) = {
+        let d = h.state().detail.as_ref().unwrap();
+        (d.name.clone(), d.ns.clone())
+    };
+    let expected = kubectl(&["-n", &ns, "get", "rs", &name, "-o", "jsonpath={.spec.replicas}"]);
+    h.get_by_label("Scale").click();
+    settle(&mut h, "prefilled replica count", |h| {
+        h.query_all_by_role(Role::TextInput).last().and_then(|n| n.value()).is_some_and(|v| !v.is_empty())
+    });
+    let shown = h.get_all_by_role(Role::TextInput).last().unwrap().value().unwrap();
+    shot(&mut h, "21_scale_dialog");
+    assert_eq!(shown, expected, "scale dialog for {ns}/{name}");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    h.step();
+    assert!(h.state().dialog.is_none());
+}
+
+#[test]
+fn delete_dialog_waits_for_an_explicit_confirmation() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 3);
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    let (name, ns) = {
+        let d = h.state().detail.as_ref().unwrap();
+        (d.name.clone(), d.ns.clone())
+    };
+    h.get_by_label("Delete").click();
+    settle(&mut h, "dialog", |h| h.state().dialog.is_some());
+    // Nothing happens by itself, however many frames pass.
+    for _ in 0..10 {
+        h.step();
+    }
+    assert!(h.state().dialog.is_some(), "the dialog must stay open until answered");
+    shot(&mut h, "22_delete_dialog");
+    // Esc cancels, and the object is still there.
+    h.key_press(egui::Key::Escape);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.state().dialog.is_none());
+    assert_eq!(kubectl(&["-n", &ns, "get", "cm", &name, "-o", "jsonpath={.metadata.name}"]), name);
+}

@@ -76,6 +76,20 @@ pub fn enc(s: &str) -> String {
     out
 }
 
+/// Percent-encodes one path segment (an object name). Characters that are
+/// legal in a path segment, such as `:`, stay readable.
+pub fn enc_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':' | b'@' | b'!' | b'$'
+            | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub(crate) fn request(
     method: http::Method,
     url: &str,

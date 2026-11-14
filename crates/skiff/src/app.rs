@@ -88,7 +88,8 @@ enum Pending {
 /// Modal dialogs.
 pub enum Dialog {
     Delete { key: ResourceKey, ns: String, name: String, force: bool },
-    Scale { key: ResourceKey, ns: String, name: String, replicas: String },
+    /// `current` fetches the object so the field starts at its real size.
+    Scale { key: ResourceKey, ns: String, name: String, replicas: String, current: Option<Job<skiff_core::ObjectData>> },
     Forward(ForwardDialog),
     /// Create or update objects from a YAML manifest.
     Create { text: String, job: Option<Job<Vec<String>>>, error: Option<String> },
@@ -134,6 +135,10 @@ pub struct SkiffApp {
     trace: StartupTrace,
     /// How soon the next repaint is needed if nothing else happens.
     tick: Duration,
+    /// Frames the current dialog has been shown for (0 = just opened).
+    dialog_frames: u32,
+    /// (context, resource id) pairs whose cluster-wide list was refused.
+    forbidden: std::collections::HashSet<(String, String)>,
 }
 
 pub fn kind_icon(key: &ResourceKey) -> MaterialIcon {
@@ -267,6 +272,8 @@ impl SkiffApp {
             empty_metrics: Arc::new(Metrics::default()),
             trace: StartupTrace::from_env(),
             tick: Duration::from_secs(30),
+            dialog_frames: 0,
+            forbidden: std::collections::HashSet::new(),
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
         let initial = opts
@@ -309,10 +316,22 @@ impl SkiffApp {
         }
     }
 
+    /// True (with a toast) when the detail panel holds unsaved YAML edits
+    /// that the requested navigation would throw away.
+    fn blocked_by_edit(&mut self) -> bool {
+        if self.detail.as_ref().is_some_and(|d| d.has_unsaved_edit()) {
+            self.toast("Apply or cancel your YAML changes first", Tone::Warn);
+            return true;
+        }
+        false
+    }
+
     pub fn switch_context(&mut self, name: &str) {
-        if self.active.as_deref() == Some(name) {
+        if self.active.as_deref() == Some(name) || self.blocked_by_edit() {
             return;
         }
+        // A dialog belongs to the cluster it was opened for.
+        self.dialog = None;
         self.remember_namespaces();
         if !self.sessions.contains_key(name) {
             self.sessions.insert(name.to_string(), self.core.connect(name));
@@ -329,8 +348,10 @@ impl SkiffApp {
         }
         self.dock.close_for_context(name);
         if self.active.as_deref() == Some(name) {
+            self.remember_namespaces();
             self.active = None;
             self.detail = None;
+            self.dialog = None;
         }
     }
 
@@ -338,6 +359,12 @@ impl SkiffApp {
     pub fn table_stats(&self) -> (usize, bool) {
         let live = matches!(self.cache.snap.state, LoadState::Live | LoadState::Polling);
         (self.cache.order.len(), live)
+    }
+
+    /// Name and namespace of the row at a display position (for tests and
+    /// diagnostics).
+    pub fn row_at(&self, index: usize) -> Option<(String, String)> {
+        self.cache.row(index).map(|r| (r.name.to_string(), r.namespace.to_string()))
     }
 
     /// Time the last filter + sort pass took.
@@ -354,7 +381,7 @@ impl SkiffApp {
     }
 
     pub fn go(&mut self, view: View) {
-        if self.view != view {
+        if self.view != view && !self.blocked_by_edit() {
             self.detail = None;
             self.view = view;
         }
@@ -423,6 +450,16 @@ impl SkiffApp {
             self.dialog = None;
             self.toast(lines.join("\n"), Tone::Ok);
         }
+        if let Some(Dialog::Scale { replicas, current, .. }) = &mut self.dialog {
+            if let Some(res) = current.as_ref().and_then(|j| j.take()) {
+                *current = None;
+                if let (Ok(obj), true) = (res, replicas.is_empty()) {
+                    if let Some(n) = obj.value.pointer("/spec/replicas").and_then(|v| v.as_i64()) {
+                        *replicas = n.to_string();
+                    }
+                }
+            }
+        }
         if let Some(Dialog::Forward(d)) = &mut self.dialog {
             if let Some(job) = &d.job {
                 if let Some(res) = job.take() {
@@ -451,6 +488,9 @@ impl SkiffApp {
                 return;
             }
         }
+        if self.blocked_by_edit() {
+            return;
+        }
         let tab = self.detail.as_ref().map(|d| d.tab);
         let mut detail = Detail::open(&session, key, &row.namespace, &row.name);
         if let Some(tab) = tab {
@@ -462,6 +502,10 @@ impl SkiffApp {
     /// Navigates to an object by kind and name (owner links, palette).
     pub fn open_object(&mut self, key: &ResourceKey, ns: &str, name: &str) {
         let Some(session) = self.session().cloned() else { return };
+        let same = self.detail.as_ref().is_some_and(|d| d.is_for(key, ns, name));
+        if !same && self.blocked_by_edit() {
+            return;
+        }
         self.view = View::Resource(key.clone());
         let tui = self.tables.entry(key.id()).or_default();
         tui.filter.clear();
@@ -527,21 +571,14 @@ impl SkiffApp {
                 });
             }
             RowAction::Scale => {
-                let current = self
-                    .cache
-                    .snap
-                    .find(ns, name)
-                    .and_then(|r| {
-                        let col = self.cache.snap.columns.iter().find(|c| c.title.eq_ignore_ascii_case("ready"))?;
-                        let text = r.text(col);
-                        text.split_once('/').map(|(_, total)| total.trim().to_string())
-                    })
-                    .unwrap_or_else(|| "1".to_string());
+                // Start from the object's actual spec.replicas rather than
+                // guessing from a table column; empty until it arrives.
                 self.dialog = Some(Dialog::Scale {
                     key: key.clone(),
                     ns: ns.to_string(),
                     name: name.to_string(),
-                    replicas: current,
+                    replicas: String::new(),
+                    current: Some(session.get_object(key, ns, name)),
                 });
             }
             RowAction::Forward => {
@@ -576,7 +613,7 @@ impl SkiffApp {
 
     fn open_object_if_needed(&mut self, key: &ResourceKey, ns: &str, name: &str) {
         let already = self.detail.as_ref().is_some_and(|d| d.is_for(key, ns, name));
-        if !already {
+        if !already && !self.blocked_by_edit() {
             if let Some(session) = self.session().cloned() {
                 self.detail = Some(Detail::open(&session, key, ns, name));
             }
@@ -679,17 +716,19 @@ impl SkiffApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let open_palette = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
-        if ctx.input_mut(|i| i.consume_shortcut(&open_palette)) {
+        if ctx.input_mut(|i| i.consume_shortcut(&open_palette)) && self.dialog.is_none() {
             self.palette = match self.palette {
                 Some(_) => None,
                 None => Some(PaletteState::default()),
             };
         }
-        let busy = self.palette.is_some() || self.dialog.is_some() || self.terminal_focused || ctx.text_edit_focused();
+        // Keys belong to whatever is on top: a text field, the terminal, a
+        // dialog, the palette, or an open menu / popup.
+        let busy = self.overlay_open(ctx) || self.terminal_focused || ctx.text_edit_focused();
         if busy {
             return;
         }
-        if ctx.input(|i| i.key_pressed(Key::Slash)) {
+        if ctx.input(|i| i.key_pressed(Key::Slash)) && matches!(self.view, View::Resource(_)) {
             self.focus_filter = true;
             // Don't let the "/" itself land in the filter box.
             ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
@@ -705,6 +744,11 @@ impl SkiffApp {
                 }
             }
         }
+    }
+
+    /// Whether a dialog, the palette or any menu / popup is open.
+    fn overlay_open(&self, ctx: &egui::Context) -> bool {
+        self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(ctx)
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -1073,7 +1117,15 @@ impl SkiffApp {
         let mut latest = store.snapshot();
         // Accounts confined to a namespace may not list cluster-wide. With a
         // single namespace selected, watch just that namespace instead.
-        let forbidden = latest.state == LoadState::Failed && latest.error_code == 403 && key.namespaced;
+        // Remember the refusal: the cluster-wide table keeps retrying in the
+        // background and briefly reports other states while it does.
+        let mark = (session.context.clone(), key.id());
+        if latest.state == LoadState::Failed && latest.error_code == 403 && key.namespaced {
+            self.forbidden.insert(mark.clone());
+        } else if matches!(latest.state, LoadState::Live | LoadState::Polling) {
+            self.forbidden.remove(&mark);
+        }
+        let forbidden = self.forbidden.contains(&mark);
         if forbidden && self.ns_filter.len() == 1 {
             if let Some(ns) = self.ns_filter.iter().next() {
                 store = session.table_in(key, Some(ns));
@@ -1205,7 +1257,8 @@ impl SkiffApp {
         }
 
         // Keyboard navigation.
-        let typing = ctx.text_edit_focused() || self.palette.is_some() || self.dialog.is_some() || self.terminal_focused;
+        let overlay = self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(&ctx);
+        let typing = ctx.text_edit_focused() || overlay || self.terminal_focused;
         let mut open_selected = false;
         if !typing {
             let step: Option<i64> = ctx.input(|i| {
@@ -1250,6 +1303,8 @@ impl SkiffApp {
         let mut to_open: Option<Arc<Row>> = None;
         if let Some(row) = out.clicked {
             tui.selected = Some(row.uid.clone());
+            // Opening the panel narrows the table; keep the row in view.
+            tui.scroll_to_selected = self.detail.is_none();
             to_open = Some(row);
         } else if open_selected {
             to_open = tui
@@ -1287,6 +1342,7 @@ impl SkiffApp {
             && self.cache.snap.state == LoadState::Live;
         detail.set_gone(listed && current_rv.is_none());
         self.tick = self.tick.min(Duration::from_secs(5));
+        let overlay = self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(ui.ctx());
         let mut actions = Vec::new();
         // Leave the table usable in small windows.
         let max_width = (ui.available_width() - 340.0).clamp(300.0, 1100.0);
@@ -1296,14 +1352,18 @@ impl SkiffApp {
             .size_range(300.0f32.min(max_width)..=max_width)
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 14, right: 10, top: 10, bottom: 8 }))
             .show(ui, |ui| {
-                actions = detail.ui(ui, &pal, &session);
+                actions = detail.ui(ui, &pal, &session, overlay);
             });
         let ctx = ui.ctx().clone();
         for a in actions {
             let Some(d) = &self.detail else { break };
             let (key, ns, name) = (d.key.clone(), d.ns.clone(), d.name.clone());
             match a {
-                DetailAction::Close => self.detail = None,
+                DetailAction::Close => {
+                    if !self.blocked_by_edit() {
+                        self.detail = None;
+                    }
+                }
                 DetailAction::Row(action) => self.run_row_action(&ctx, action, &key, &ns, &name),
                 DetailAction::Open { kind, ns, name } => self.open_by_kind(&kind, &ns, &name),
                 DetailAction::Toast(text, tone) => self.toast(text, tone),
@@ -1342,10 +1402,24 @@ impl SkiffApp {
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
-        let Some(dialog) = &mut self.dialog else { return };
+        let Some(dialog) = &mut self.dialog else {
+            self.dialog_frames = 0;
+            return;
+        };
         let Some(session) = self.active.as_ref().and_then(|c| self.sessions.get(c)).cloned() else {
             self.dialog = None;
             return;
+        };
+        // Keys that opened the dialog must not also act inside it, so
+        // default focus is given once and Enter is left to the focused
+        // widget rather than read globally.
+        let fresh = self.dialog_frames == 0;
+        self.dialog_frames = self.dialog_frames.saturating_add(1);
+        // A dialog holding typed text or a running request is only closed
+        // by its own buttons, not by Esc or a click outside.
+        let sticky = match dialog {
+            Dialog::Create { job, .. } => job.is_some() || !fresh,
+            _ => false,
         };
         let mut close = false;
         let mut push: Option<Pending> = None;
@@ -1362,7 +1436,11 @@ impl SkiffApp {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let del = egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(pal.err);
-                        if ui.add(del).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        let del = ui.add(del);
+                        if fresh {
+                            del.request_focus();
+                        }
+                        if del.clicked() {
                             push = Some(Pending::Simple {
                                 job: session.delete_object(key, ns, name, *force),
                                 ok: format!("Deleted {name}"),
@@ -1374,14 +1452,19 @@ impl SkiffApp {
                         }
                     });
                 }
-                Dialog::Scale { key, ns, name, replicas } => {
+                Dialog::Scale { key, ns, name, replicas, current } => {
                     ui.label(widgets::semibold(format!("Scale {name}"), 15.0));
                     ui.add_space(6.0);
+                    let mut submitted = false;
                     ui.horizontal(|ui| {
                         ui.label("Replicas");
                         let edit = ui.add(egui::TextEdit::singleline(replicas).hint_text("count").desired_width(70.0));
-                        if !edit.has_focus() && !edit.lost_focus() {
+                        if fresh {
                             edit.request_focus();
+                        }
+                        submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if current.is_some() {
+                            ui.spinner();
                         }
                         if ui.small_button("−").clicked() {
                             let n: i32 = replicas.trim().parse().unwrap_or(1);
@@ -1396,7 +1479,7 @@ impl SkiffApp {
                     let parsed: Option<i32> = replicas.trim().parse().ok().filter(|n| *n >= 0);
                     ui.horizontal(|ui| {
                         let go = ui.add_enabled(parsed.is_some(), egui::Button::new("Scale")).clicked()
-                            || (parsed.is_some() && ui.input(|i| i.key_pressed(Key::Enter)));
+                            || (parsed.is_some() && submitted);
                         if let (true, Some(n)) = (go, parsed) {
                             push = Some(Pending::Simple {
                                 job: session.scale(key, ns, name, n),
@@ -1456,7 +1539,8 @@ impl SkiffApp {
                             *error = None;
                             *job = Some(session.apply_manifest(text.clone()));
                         }
-                        if ui.button("Cancel").clicked() {
+                        // Closing now would lose the outcome of the request.
+                        if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() {
                             close = true;
                         }
                         if busy {
@@ -1531,7 +1615,7 @@ impl SkiffApp {
         if let Some(p) = push {
             self.pending.push(p);
         }
-        if close || resp.should_close() {
+        if close || (resp.should_close() && !sticky) {
             self.dialog = None;
         }
     }

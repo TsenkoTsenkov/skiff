@@ -16,6 +16,10 @@ pub struct PaletteState {
     pub query: String,
     pub selected: usize,
     last_query: String,
+    /// Matches for `cached_for`; rebuilt only when the query or the
+    /// underlying data changes, not on every frame the palette is open.
+    items: Vec<Item>,
+    cached_for: Option<(String, u64, Option<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -213,7 +217,21 @@ pub fn show(
         state.last_query = state.query.clone();
         state.selected = 0;
     }
-    let items = collect(state.query.trim(), contexts, active, session);
+    // Everything the results depend on: the query, the cluster, and a stamp
+    // of the loaded tables and discovery.
+    let stamp = session
+        .map(|s| {
+            s.active_tables()
+                .iter()
+                .fold(s.discovered().len() as u64, |acc, t| acc.wrapping_mul(31).wrapping_add(t.peek().generation))
+        })
+        .unwrap_or(0);
+    let wanted = (state.query.trim().to_string(), stamp, active.map(str::to_string));
+    if state.cached_for.as_ref() != Some(&wanted) {
+        state.items = collect(&wanted.0, contexts, active, session);
+        state.cached_for = Some(wanted);
+    }
+    let items = std::mem::take(&mut state.items);
     let mut moved = false;
     ctx.input_mut(|i| {
         if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
@@ -310,11 +328,10 @@ pub fn show(
     if enter && !items.is_empty() {
         chosen = Some(state.selected);
     }
-    if let Some(i) = chosen {
-        if let Some(item) = items.into_iter().nth(i) {
-            return Outcome::Run(item.cmd);
-        }
+    if let Some(cmd) = chosen.and_then(|i| items.get(i)).map(|item| item.cmd.clone()) {
+        return Outcome::Run(cmd);
     }
+    state.items = items;
     if resp.should_close() {
         return Outcome::Close;
     }

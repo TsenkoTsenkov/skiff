@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -131,6 +131,12 @@ pub struct Session {
     tasks: Mutex<Vec<AbortHandle>>,
     /// Number of connection attempts started.
     conn_gen: AtomicU64,
+    /// Serialises "is this attempt still current?" with publishing its
+    /// outcome, against `reconnect()` starting a newer attempt.
+    conn_lock: Mutex<()>,
+    /// Open log streams and shells, so `shutdown()` can end them.
+    logs: Mutex<Vec<Weak<LogStream>>>,
+    execs: Mutex<Vec<Weak<ExecSession>>>,
 }
 
 /// Builds a client for a kubeconfig context; also returns the server URL.
@@ -253,6 +259,9 @@ impl Session {
             forwards: Mutex::new(Vec::new()),
             tasks: Mutex::new(Vec::new()),
             conn_gen: AtomicU64::new(0),
+            conn_lock: Mutex::new(()),
+            logs: Mutex::new(Vec::new()),
+            execs: Mutex::new(Vec::new()),
         });
         session.start_connect();
         session.start_janitor();
@@ -276,6 +285,7 @@ impl Session {
         self.spawn_tracked(async move {
             let current = |s: &Session| s.conn_gen.load(Ordering::SeqCst) == attempt;
             let fail = |s: &Session, msg: String| {
+                let _publishing = s.conn_lock.lock();
                 if current(s) {
                     s.status.store(Arc::new(ConnStatus::Failed(msg.clone())));
                     s.client_tx.send_replace(Some(Err(msg)));
@@ -285,6 +295,7 @@ impl Session {
             let result = build_client(&context).await;
             let (client, server) = {
                 let Some(s) = weak.upgrade() else { return };
+                let publishing = s.conn_lock.lock();
                 match result {
                     Ok((c, server)) if current(&s) => {
                         // Hand the client out immediately so tables start
@@ -293,7 +304,10 @@ impl Session {
                         (c, server)
                     }
                     Ok(_) => return,
-                    Err(e) => return fail(&s, e),
+                    Err(e) => {
+                        drop(publishing);
+                        return fail(&s, e);
+                    }
                 }
             };
             let server = server.trim_end_matches('/').to_string();
@@ -301,17 +315,21 @@ impl Session {
             {
                 let Some(s) = weak.upgrade() else { return };
                 match version {
-                    Ok(Ok(v)) if current(&s) => {
+                    Ok(Ok(v)) => {
+                        let _publishing = s.conn_lock.lock();
+                        if !current(&s) {
+                            return;
+                        }
                         s.status.store(Arc::new(ConnStatus::Connected { version: v.git_version }));
                         s.notify.ping();
                     }
-                    Ok(Ok(_)) => return,
                     Ok(Err(e)) => return fail(&s, format!("Cannot reach {server}: {}", friendly(&e))),
                     Err(_) => return fail(&s, format!("Cannot reach {server}: no response within 15 seconds")),
                 }
             }
             let found = discover(&client).await;
             if let (Some(s), Ok(found)) = (weak.upgrade(), found) {
+                let _publishing = s.conn_lock.lock();
                 if current(&s) {
                     s.discovered.store(Arc::new(found));
                     s.notify.ping();
@@ -376,6 +394,17 @@ impl Session {
                     match current {
                         Some(Ok(c)) => break c,
                         _ => {
+                            // Disconnected or reconnecting: a sample from
+                            // the old connection must not look current.
+                            match weak.upgrade() {
+                                Some(s) if s.metrics.load().available => {
+                                    generation += 1;
+                                    s.metrics.store(Arc::new(Metrics { generation, ..Default::default() }));
+                                    s.notify.ping();
+                                }
+                                Some(_) => {}
+                                None => return,
+                            }
                             if rx.changed().await.is_err() {
                                 return;
                             }
@@ -454,12 +483,26 @@ impl Session {
     /// Drops the current client and connects again (after a failure, or to
     /// pick up refreshed credentials).
     pub fn reconnect(self: &Arc<Self>) {
-        self.status.store(Arc::new(ConnStatus::Connecting));
-        // `send_replace` stores the value even when nobody is subscribed
-        // right now; `send` would silently keep the old client.
-        self.client_tx.send_replace(None);
+        {
+            // Invalidate every earlier attempt before publishing anything,
+            // under the lock those attempts publish under.
+            let _publishing = self.conn_lock.lock();
+            self.conn_gen.fetch_add(1, Ordering::SeqCst);
+            self.status.store(Arc::new(ConnStatus::Connecting));
+            // `send_replace` stores the value even when nobody is subscribed
+            // right now; `send` would silently keep the old client.
+            self.client_tx.send_replace(None);
+        }
         self.start_connect();
         self.notify.ping();
+    }
+
+    /// Reads the session's current client without waiting; `None` while
+    /// disconnected. Long-lived streams call this on every (re)connect so
+    /// they follow a `reconnect()`.
+    fn client_provider(&self) -> logs::ClientProvider {
+        let rx = self.client_tx.subscribe();
+        Arc::new(move || rx.borrow().clone().and_then(|r| r.ok()))
     }
 
     /// Everything the API server can list (empty until discovery finishes).
@@ -638,32 +681,47 @@ impl Session {
     }
 
     pub fn logs(&self, targets: Vec<LogTarget>, options: LogOptions) -> Arc<LogStream> {
-        logs::open(&self.handle, self.client(), targets, options, self.notify.clone())
+        let stream = logs::open(
+            &self.handle,
+            self.client(),
+            self.client_provider(),
+            targets,
+            options,
+            self.notify.clone(),
+        );
+        let mut open = self.logs.lock();
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(&stream));
+        stream
     }
 
     pub fn exec(&self, ns: &str, pod: &str, container: &str, command: Vec<String>) -> Arc<ExecSession> {
-        exec::open(&self.handle, self.client(), ns, pod, container, command, self.notify.clone())
+        let session = exec::open(&self.handle, self.client(), ns, pod, container, command, self.notify.clone());
+        let mut open = self.execs.lock();
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(&session));
+        session
     }
 
     /// Forwards a local port to a pod port. `local_port` of `None` picks a
     /// free one.
     pub fn forward_pod(&self, ns: &str, pod: &str, remote_port: u16, local_port: Option<u16>) -> Job<Arc<PortForward>> {
         let (ns, pod) = (ns.to_string(), pod.to_string());
-        let (handle, notify) = (self.handle.clone(), self.notify.clone());
+        let (handle, notify, provider) = (self.handle.clone(), self.notify.clone(), self.client_provider());
         let label = format!("pod/{pod}");
         self.job(move |c| async move {
-            forward::start(handle, c, ns, pod, label, remote_port, local_port, notify).await
+            forward::start(handle, c, provider, ns, pod, label, remote_port, local_port, notify).await
         })
     }
 
     /// Forwards a local port to a service port via one of its ready pods.
     pub fn forward_service(&self, ns: &str, service: &str, port: u16, local_port: Option<u16>) -> Job<Arc<PortForward>> {
         let (ns, service) = (ns.to_string(), service.to_string());
-        let (handle, notify) = (self.handle.clone(), self.notify.clone());
+        let (handle, notify, provider) = (self.handle.clone(), self.notify.clone(), self.client_provider());
         self.job(move |c| async move {
             let (pod, remote) = ops::resolve_service(&c, &ns, &service, port).await?;
             let label = format!("svc/{service}");
-            forward::start(handle, c, ns, pod, label, remote, local_port, notify).await
+            forward::start(handle, c, provider, ns, pod, label, remote, local_port, notify).await
         })
     }
 
@@ -694,6 +752,12 @@ impl Session {
         }
         for f in self.forwards.lock().drain(..) {
             f.stop();
+        }
+        for stream in self.logs.lock().drain(..).filter_map(|w| w.upgrade()) {
+            stream.stop();
+        }
+        for exec in self.execs.lock().drain(..).filter_map(|w| w.upgrade()) {
+            exec.close();
         }
     }
 }

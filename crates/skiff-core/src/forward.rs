@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::task::AbortHandle;
 
+use crate::logs::ClientProvider;
 use crate::util::{friendly, Notifier};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -78,9 +79,11 @@ async fn serve_one(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     handle: tokio::runtime::Handle,
     client: Client,
+    provider: ClientProvider,
     namespace: String,
     pod: String,
     label: String,
@@ -106,7 +109,6 @@ pub(crate) async fn start(
         conns: Mutex::new(Vec::new()),
         stopped: AtomicBool::new(false),
     });
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let weak = Arc::downgrade(&fwd);
     let h = handle.clone();
     let task = handle.spawn(async move {
@@ -114,7 +116,10 @@ pub(crate) async fn start(
             let Ok((conn, _)) = listener.accept().await else { break };
             let Some(fwd) = weak.upgrade() else { break };
             fwd.connections.fetch_add(1, Ordering::Relaxed);
-            let (pods, pod, notify) = (pods.clone(), pod.clone(), notify.clone());
+            // Use the session's current client, so forwards keep working
+            // across a reconnect.
+            let pods: Api<Pod> = Api::namespaced(provider().unwrap_or_else(|| client.clone()), &namespace);
+            let (pod, notify) = (pod.clone(), notify.clone());
             let weak = weak.clone();
             let conn_task = h.spawn(async move {
                 if let Err(e) = serve_one(pods, pod, remote_port, conn).await {

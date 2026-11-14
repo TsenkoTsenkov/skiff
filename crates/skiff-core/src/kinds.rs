@@ -53,7 +53,9 @@ impl ResourceKey {
     }
 
     pub fn object_path(&self, ns: &str, name: &str) -> String {
-        format!("{}/{}", self.list_path(Some(ns)), name)
+        // RBAC object names may contain characters such as `#` or spaces
+        // that would otherwise change the meaning of the URL.
+        format!("{}/{}", self.list_path(Some(ns)), crate::util::enc_segment(name))
     }
 
     /// `pods`, `deployments.apps` — the form kubectl accepts.
@@ -226,6 +228,11 @@ mod tests {
         let n = nodes();
         assert_eq!(n.object_path("", "n1"), "/api/v1/nodes/n1");
         assert_eq!(n.list_path(Some("ignored")), "/api/v1/nodes");
+        let cr = builtin("rbac.authorization.k8s.io", "clusterroles").unwrap().key();
+        assert_eq!(
+            cr.object_path("", "system:a#b c"),
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:a%23b%20c"
+        );
     }
 
     #[test]

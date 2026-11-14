@@ -369,8 +369,19 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
     let mut docs = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(yaml) {
         let value = Value::deserialize(doc).map_err(|e| format!("invalid YAML: {e}"))?;
-        if !value.is_null() {
-            docs.push(value);
+        if value.is_null() {
+            continue;
+        }
+        // `kubectl get -o yaml` of several objects produces a List.
+        let is_list = value.get("kind").and_then(|k| k.as_str()).is_some_and(|k| k.ends_with("List"))
+            && value.get("items").is_some_and(|i| i.is_array());
+        match value {
+            Value::Object(mut map) if is_list => {
+                if let Some(Value::Array(items)) = map.remove("items") {
+                    docs.extend(items.into_iter().filter(|i| !i.is_null()));
+                }
+            }
+            other => docs.push(other),
         }
     }
     if docs.is_empty() {
@@ -387,26 +398,33 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
             failed = true;
             continue;
         }
+        // Match on group and kind, then address the object at the version
+        // the manifest asks for: discovery only lists each group's preferred
+        // version, but the server serves others too (autoscaling/v1, ...).
+        let (group, version) = match api_version.split_once('/') {
+            Some((g, v)) => (g, v),
+            None => ("", api_version.as_str()),
+        };
         let key = discovered
             .iter()
             .map(|d| &d.key)
-            .find(|k| &*k.kind == kind && k.api_version() == api_version)
+            .find(|k| &*k.kind == kind && &*k.group == group)
             .cloned()
-            .or_else(|| {
-                crate::kinds::builtin_by_kind(&kind)
-                    .map(|b| b.key())
-                    .filter(|k| k.api_version() == api_version)
-            });
+            .or_else(|| crate::kinds::builtin_by_kind(&kind).map(|b| b.key()).filter(|k| &*k.group == group))
+            .map(|k| ResourceKey::new(group, version, &k.plural, &k.kind, k.namespaced));
         let Some(key) = key else {
             report.push(format!("{kind}/{name}: unknown resource type {api_version}/{kind}"));
             failed = true;
             continue;
         };
+        // Like kubectl: an object without a namespace goes to the namespace
+        // of the kubeconfig context.
         let ns = if key.namespaced {
             value
                 .pointer("/metadata/namespace")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default")
+                .filter(|n| !n.is_empty())
+                .unwrap_or(client.default_namespace())
                 .to_string()
         } else {
             String::new()
