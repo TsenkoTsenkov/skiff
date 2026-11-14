@@ -293,6 +293,7 @@ async fn drive(
     Ok(reason)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     handle: &tokio::runtime::Handle,
     client: impl std::future::Future<Output = Result<Client, String>> + Send + 'static,
