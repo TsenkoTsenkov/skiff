@@ -379,6 +379,14 @@ impl TerminalView {
     /// are collected with [`Self::take_replies`] (or by the next `ui` call).
     pub fn feed(&mut self, bytes: &[u8]) {
         self.expire_sync();
+        // (In pieces, so that what the emulator wants to say in return is
+        // collected, and capped, as it goes rather than after megabytes.)
+        for piece in bytes.chunks(64 * 1024) {
+            self.feed_piece(piece);
+        }
+    }
+
+    fn feed_piece(&mut self, bytes: &[u8]) {
         // Hand the bytes to the parser in stretches, leaving out what exceeds
         // the limits (see the constants at the top).
         let mut start = 0;
