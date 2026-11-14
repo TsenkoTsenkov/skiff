@@ -249,6 +249,46 @@ fn nav_row(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, label: &str, selected: 
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// One cluster in the switcher: status dot and name, left-aligned, at a
+/// fixed width.
+fn cluster_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    width: f32,
+    name: &str,
+    selected: bool,
+    dot: Color32,
+    room_for_button: bool,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let bg = if selected {
+            pal.selected
+        } else if resp.hovered() {
+            pal.hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(6), bg);
+        p.circle_filled(egui::pos2(rect.left() + 14.0, rect.center().y), 4.0, dot);
+        let right = if room_for_button { 36.0 } else { 8.0 };
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 28.0, rect.top()),
+            egui::pos2(rect.right() - right, rect.bottom()),
+        );
+        let color = if selected { pal.accent } else { pal.text };
+        let font = if selected { FontId::new(13.0, theme::semibold()) } else { FontId::proportional(13.0) };
+        let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), font, color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width().max(10.0));
+        let galley = ui.painter().layout_job(job);
+        p.galley(egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0), galley, color);
+    }
+    let label = name.to_string();
+    resp.widget_info(move || egui::WidgetInfo::selected(egui::Role::Button, true, selected, &label));
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 impl SkiffApp {
     pub fn new(cc: &eframe::CreationContext<'_>, opts: AppOptions) -> Self {
         let saved: Saved = cc
@@ -649,6 +689,14 @@ impl SkiffApp {
                 let job = session.pod_containers(ns, name);
                 self.dock.open_shell(&session, ns, name, job);
             }
+            RowAction::ShellExternal => {
+                // kubectl picks the pod's default container.
+                let cmd = crate::external::exec_command(&session.context, ns, name, None);
+                match crate::external::open(&cmd) {
+                    Ok(app) => self.toast(format!("Opened a shell in {app}"), Tone::Normal),
+                    Err(e) => self.toast(e, Tone::Err),
+                }
+            }
             RowAction::Edit => {
                 self.open_object_if_needed(key, ns, name);
                 if let Some(d) = &mut self.detail {
@@ -967,43 +1015,73 @@ impl SkiffApp {
             .on_hover_text("Switch cluster");
         let mut switch_to = None;
         let mut disconnect = None;
+        // The longest context name decides the width, within limits. The
+        // width is fixed for the whole menu: rows that size themselves from
+        // the space left over would make the popup grow on every frame.
+        let longest = self
+            .contexts
+            .items
+            .iter()
+            .map(|c| {
+                ui.painter()
+                    .layout_no_wrap(c.name.clone(), FontId::proportional(13.0), pal.text)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        let menu_width = (longest + 90.0).clamp(280.0, 520.0);
         egui::Popup::menu(&resp)
             .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                ui.set_min_width(280.0);
+                ui.set_width(menu_width);
                 widgets::caption(ui, "Clusters", &pal);
                 if let Some(err) = &self.contexts_error {
-                    ui.label(RichText::new(err).color(pal.err));
+                    ui.add(egui::Label::new(RichText::new(err).color(pal.err)).wrap());
                 }
                 if self.contexts.items.is_empty() && self.contexts_error.is_none() {
                     ui.label(RichText::new("No contexts in kubeconfig").color(pal.muted));
                 }
-                egui::ScrollArea::vertical().max_height(360.0).min_scrolled_height(360.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let row_width = ui.available_width();
                     for c in &self.contexts.items {
                         let is_active = self.active.as_deref() == Some(c.name.as_str());
                         let connected = self.sessions.get(&c.name).map(|s| s.status());
-                        ui.horizontal(|ui| {
-                            let dot_color = match connected.as_deref() {
-                                Some(ConnStatus::Connected { .. }) => pal.ok,
-                                Some(ConnStatus::Connecting) => pal.warn,
-                                Some(ConnStatus::Failed(_)) => pal.err,
-                                None => pal.faint,
-                            };
-                            widgets::dot(ui, dot_color);
-                            let w = ui.available_width() - if connected.is_some() { 30.0 } else { 0.0 };
-                            let r = ui
-                                .add_sized([w, 26.0], egui::Button::selectable(is_active, &c.name))
-                                .on_hover_text(&c.server);
-                            if r.clicked() {
-                                switch_to = Some(c.name.clone());
-                                ui.close();
-                            }
-                            if connected.is_some()
-                                && widgets::icon_button(ui, icons::ICON_POWER_SETTINGS_NEW, "Disconnect").clicked()
-                            {
+                        let dot_color = match connected.as_deref() {
+                            Some(ConnStatus::Connected { .. }) => pal.ok,
+                            Some(ConnStatus::Connecting) => pal.warn,
+                            Some(ConnStatus::Failed(_)) => pal.err,
+                            None => pal.faint,
+                        };
+                        let status = match connected.as_deref() {
+                            Some(ConnStatus::Connected { .. }) => "connected",
+                            Some(ConnStatus::Connecting) => "connecting",
+                            Some(ConnStatus::Failed(_)) => "failed to connect",
+                            None => "not connected",
+                        };
+                        let r = cluster_row(ui, &pal, row_width, &c.name, is_active, dot_color, connected.is_some())
+                            .on_hover_text(format!("{}\n{}", c.server, status));
+                        if connected.is_some() {
+                            // Drawn over the row's right end (and so
+                            // clicked instead of it).
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(r.rect.right() - 32.0, r.rect.top() + 2.0),
+                                Vec2::new(28.0, r.rect.height() - 4.0),
+                            );
+                            let off = ui.put(
+                                rect,
+                                egui::Button::new(widgets::icon(icons::ICON_POWER_SETTINGS_NEW, 16.0).color(pal.muted))
+                                    .frame_when_inactive(false),
+                            );
+                            if widgets::named(off, "Disconnect").clicked() {
                                 disconnect = Some(c.name.clone());
+                                continue;
                             }
-                        });
+                        }
+                        if r.clicked() {
+                            switch_to = Some(c.name.clone());
+                            ui.close();
+                        }
                     }
                 });
             });
@@ -1339,6 +1417,14 @@ impl SkiffApp {
                                     tui.col_visible.insert(title.to_string(), on);
                                 }
                             }
+                        }
+                        ui.separator();
+                        if widgets::action_button(ui, icons::ICON_RESTART_ALT, "Reset columns")
+                            .on_hover_text("Default columns and widths")
+                            .clicked()
+                        {
+                            tui.col_visible.clear();
+                            tui.widths_generation = tui.widths_generation.wrapping_add(1);
                         }
                     });
                 let id = egui::Id::unique("table-filter");

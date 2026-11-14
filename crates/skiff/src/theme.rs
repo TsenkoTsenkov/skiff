@@ -160,8 +160,8 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
 
         let s = &mut style.spacing;
         s.item_spacing = egui::vec2(8.0, 6.0);
-        s.button_padding = egui::vec2(9.0, 4.0);
-        s.interact_size = egui::vec2(28.0, 24.0);
+        s.button_padding = egui::vec2(10.0, 5.0);
+        s.interact_size = egui::vec2(30.0, 26.0);
         s.menu_margin = Margin::same(6);
         s.window_margin = Margin::same(12);
         s.indent = 14.0;

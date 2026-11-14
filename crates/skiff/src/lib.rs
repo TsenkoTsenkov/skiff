@@ -3,6 +3,8 @@
 pub mod app;
 pub mod detail;
 pub mod dock;
+pub mod external;
+pub mod log_text;
 pub mod overview;
 pub mod palette;
 pub mod shell;

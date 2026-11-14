@@ -27,13 +27,15 @@ pub struct TableUi {
     pub col_visible: HashMap<String, bool>,
     /// Set to scroll the selected row into view on the next frame.
     pub scroll_to_selected: bool,
-    /// Scroll position and column count of the last frame, to carry the
+    /// Scroll position and column layout of the last frame, to carry the
     /// position over when the set of columns (and so the table's stored
     /// state) changes.
     pub scroll_y: f32,
     pub last_cols: usize,
     /// uid of the row the open context menu was opened on.
     pub menu_uid: Option<Box<str>>,
+    /// Bumped to forget the column widths the user dragged.
+    pub widths_generation: u32,
 }
 
 /// A column as displayed: either from the snapshot or computed in the UI.
@@ -391,6 +393,8 @@ pub struct TableOutput {
 pub enum RowAction {
     Logs,
     Shell,
+    /// A shell in the user's own terminal app.
+    ShellExternal,
     Edit,
     Delete,
     CopyName,
@@ -414,6 +418,7 @@ pub fn actions_for(key: &ResourceKey) -> Vec<(RowAction, egui_material_icons::Ma
     }
     if key.is("", "pods") {
         v.push((RowAction::Shell, icons::ICON_TERMINAL, "Shell"));
+        v.push((RowAction::ShellExternal, icons::ICON_OPEN_IN_NEW, "Shell in terminal app"));
     }
     if key.is("", "pods") || key.is("", "services") {
         v.push((RowAction::Forward, icons::ICON_SWAP_HORIZ, "Port forward"));
@@ -474,11 +479,14 @@ pub fn show(
     // The context menu belongs to a row position; rows can move under it.
     let mut menu_uid = tui.menu_uid.take();
     let mut menu_open = false;
+    // Stored widths are kept per set of columns, by identity: widths the
+    // user dragged survive the detail panel opening and closing (which
+    // changes how many columns fit) and switching a column off and on
+    // again, and are never applied to a different column that happens to
+    // be in the same position. The scroll position is carried over below.
+    let col_ids: Vec<&str> = cols.iter().map(|c| c.title(snap)).collect();
     let mut builder = TableBuilder::new(ui)
-        // One stored state per column count, so widths the user dragged
-        // survive the detail panel opening and closing (which changes how
-        // many columns fit). The scroll position is carried over below.
-        .id_salt(("resource-table", key.id(), cols.len()))
+        .id_salt(("resource-table", key.id(), &col_ids, tui.widths_generation))
         .striped(false)
         .resizable(true)
         .sense(Sense::click())
@@ -495,11 +503,12 @@ pub fn show(
             TableColumn::initial(width).at_least(36.0).clip(true)
         });
     }
-    if tui.last_cols != cols.len() {
+    let layout_sig = col_layout_signature(&col_ids, tui.widths_generation);
+    if tui.last_cols != layout_sig {
         if tui.last_cols != 0 {
             builder = builder.vertical_scroll_offset(tui.scroll_y);
         }
-        tui.last_cols = cols.len();
+        tui.last_cols = layout_sig;
     }
     if tui.scroll_to_selected {
         tui.scroll_to_selected = false;
@@ -656,6 +665,15 @@ pub fn show(
         });
     }
     out
+}
+
+/// Identifies a column layout (never 0, which means "none yet").
+fn col_layout_signature(titles: &[&str], generation: u32) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    titles.hash(&mut h);
+    generation.hash(&mut h);
+    (h.finish() as usize).max(1)
 }
 
 fn node_usage_cell(ui: &mut Ui, pal: &Palette, row: &Row, title: &str, capacity: f64, text: &str, metrics: &Metrics) {

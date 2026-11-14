@@ -5,7 +5,7 @@ use std::sync::Arc;
 use egui::{RichText, Ui};
 use egui_material_icons::icons;
 use skiff_core::exec::default_shell;
-use skiff_core::{ContainerInfo, ExecSession, ExecState, Job, Session};
+use skiff_core::{ContainerInfo, ExecSession, ExecState, Job, Session, Tone};
 
 use crate::theme::Palette;
 use crate::widgets;
@@ -154,7 +154,7 @@ impl ShellTab {
     }
 
     /// Draws the tab; returns whether the terminal has keyboard focus.
-    pub fn ui(&mut self, ui: &mut Ui, pal: &Palette) -> bool {
+    pub fn ui(&mut self, ui: &mut Ui, pal: &Palette, toasts: &mut Vec<(String, Tone)>) -> bool {
         if let Some(err) = &self.error {
             widgets::empty_state(ui, icons::ICON_ERROR, "Couldn't open a shell", err, pal);
             return false;
@@ -194,6 +194,17 @@ impl ShellTab {
                 ExecState::Failed(err) => {
                     widgets::pill(ui, "failed", pal.err, pal).on_hover_text(err);
                     reconnect = ui.small_button("Retry").clicked();
+                }
+            }
+            if widgets::action_button(ui, icons::ICON_OPEN_IN_NEW, "Open in terminal app")
+                .on_hover_text("Open this shell in your own terminal (iTerm, Terminal, ...) with kubectl exec")
+                .clicked()
+            {
+                let cmd =
+                    crate::external::exec_command(&self.session.context, &self.ns, &self.pod, self.container.as_deref());
+                match crate::external::open(&cmd) {
+                    Ok(app) => toasts.push((format!("Opened in {app}"), Tone::Normal)),
+                    Err(e) => toasts.push((e, Tone::Err)),
                 }
             }
         });

@@ -12,9 +12,9 @@ pub fn icon(ic: MaterialIcon, size: f32) -> RichText {
 /// Borderless icon button that lights up on hover.
 pub fn icon_button(ui: &mut Ui, ic: MaterialIcon, tooltip: &str) -> Response {
     let resp = ui.add(
-        egui::Button::new(icon(ic, 16.0))
+        egui::Button::new(icon(ic, 18.0))
             .frame_when_inactive(false)
-            .min_size(Vec2::new(26.0, 24.0)),
+            .min_size(Vec2::new(30.0, 28.0)),
     );
     named(resp, tooltip)
 }
@@ -27,19 +27,19 @@ pub fn named(resp: Response, name: &str) -> Response {
 }
 
 pub fn icon_toggle(ui: &mut Ui, on: bool, ic: MaterialIcon, tooltip: &str, pal: &Palette) -> Response {
-    let text = icon(ic, 16.0).color(if on { pal.accent } else { pal.muted });
+    let text = icon(ic, 18.0).color(if on { pal.accent } else { pal.muted });
     let resp = ui.add(
         egui::Button::new(text)
             .frame_when_inactive(on)
             .fill(if on { pal.selected } else { Color32::TRANSPARENT })
-            .min_size(Vec2::new(26.0, 24.0)),
+            .min_size(Vec2::new(30.0, 28.0)),
     );
     named(resp, tooltip)
 }
 
 /// Button with a leading icon.
 pub fn action_button(ui: &mut Ui, ic: MaterialIcon, label: &str) -> Response {
-    ui.add(egui::Button::new((icon(ic, 15.0), label)))
+    ui.add(egui::Button::new((icon(ic, 16.0), label)).min_size(Vec2::new(0.0, 28.0)))
 }
 
 pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
