@@ -34,6 +34,7 @@ pub enum Command {
     PortForwards,
     CreateResource,
     Reconnect,
+    CheckForUpdates,
 }
 
 pub enum Outcome {
@@ -165,6 +166,9 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
     push(icons::ICON_SWAP_HORIZ, "Port forwards".into(), "Action".into(), Command::PortForwards, 0, &[]);
     push(icons::ICON_ADD, "Create resource from YAML".into(), "Action".into(), Command::CreateResource, 0, &["apply", "new"]);
     push(icons::ICON_REFRESH, "Reconnect to cluster".into(), "Action".into(), Command::Reconnect, 0, &[]);
+    if cfg!(target_os = "macos") {
+        push(icons::ICON_SYSTEM_UPDATE_ALT, "Check for updates".into(), "Action".into(), Command::CheckForUpdates, 0, &["upgrade", "version"]);
+    }
 
     // Objects in tables that are already loaded: instant, no extra requests.
     if let (Some(s), true) = (session, query.len() >= 2) {

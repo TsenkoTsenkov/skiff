@@ -151,6 +151,19 @@ Settings → Privacy & Security → Open Anyway, or
 xattr -dr com.apple.quarantine /Applications/Skiff.app
 ```
 
+#### Updates
+
+Every push to `main` that changes the app makes the workflow publish a
+release named `build-<n>` with the zipped app. A copy installed from one of
+those releases (or from a `v…` tag) checks GitHub every few hours and shows
+an **Update** button in the top bar when a newer build exists. Clicking it
+downloads the new version next to the installed one, and **Restart to
+update** swaps them and reopens Skiff. "Check for updates" is also in the
+command palette (`Cmd+K`). For a private repository it uses the token from
+`$GITHUB_TOKEN`, `$GH_TOKEN` or `gh auth token`. `SKIFF_NO_UPDATE_CHECK=1`
+turns the check off. What the swap did is logged to
+`~/Library/Logs/Skiff-update.log`.
+
 Opened from the Finder or the Dock, the app asks your login shell for its
 `PATH`, so that the credential helpers your kubeconfig calls (`aws`,
 `gke-gcloud-auth-plugin`, `kubelogin`, …) are found.

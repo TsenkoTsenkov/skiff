@@ -1,17 +1,27 @@
 # Builds Skiff for Apple Silicon on GitHub's own Macs and offers the disk
-# image for download as an artifact of the run; for a tag like v0.1.0 it is
-# also attached to a release. It runs when such a tag or a branch named
-# release/... is pushed, and can be started by hand (Actions > macOS build >
-# Run workflow), optionally with the unit tests.
+# image for download as an artifact of the run.
 #
-# Ordinary pushes do not start it: on a private repository a Mac runner
-# uses up the included Actions minutes ten times as fast as a Linux one.
+# Every push to main that changes the app publishes a release named
+# build-<run number> with the zipped app; the app's Update button finds it
+# (see crates/skiff/src/update.rs). Only the newest 10 such releases are
+# kept. A tag like v0.1.0 also gets a release, with the disk image.
+#
+# It also runs when a branch named release/... is pushed, and can be started
+# by hand (Actions > macOS build > Run workflow), optionally with the unit
+# tests. (On a private repository a Mac runner uses up the included Actions
+# minutes ten times as fast as a Linux one.)
 name: macOS build
 
 on:
   push:
     tags: ["v*"]
-    branches: ["release/**"]
+    branches: ["main", "release/**"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "hack/macos-app.sh"
+      - ".github/workflows/macos.yml"
   workflow_dispatch:
     inputs:
       run_tests:
@@ -21,6 +31,11 @@ on:
 
 permissions:
   contents: write
+
+# A newer push to the same branch replaces a build still in progress.
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   dmg:
@@ -33,13 +48,22 @@ jobs:
       - name: Rust toolchain
         run: rustup update stable && rustup default stable
       - name: Build
-        run: hack/macos-app.sh --dmg
+        env:
+          SKIFF_BUILD: ${{ github.run_number }}
+          SKIFF_UPDATE_REPO: ${{ github.repository }}
+        run: |
+          hack/macos-app.sh --dmg
+          # What the in-app updater downloads (ditto keeps the signature).
+          ditto -c -k --keepParent target/release/Skiff.app \
+            "target/release/Skiff-macos-arm64-build-${{ github.run_number }}.zip"
       - name: The binary starts
         run: target/release/Skiff.app/Contents/MacOS/Skiff --version
       - uses: actions/upload-artifact@v4
         with:
           name: Skiff-macos-arm64
-          path: target/release/Skiff-*.dmg
+          path: |
+            target/release/Skiff-*.dmg
+            target/release/Skiff-macos-arm64-build-*.zip
           if-no-files-found: error
       # After the upload, so that a failure here still leaves the image.
       - name: The app opens a window and draws a frame
@@ -61,9 +85,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" target/release/Skiff-*.dmg \
+          gh release create "$GITHUB_REF_NAME" target/release/Skiff-*.dmg target/release/Skiff-macos-arm64-build-*.zip \
             --title "Skiff $GITHUB_REF_NAME" \
             --notes "Skiff for Apple Silicon Macs. The app is not notarized by Apple: after copying it to Applications, allow it once under System Settings > Privacy & Security (Open Anyway), or run: xattr -dr com.apple.quarantine /Applications/Skiff.app"
+
+      - name: Publish the build for in-app updates
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          git log -1 --format='%B' > notes.md
+          gh release create "build-$BUILD" target/release/Skiff-macos-arm64-build-*.zip target/release/Skiff-*.dmg \
+            --target "$GITHUB_SHA" --title "Skiff $version (build $BUILD)" --notes-file notes.md --latest
+          # Keep the newest 10 builds.
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("build-"))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' |
+            while read -r tag; do gh release delete "$tag" --yes --cleanup-tag; done
 
   tests:
     name: Unit tests on macOS

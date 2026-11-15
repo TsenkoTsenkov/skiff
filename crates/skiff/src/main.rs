@@ -34,7 +34,10 @@ fn parse_args() -> Result<AppOptions, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                let _ = writeln!(std::io::stdout(), "skiff {}", env!("CARGO_PKG_VERSION"));
+                let _ = match skiff::update::build_number() {
+                    0 => writeln!(std::io::stdout(), "skiff {}", env!("CARGO_PKG_VERSION")),
+                    n => writeln!(std::io::stdout(), "skiff {} (build {n})", env!("CARGO_PKG_VERSION")),
+                };
                 std::process::exit(0);
             }
             // (What the macOS launcher may add when the app is opened
