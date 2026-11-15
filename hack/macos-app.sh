@@ -36,6 +36,8 @@ fi
 cargo build --release
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# Set by the release workflow (its run number); 0 for a local build.
+build="${SKIFF_BUILD:-0}"
 app=target/release/Skiff.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -52,7 +54,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>Skiff</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleVersion</key><string>${version}</string>
+  <key>CFBundleVersion</key><string>${build}</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>

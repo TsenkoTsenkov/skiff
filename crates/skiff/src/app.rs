@@ -140,6 +140,10 @@ pub struct SkiffApp {
     cache: ViewCache,
     pub detail: Option<Detail>,
     pub dock: Dock,
+    updater: crate::update::Updater,
+    /// The user asked for the current update check (so "up to date" is
+    /// worth saying).
+    update_check_asked: bool,
     pub palette: Option<PaletteState>,
     toasts: Vec<Toast>,
     pending: Vec<Pending>,
@@ -295,7 +299,9 @@ impl SkiffApp {
             .storage
             .and_then(|s| eframe::get_value(s, "skiff"))
             .unwrap_or_default();
-        Self::build(&cc.egui_ctx, opts, saved)
+        let mut app = Self::build(&cc.egui_ctx, opts, saved);
+        app.updater.enable();
+        app
     }
 
     /// Construct without persisted settings (tests, headless rendering).
@@ -328,6 +334,8 @@ impl SkiffApp {
             cache: ViewCache::default(),
             detail: None,
             dock: Dock::default(),
+            updater: Default::default(),
+            update_check_asked: false,
             palette: None,
             toasts: Vec::new(),
             pending: Vec::new(),
@@ -797,6 +805,11 @@ impl SkiffApp {
             Command::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             Command::PortForwards => self.dock.show_forwards(),
             Command::CreateResource => self.open_create_dialog(),
+            Command::CheckForUpdates => {
+                self.updater.enable();
+                self.updater.check_now(ctx);
+                self.update_check_asked = true;
+            }
             Command::Reconnect => {
                 if let Some(s) = self.session() {
                     s.reconnect();
@@ -813,6 +826,7 @@ impl SkiffApp {
         let started = Instant::now();
         let ctx = ui.ctx().clone();
         self.tick = Duration::from_secs(30);
+        self.updater.tick(&ctx);
         // Sampled before anything is drawn: a key that closes a menu this
         // frame was meant for that menu, not for the table underneath.
         self.overlay_at_start = self.overlay_open(&ctx);
@@ -970,10 +984,80 @@ impl SkiffApp {
                         if widgets::icon_button(ui, icons::ICON_ADD, "Create resource from YAML").clicked() {
                             self.open_create_dialog();
                         }
+                        self.update_button(ui);
                         self.connection_badge(ui);
                     });
                 });
             });
+    }
+
+    fn update_button(&mut self, ui: &mut Ui) {
+        use crate::update::{self, State};
+        let pal = self.pal;
+        let ctx = ui.ctx().clone();
+        let state = self.updater.state();
+        if self.update_check_asked {
+            match &state {
+                State::UpToDate => {
+                    self.update_check_asked = false;
+                    self.toast(format!("Skiff is up to date (build {})", update::build_number()), Tone::Ok);
+                }
+                State::Failed(e) => {
+                    self.update_check_asked = false;
+                    self.toast(format!("Couldn't check for updates: {e}"), Tone::Err);
+                }
+                State::Available(_) => self.update_check_asked = false,
+                _ => {}
+            }
+        }
+        let accent = |text: &str| {
+            egui::Button::new((
+                widgets::icon(icons::ICON_SYSTEM_UPDATE_ALT, 16.0).color(pal.bg),
+                RichText::new(text).color(pal.bg),
+            ))
+            .fill(pal.accent)
+            .min_size(Vec2::new(0.0, 28.0))
+        };
+        match state {
+            State::Available(r) | State::DownloadFailed(r, _) => {
+                let failed = match self.updater.state() {
+                    State::DownloadFailed(_, e) => Some(e),
+                    _ => None,
+                };
+                let mut tip = format!("{} is available (you have build {}).", r.title, update::build_number());
+                if !r.notes.trim().is_empty() {
+                    let notes: String = r.notes.lines().take(12).collect::<Vec<_>>().join("\n");
+                    tip.push_str(&format!("\n\n{notes}"));
+                }
+                if let Some(e) = &failed {
+                    tip.push_str(&format!("\n\nLast attempt failed: {e}"));
+                }
+                let label = if failed.is_some() { "Retry update" } else { "Update" };
+                if ui.add(accent(label)).on_hover_text(tip).clicked() {
+                    if update::can_install() {
+                        self.updater.download(&ctx, r);
+                    } else {
+                        ctx.open_url(egui::OpenUrl::new_tab(r.page));
+                    }
+                }
+            }
+            State::Downloading(_) => {
+                ui.label(RichText::new("Downloading update…").color(pal.muted).size(12.0));
+                ui.spinner();
+            }
+            State::Ready { release, .. } => {
+                let resp = ui
+                    .add(accent("Restart to update"))
+                    .on_hover_text(format!("{} is downloaded. Skiff restarts into it.", release.title));
+                if resp.clicked() && !self.blocked_by_edit() {
+                    match self.updater.apply() {
+                        Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => self.toast(e, Tone::Err),
+                    }
+                }
+            }
+            State::Idle | State::Checking | State::UpToDate | State::Failed(_) => {}
+        }
     }
 
     fn connection_badge(&mut self, ui: &mut Ui) {
