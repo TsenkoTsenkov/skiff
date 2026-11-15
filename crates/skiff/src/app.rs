@@ -16,8 +16,9 @@ use skiff_core::{
     ResourceKey, Row, Session, Tone, BUILTINS,
 };
 
-use crate::detail::{Detail, DetailAction};
+use crate::detail::{Detail, DetailAction, DetailTab};
 use crate::dock::Dock;
+use crate::keymap::{Action, Keymap};
 use crate::overview;
 use crate::palette::{self, Command, PaletteState};
 use crate::table_view::{self, RowAction, TableUi, ViewCache};
@@ -53,6 +54,24 @@ impl StartupTrace {
 pub enum View {
     Overview,
     Resource(ResourceKey),
+}
+
+/// Which pane keyboard navigation (see [`Keymap`]) acts on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NavFocus {
+    /// The sidebar: up / down move a cursor over its entries.
+    Sidebar,
+    /// The table (and the detail panel next to it).
+    #[default]
+    Main,
+}
+
+/// A sidebar entry the keyboard can land on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NavItem {
+    View(View),
+    /// A collapsible API group of custom resources.
+    Group(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,6 +190,14 @@ pub struct SkiffApp {
     pointer_used: bool,
     /// (context, resource id) pairs whose cluster-wide list was refused.
     forbidden: std::collections::HashSet<(String, String)>,
+    pub keymap: Keymap,
+    pub nav_focus: NavFocus,
+    /// The sidebar entry under the keyboard cursor (while it has focus).
+    sidebar_cursor: Option<NavItem>,
+    /// Scroll the sidebar cursor into view on the next frame.
+    sidebar_scroll: bool,
+    /// Where the sidebar was drawn last frame.
+    sidebar_rect: Option<egui::Rect>,
 }
 
 pub fn kind_icon(key: &ResourceKey) -> MaterialIcon {
@@ -218,7 +245,33 @@ pub fn kind_title(key: &ResourceKey) -> String {
     }
 }
 
-fn nav_row(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, label: &str, selected: bool, indent: f32) -> Response {
+/// Custom resource types discovery found that have no fixed place in the
+/// sidebar, grouped by API group, in sidebar order.
+fn custom_group_list(found: &[skiff_core::Discovered]) -> Vec<(String, Vec<ResourceKey>)> {
+    let mut groups: Vec<(String, Vec<ResourceKey>)> = Vec::new();
+    for d in found {
+        if kinds::builtin(&d.key.group, &d.key.plural).is_some() {
+            continue;
+        }
+        let g: &str = if d.key.group.is_empty() { "core" } else { &d.key.group };
+        match groups.last_mut() {
+            Some((name, list)) if name == g => list.push(d.key.clone()),
+            _ => groups.push((g.to_string(), vec![d.key.clone()])),
+        }
+    }
+    groups
+}
+
+/// A sidebar row; `cursor` draws the keyboard cursor around it.
+fn nav_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    ic: MaterialIcon,
+    label: &str,
+    selected: bool,
+    indent: f32,
+    cursor: bool,
+) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let bg = if selected {
@@ -230,7 +283,10 @@ fn nav_row(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, label: &str, selected: 
         };
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::same(6), bg);
-        let fg = if selected || resp.hovered() { pal.text } else { pal.muted };
+        if cursor {
+            p.rect_stroke(rect.shrink(0.5), CornerRadius::same(6), Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+        }
+        let fg = if selected || resp.hovered() || cursor { pal.text } else { pal.muted };
         let icon_color = if selected { pal.accent } else { pal.faint };
         p.text(
             egui::pos2(rect.left() + 10.0 + indent, rect.center().y),
@@ -301,6 +357,11 @@ impl SkiffApp {
             .unwrap_or_default();
         let mut app = Self::build(&cc.egui_ctx, opts, saved);
         app.updater.enable();
+        let (keymap, error) = Keymap::load();
+        app.keymap = keymap;
+        if let Some(e) = error {
+            app.toast(format!("Key bindings: {e}"), Tone::Warn);
+        }
         app
     }
 
@@ -354,6 +415,11 @@ impl SkiffApp {
             shell_had_keyboard: false,
             pointer_used: false,
             forbidden: std::collections::HashSet::new(),
+            keymap: Keymap::default(),
+            nav_focus: NavFocus::Main,
+            sidebar_cursor: None,
+            sidebar_scroll: false,
+            sidebar_rect: None,
         };
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
         let initial = opts
@@ -921,11 +987,53 @@ impl SkiffApp {
         if busy {
             return;
         }
+        // A click outside the sidebar takes the keyboard back to the table.
+        if self.nav_focus == NavFocus::Sidebar {
+            let elsewhere = ctx.input(|i| {
+                i.pointer.any_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| !self.sidebar_rect.is_some_and(|r| r.contains(p)))
+            });
+            if elsewhere || !self.sidebar_open {
+                self.nav_focus = NavFocus::Main;
+            }
+        }
         // Only where a filter box is actually drawn.
-        if ctx.input(|i| i.key_pressed(Key::Slash)) && matches!(self.view, View::Resource(_)) && self.session().is_some() {
+        if ctx.input(|i| self.keymap.pressed(i, Action::Filter))
+            && matches!(self.view, View::Resource(_))
+            && self.session().is_some()
+        {
             self.focus_filter = true;
-            // Don't let the "/" itself land in the filter box.
-            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/")));
+            self.nav_focus = NavFocus::Main;
+            // Don't let the key itself land in the filter box.
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+        }
+        if self.nav_focus == NavFocus::Sidebar {
+            self.sidebar_keys(ctx);
+            return;
+        }
+        if ctx.input(|i| self.keymap.pressed(i, Action::FocusLeft)) {
+            self.nav_focus = NavFocus::Sidebar;
+            self.sidebar_open = true;
+            self.sidebar_cursor = Some(self.current_nav_item());
+            self.sidebar_scroll = true;
+            return;
+        }
+        if let Some(d) = self.detail.as_mut() {
+            let tabs = [DetailTab::Overview, DetailTab::Yaml, DetailTab::Events];
+            let at = tabs.iter().position(|t| *t == d.tab).unwrap_or(0);
+            let step = ctx.input(|i| {
+                if self.keymap.pressed(i, Action::NextTab) {
+                    Some(1)
+                } else if self.keymap.pressed(i, Action::PrevTab) {
+                    Some(tabs.len() - 1)
+                } else {
+                    None
+                }
+            });
+            // An edit in progress keeps the YAML tab.
+            if let Some(step) = step.filter(|_| !d.has_unsaved_edit()) {
+                d.tab = tabs[(at + step) % tabs.len()];
+            }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             if let Some(d) = self.detail.as_mut().filter(|d| d.editing()) {
@@ -941,6 +1049,93 @@ impl SkiffApp {
                     t.filter.clear();
                 }
             }
+        }
+    }
+
+    /// The sidebar entry for the current view.
+    fn current_nav_item(&self) -> NavItem {
+        NavItem::View(self.view.clone())
+    }
+
+    /// Whether a custom resource group is expanded in the sidebar.
+    fn group_open(&self, group: &str, keys: &[ResourceKey]) -> bool {
+        let has_current = matches!(&self.view, View::Resource(k) if keys.contains(k));
+        *self.nav_open.get(group).unwrap_or(&false) || has_current
+    }
+
+    /// Sidebar entries in the order they are drawn.
+    fn nav_items(&self) -> Vec<NavItem> {
+        let mut items = vec![NavItem::View(View::Overview)];
+        for cat in Category::ALL {
+            items.extend(BUILTINS.iter().filter(|b| b.category == cat).map(|b| NavItem::View(View::Resource(b.key()))));
+            if cat == Category::Custom {
+                if let Some(found) = self.session().map(|s| s.discovered()) {
+                    for (group, keys) in custom_group_list(&found) {
+                        let open = self.group_open(&group, &keys);
+                        items.push(NavItem::Group(group));
+                        if open {
+                            items.extend(keys.into_iter().map(|k| NavItem::View(View::Resource(k))));
+                        }
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    /// Keyboard navigation while the sidebar has focus.
+    fn sidebar_keys(&mut self, ctx: &egui::Context) {
+        let items = self.nav_items();
+        if items.is_empty() {
+            return;
+        }
+        let km = &self.keymap;
+        let (step, open, back) = ctx.input(|i| {
+            let step: Option<i64> = if km.pressed(i, Action::Down) {
+                Some(1)
+            } else if km.pressed(i, Action::Up) {
+                Some(-1)
+            } else if km.pressed(i, Action::PageDown) {
+                Some(10)
+            } else if km.pressed(i, Action::PageUp) {
+                Some(-10)
+            } else if km.pressed(i, Action::Top) {
+                Some(i64::MIN / 2)
+            } else if km.pressed(i, Action::Bottom) {
+                Some(i64::MAX / 2)
+            } else {
+                None
+            };
+            let open = km.pressed(i, Action::Open) || km.pressed(i, Action::FocusRight);
+            (step, open, i.key_pressed(Key::Escape))
+        });
+        let cur = self.sidebar_cursor.clone().unwrap_or_else(|| self.current_nav_item());
+        let at = items.iter().position(|it| *it == cur).unwrap_or(0);
+        if let Some(step) = step {
+            let next = (at as i64).saturating_add(step).clamp(0, items.len() as i64 - 1) as usize;
+            self.sidebar_cursor = Some(items[next].clone());
+            self.sidebar_scroll = true;
+        }
+        if open {
+            match items.get(at).cloned() {
+                Some(NavItem::Group(g)) => {
+                    let keys = self
+                        .session()
+                        .map(|s| custom_group_list(&s.discovered()))
+                        .and_then(|gs| gs.into_iter().find(|(n, _)| *n == g))
+                        .map(|(_, k)| k)
+                        .unwrap_or_default();
+                    let open = self.group_open(&g, &keys);
+                    self.nav_open.insert(g, !open);
+                }
+                Some(NavItem::View(v)) => {
+                    self.go(v);
+                    self.nav_focus = NavFocus::Main;
+                }
+                None => {}
+            }
+        } else if back {
+            self.nav_focus = NavFocus::Main;
         }
     }
 
@@ -1271,7 +1466,14 @@ impl SkiffApp {
         let mut go: Option<View> = None;
         let discovered = self.session().map(|s| s.discovered());
         let mut open = self.sidebar_open;
-        Panel::left("sidebar")
+        let cursor = (self.nav_focus == NavFocus::Sidebar).then(|| self.sidebar_cursor.clone()).flatten();
+        let scroll = std::mem::take(&mut self.sidebar_scroll);
+        let mark = |resp: &Response, item: &NavItem| {
+            if scroll && cursor.as_ref() == Some(item) {
+                resp.scroll_to_me(None);
+            }
+        };
+        let shown = Panel::left("sidebar")
             .resizable(true)
             .default_size(214.0)
             .size_range(168.0..=340.0)
@@ -1279,7 +1481,18 @@ impl SkiffApp {
             .show_collapsible(ui, &mut open, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    if nav_row(ui, &pal, icons::ICON_DASHBOARD, "Overview", self.view == View::Overview, 0.0).clicked() {
+                    let item = NavItem::View(View::Overview);
+                    let r = nav_row(
+                        ui,
+                        &pal,
+                        icons::ICON_DASHBOARD,
+                        "Overview",
+                        self.view == View::Overview,
+                        0.0,
+                        cursor.as_ref() == Some(&item),
+                    );
+                    mark(&r, &item);
+                    if r.clicked() {
                         go = Some(View::Overview);
                     }
                     for cat in Category::ALL {
@@ -1293,51 +1506,70 @@ impl SkiffApp {
                             let key = b.key();
                             let selected = matches!(&self.view, View::Resource(k) if k == &key);
                             let title = if cat == Category::Custom { "Definitions" } else { b.title };
-                            if nav_row(ui, &pal, kind_icon(&key), title, selected, 0.0).clicked() {
+                            let item = NavItem::View(View::Resource(key.clone()));
+                            let r = nav_row(
+                                ui,
+                                &pal,
+                                kind_icon(&key),
+                                title,
+                                selected,
+                                0.0,
+                                cursor.as_ref() == Some(&item),
+                            );
+                            mark(&r, &item);
+                            if r.clicked() {
                                 go = Some(View::Resource(key));
                             }
                         }
                         if cat == Category::Custom {
                             if let Some(found) = &discovered {
-                                self.custom_groups(ui, found, &mut go);
+                                self.custom_groups(ui, found, &mut go, cursor.as_ref(), scroll);
                             }
                         }
                     }
                     ui.add_space(12.0);
                 });
             });
+        self.sidebar_rect = shown.map(|s| s.response.rect);
         self.sidebar_open = open;
         if let Some(v) = go {
             self.go(v);
+            self.nav_focus = NavFocus::Main;
         }
     }
 
     /// Everything discovery found that has no fixed place, grouped by API group.
-    fn custom_groups(&mut self, ui: &mut Ui, found: &[skiff_core::Discovered], go: &mut Option<View>) {
+    fn custom_groups(
+        &mut self,
+        ui: &mut Ui,
+        found: &[skiff_core::Discovered],
+        go: &mut Option<View>,
+        cursor: Option<&NavItem>,
+        scroll: bool,
+    ) {
         let pal = self.pal;
-        let mut groups: Vec<(&str, Vec<&ResourceKey>)> = Vec::new();
-        for d in found {
-            if kinds::builtin(&d.key.group, &d.key.plural).is_some() {
-                continue;
+        let mark = |resp: &Response, item: &NavItem| {
+            if scroll && cursor == Some(item) {
+                resp.scroll_to_me(None);
             }
-            let g: &str = if d.key.group.is_empty() { "core" } else { &d.key.group };
-            match groups.last_mut() {
-                Some((name, list)) if *name == g => list.push(&d.key),
-                _ => groups.push((g, vec![&d.key])),
-            }
-        }
-        for (group, keys) in groups {
-            let has_current = matches!(&self.view, View::Resource(k) if keys.contains(&k));
-            let open = *self.nav_open.get(group).unwrap_or(&false) || has_current;
+        };
+        for (group, keys) in custom_group_list(found) {
+            let open = self.group_open(&group, &keys);
             let chevron = if open { icons::ICON_EXPAND_MORE } else { icons::ICON_CHEVRON_RIGHT };
-            if nav_row(ui, &pal, chevron, group, false, 0.0).clicked() {
-                self.nav_open.insert(group.to_string(), !open);
+            let item = NavItem::Group(group.clone());
+            let r = nav_row(ui, &pal, chevron, &group, false, 0.0, cursor == Some(&item));
+            mark(&r, &item);
+            if r.clicked() {
+                self.nav_open.insert(group.clone(), !open);
             }
             if open {
                 for key in keys {
-                    let selected = matches!(&self.view, View::Resource(k) if k == key);
-                    if nav_row(ui, &pal, kind_icon(key), &key.kind, selected, 12.0).clicked() {
-                        *go = Some(View::Resource(key.clone()));
+                    let selected = matches!(&self.view, View::Resource(k) if k == &key);
+                    let item = NavItem::View(View::Resource(key.clone()));
+                    let r = nav_row(ui, &pal, kind_icon(&key), &key.kind, selected, 12.0, cursor == Some(&item));
+                    mark(&r, &item);
+                    if r.clicked() {
+                        *go = Some(View::Resource(key));
                     }
                 }
             }
@@ -1574,21 +1806,26 @@ impl SkiffApp {
         // While unsaved YAML edits are open the selection stays put: moving
         // it would be refused anyway, one toast per key press.
         let editing = self.detail.as_ref().is_some_and(|d| d.has_unsaved_edit());
-        let typing = ctx.text_edit_focused() || overlay || self.terminal_focused || editing;
+        let typing = ctx.text_edit_focused()
+            || overlay
+            || self.terminal_focused
+            || editing
+            || self.nav_focus != NavFocus::Main;
         let mut open_selected = false;
         if !typing {
+            let km = &self.keymap;
             let step: Option<i64> = ctx.input(|i| {
-                if i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::J) {
+                if km.pressed(i, Action::Down) {
                     Some(1)
-                } else if i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::K) {
+                } else if km.pressed(i, Action::Up) {
                     Some(-1)
-                } else if i.key_pressed(Key::PageDown) {
+                } else if km.pressed(i, Action::PageDown) {
                     Some(20)
-                } else if i.key_pressed(Key::PageUp) {
+                } else if km.pressed(i, Action::PageUp) {
                     Some(-20)
-                } else if i.key_pressed(Key::Home) {
+                } else if km.pressed(i, Action::Top) {
                     Some(i64::MIN / 2)
-                } else if i.key_pressed(Key::End) {
+                } else if km.pressed(i, Action::Bottom) {
                     Some(i64::MAX / 2)
                 } else {
                     None
@@ -1606,7 +1843,7 @@ impl SkiffApp {
                     open_selected = self.detail.is_some();
                 }
             }
-            if ctx.input(|i| i.key_pressed(Key::Enter)) {
+            if ctx.input(|i| km.pressed(i, Action::Open) || km.pressed(i, Action::FocusRight)) {
                 open_selected = true;
             }
         }

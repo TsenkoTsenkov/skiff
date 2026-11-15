@@ -4,6 +4,7 @@ pub mod app;
 pub mod detail;
 pub mod dock;
 pub mod external;
+pub mod keymap;
 pub mod log_text;
 pub mod overview;
 pub mod palette;
@@ -14,4 +15,4 @@ pub mod theme;
 pub mod update;
 pub mod widgets;
 
-pub use app::{AppOptions, SkiffApp, View};
+pub use app::{AppOptions, NavFocus, SkiffApp, View};
