@@ -174,17 +174,56 @@ yet.
 
 ## Keyboard
 
+Moving around is vim-style by default, and every movement key can be
+changed (see below).
+
 | Key | Action |
 | --- | --- |
 | `Ctrl/Cmd+K` | Command palette |
 | `/` | Focus the table filter |
-| `↑` `↓` or `j` `k` | Move the selection |
-| `PgUp` `PgDn` `Home` `End` | Move further |
-| `Enter` | Open details |
-| `Esc` | Close details / clear the filter |
+| `j` `k` or `↓` `↑` | Move the selection (table rows, or sidebar entries) |
+| `Ctrl+d` `Ctrl+u` or `PgDn` `PgUp` | Move further |
+| `g` `G` or `Home` `End` | Go to the first / last entry |
+| `h` or `←` | Move to the sidebar |
+| `l` or `→` | From the sidebar: open the entry and go back to the table. From the table: open details |
+| `Enter` | Open (details, or a sidebar entry) |
+| `]` `[` | Next / previous tab of the details panel |
+| `Esc` | Leave the sidebar / close details / clear the filter |
 | `Ctrl/Cmd+S` | Apply (while editing YAML) |
 
 Right-click a row for its actions.
+
+In the sidebar, the entry under the keyboard is outlined; moving over
+entries does not switch views until you open one. A click anywhere else
+gives the keyboard back to the table.
+
+### Custom key bindings
+
+Bindings are read at startup from `~/.config/skiff/keys.json` (or
+`$XDG_CONFIG_HOME/skiff/keys.json`, or the file named by `$SKIFF_KEYMAP`).
+It maps actions to lists of keys; actions it leaves out keep their
+defaults, and `[]` unbinds one. For example, to use the Colemak home row
+and keep the arrows:
+
+```json
+{
+  "down": ["n", "ArrowDown"],
+  "up": ["e", "ArrowUp"],
+  "focus_left": ["h", "ArrowLeft"],
+  "focus_right": ["i", "ArrowRight"]
+}
+```
+
+Actions: `down`, `up`, `page_down`, `page_up`, `top`, `bottom`, `open`,
+`focus_left`, `focus_right`, `next_tab`, `prev_tab`, `filter`.
+
+Keys are written as `j`, `ArrowDown`, `PageUp`, `Home`, `Enter`, `Space`,
+`/`, `[`, `F5` and so on, optionally after modifiers joined with `+`:
+`Ctrl+d`, `Shift+g`, `Alt+j`, `Cmd+j` (`Cmd` is `Ctrl` on Linux and
+Windows). A single capital letter includes Shift: `G` is `Shift+g`. A key
+binds only with exactly the modifiers given, so `j` does not also fire on
+`Ctrl+j`. If the file has mistakes, Skiff says so when it starts and uses
+the parts it understood.
 
 In a shell, keys go to the shell and nowhere else (including `Esc`, `Tab`,
 `Ctrl+K` and `Ctrl+S`). `Ctrl+Shift+C` copies the selection and
