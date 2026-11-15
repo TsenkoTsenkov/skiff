@@ -17,6 +17,44 @@ use crate::util::{friendly, Notifier};
 
 const MAX_LINES: usize = 100_000;
 const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Like `read_until(b'\n')`, but keeps at most `cap` bytes of a line in
+/// `buf` and drops the rest of it: a container that prints for hours without
+/// a newline (progress bars, binary output) must not grow the buffer without
+/// end. Partial data stays in `buf` when the future is cancelled (nothing is
+/// consumed from the reader without being accounted for first), so a timeout
+/// around it loses nothing. Returns the bytes read (0 at the end of input).
+async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> std::io::Result<usize>
+where
+    R: futures::AsyncBufRead + Unpin,
+{
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let (chunk, done) = match available.iter().position(|b| *b == b'\n') {
+            Some(i) => (&available[..=i], true),
+            None => (available, false),
+        };
+        let n = chunk.len();
+        let room = cap.saturating_sub(buf.len());
+        if room >= n {
+            buf.extend_from_slice(chunk);
+        } else {
+            buf.extend_from_slice(&chunk[..room]);
+            if done {
+                buf.push(b'\n');
+            }
+        }
+        reader.consume_unpin(n);
+        total += n;
+        if done {
+            return Ok(total);
+        }
+    }
+}
 /// Consecutive failed attempts (connections that could not be made, or that
 /// ended at once with nothing new) before a follow stream gives up.
 const MAX_RETRIES: u32 = 30;
@@ -478,13 +516,13 @@ async fn pump(
                 connected_once = true;
                 shared.set_state(idx, SourceState::Streaming);
                 notify.ping();
-                futures::pin_mut!(reader);
+                let mut reader = Box::pin(reader);
                 let mut buf = Vec::with_capacity(1024);
                 loop {
                     // `read_until` keeps partial data in `buf` when it is
                     // cancelled, so the timeout loses nothing.
                     let wait = if unannounced { PING_INTERVAL } else { Duration::from_secs(3600) };
-                    let read = tokio::time::timeout(wait, reader.read_until(b'\n', &mut buf)).await;
+                    let read = tokio::time::timeout(wait, read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)).await;
                     match read {
                         Err(_elapsed) => {}
                         Ok(Ok(_)) if buf.last() == Some(&b'\n') => {
@@ -596,6 +634,24 @@ pub(crate) fn open(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn endless_lines_are_capped() {
+        let mut input: Vec<u8> = vec![b'x'; 300_000];
+        input.extend_from_slice(b"\nnext\n");
+        let mut reader = futures::io::Cursor::new(input);
+        let mut buf = Vec::new();
+        let n = futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap();
+        assert_eq!(n, 300_001, "the whole line is consumed");
+        assert_eq!(buf.len(), 1025, "but only the cap is kept, plus the newline");
+        assert_eq!(buf.last(), Some(&b'\n'));
+        buf.clear();
+        futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap();
+        assert_eq!(buf, b"next\n");
+        buf.clear();
+        assert_eq!(futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap(), 0);
+    }
+
     use super::*;
 
     #[test]

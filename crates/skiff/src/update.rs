@@ -94,6 +94,11 @@ impl Updater {
         self.enabled = cfg!(target_os = "macos") && std::env::var_os("SKIFF_NO_UPDATE_CHECK").is_none();
     }
 
+    /// Stops automatic checks (an explicit "check now" still works).
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
     pub fn state(&self) -> State {
         self.state.lock().map(|s| s.clone()).unwrap_or(State::Idle)
     }
@@ -186,14 +191,26 @@ fn curl(url: &str, accept: &str, token: Option<&str>, out_file: Option<&Path>) -
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "--max-time", "600", "-H", &format!("Accept: {accept}")]);
     cmd.args(["-H", "X-GitHub-Api-Version: 2022-11-28", "-A", "skiff-updater"]);
-    if let Some(t) = token {
-        cmd.args(["-H", &format!("Authorization: Bearer {t}")]);
+    // The token goes in through stdin (`-H @-`), not the command line,
+    // where any local user could read it with `ps`.
+    if token.is_some() {
+        cmd.args(["-H", "@-"]);
     }
     if let Some(f) = out_file {
         cmd.arg("-o").arg(f);
     }
     cmd.arg(url);
-    let out = cmd.stdin(Stdio::null()).output().map_err(|e| format!("could not run curl: {e}"))?;
+    let out = match token {
+        None => cmd.stdin(Stdio::null()).output(),
+        Some(t) => cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(format!("Authorization: Bearer {t}\n").as_bytes())?;
+            }
+            child.wait_with_output()
+        }),
+    }
+    .map_err(|e| format!("could not run curl: {e}"))?;
     if out.status.success() {
         Ok(out.stdout)
     } else {

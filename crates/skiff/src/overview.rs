@@ -53,6 +53,22 @@ fn loading(snap: &Snapshot) -> bool {
     matches!(snap.state, LoadState::Connecting | LoadState::Loading)
 }
 
+/// Why a list has nothing to show, when it failed (no permission to list
+/// cluster-wide, cluster unreachable): an empty list then means "unknown",
+/// never "all healthy".
+fn failure(snap: &Snapshot) -> Option<&'static str> {
+    (snap.state == LoadState::Failed && snap.rows.is_empty())
+        .then_some(if snap.error_code == 403 { "no permission to list" } else { "couldn't load" })
+}
+
+/// Card figures, unless the list failed.
+fn figures(snap: &Snapshot, count: String, sub: String, tone: Tone) -> (String, String, Tone) {
+    match failure(snap) {
+        Some(why) => ("—".to_string(), why.to_string(), Tone::Err),
+        None => (count, sub, tone),
+    }
+}
+
 fn status_text<'a>(snap: &'a Snapshot, row: &'a Row) -> &'a str {
     snap.columns
         .iter()
@@ -102,7 +118,8 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             let sub = if node_bad == 0 { "all ready".to_string() } else { format!("{node_bad} not ready / cordoned") };
             let tone = if node_bad == 0 { Tone::Ok } else { Tone::Warn };
-            if card(ui, pal, "Nodes", &nodes.rows.len().to_string(), &sub, tone, loading(&nodes)) {
+            let (n, sub, tone) = figures(&nodes, nodes.rows.len().to_string(), sub, tone);
+            if card(ui, pal, "Nodes", &n, &sub, tone, loading(&nodes)) {
                 action = Some(Action::Go(k_nodes.clone()));
             }
             let (sub, tone) = match (pod_err, pod_warn) {
@@ -111,17 +128,20 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
                 (e, 0) => (format!("{e} failing"), Tone::Err),
                 (e, w) => (format!("{e} failing, {w} pending"), Tone::Err),
             };
-            if card(ui, pal, "Pods", &widgets::thousands(pod_rows.len()), &sub, tone, loading(&pods)) {
+            let (n, sub, tone) = figures(&pods, widgets::thousands(pod_rows.len()), sub, tone);
+            if card(ui, pal, "Pods", &n, &sub, tone, loading(&pods)) {
                 action = Some(Action::Go(k_pods.clone()));
             }
             let sub = if dep_bad == 0 { "all available".to_string() } else { format!("{dep_bad} degraded") };
             let tone = if dep_bad == 0 { Tone::Ok } else { Tone::Warn };
-            if card(ui, pal, "Deployments", &widgets::thousands(dep_rows.len()), &sub, tone, loading(&deploys)) {
+            let (n, sub, tone) = figures(&deploys, widgets::thousands(dep_rows.len()), sub, tone);
+            if card(ui, pal, "Deployments", &n, &sub, tone, loading(&deploys)) {
                 action = Some(Action::Go(k_deploy.clone()));
             }
             let sub = if warn_events.is_empty() { "no warnings".to_string() } else { "in the last hour".to_string() };
             let tone = if warn_events.is_empty() { Tone::Ok } else { Tone::Warn };
-            if card(ui, pal, "Warning events", &widgets::thousands(warn_events.len()), &sub, tone, loading(&events)) {
+            let (n, sub, tone) = figures(&events, widgets::thousands(warn_events.len()), sub, tone);
+            if card(ui, pal, "Warning events", &n, &sub, tone, loading(&events)) {
                 action = Some(Action::Go(k_events.clone()));
             }
         });
@@ -172,7 +192,26 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
         ui.add_space(16.0);
         widgets::caption(ui, &format!("Needs attention · {}", problems.len()), pal);
         ui.add_space(4.0);
-        if problems.is_empty() {
+        let unknown: Vec<&str> = [("nodes", &nodes), ("pods", &pods), ("deployments", &deploys), ("events", &events)]
+            .iter()
+            .filter(|(_, s)| failure(s).is_some())
+            .map(|(name, _)| *name)
+            .collect();
+        let complete = [&nodes, &pods, &deploys, &events]
+            .iter()
+            .all(|s| matches!(s.state, LoadState::Live | LoadState::Polling));
+        if !unknown.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(widgets::icon(icons::ICON_ERROR, 16.0).color(pal.warn));
+                ui.label(
+                    RichText::new(format!(
+                        "Couldn't list {} cluster-wide, so this page can't say whether they are healthy. If your account is limited to a namespace, open that namespace's views instead.",
+                        unknown.join(", ")
+                    ))
+                    .color(pal.muted),
+                );
+            });
+        } else if problems.is_empty() && complete {
             ui.horizontal(|ui| {
                 ui.label(widgets::icon(icons::ICON_CHECK_CIRCLE, 16.0).color(pal.ok));
                 ui.label(RichText::new("Nothing is failing in the selected scope.").color(pal.muted));

@@ -113,8 +113,22 @@ pub(crate) async fn start(
     let h = handle.clone();
     let task = handle.spawn(async move {
         loop {
-            let Ok((conn, _)) = listener.accept().await else { break };
+            let accepted = listener.accept().await;
             let Some(fwd) = weak.upgrade() else { break };
+            let conn = match accepted {
+                Ok((conn, _)) => conn,
+                Err(e) => {
+                    // Usually temporary (out of file descriptors, a
+                    // connection reset before it was accepted): say so and
+                    // keep listening, instead of a forward that looks
+                    // active but answers nothing.
+                    *fwd.last_error.lock() = Some(format!("accepting a connection failed: {e}"));
+                    notify.ping();
+                    drop(fwd);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
             fwd.connections.fetch_add(1, Ordering::Relaxed);
             // Use the session's current client, so forwards keep working
             // across a reconnect.
