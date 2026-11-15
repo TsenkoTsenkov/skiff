@@ -729,9 +729,17 @@ impl Detail {
                     egui::CollapsingHeader::new(RichText::new(widgets::plural(ann.len(), "annotation")).color(pal.muted))
                         .id_salt("annotations")
                         .show(ui, |ui| {
+                            let secret = self.key.is("", "secrets");
                             for (k, val) in ann {
                                 ui.label(RichText::new(k).color(pal.muted).size(12.0));
-                                let text = val.as_str().unwrap_or("");
+                                // `kubectl apply` keeps the whole manifest
+                                // here, plain-text stringData included: on a
+                                // Secret it would show what Reveal hides.
+                                let text = if secret && k == "kubectl.kubernetes.io/last-applied-configuration" {
+                                    "(hidden: holds the secret's values; see the YAML tab)"
+                                } else {
+                                    val.as_str().unwrap_or("")
+                                };
                                 let shown: String = if text.len() > 400 { format!("{}…", &text[..text.floor_char_boundary(400)]) } else { text.to_string() };
                                 ui.add(egui::Label::new(RichText::new(shown).font(theme::mono(11.5))).wrap().selectable(true));
                                 ui.add_space(4.0);
@@ -1336,6 +1344,17 @@ impl Detail {
     fn related_pods(&mut self, ui: &mut Ui, pal: &Palette, actions: &mut Vec<DetailAction>) {
         let Some(pods) = &self.pods else { return };
         widgets::section(ui, &format!("Pods · {}", pods.rows.len()), pal);
+        if self.key.is("", "nodes") && !pods.rows.is_empty() {
+            let label = if pods.rows.len() > 200 {
+                format!("Showing 200 of {}. Open all in the Pods table", pods.rows.len())
+            } else {
+                "Open in the Pods table (filter, sort, select)".to_string()
+            };
+            if ui.link(RichText::new(label).size(12.0)).clicked() {
+                actions.push(DetailAction::Row(RowAction::ShowPods));
+            }
+            ui.add_space(4.0);
+        }
         if pods.rows.is_empty() {
             ui.label(RichText::new("No matching pods").color(pal.muted));
             return;

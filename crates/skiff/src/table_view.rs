@@ -25,17 +25,40 @@ pub struct TableUi {
     pub selected: Option<Box<str>>,
     /// User overrides of default column visibility, by title.
     pub col_visible: HashMap<String, bool>,
+    /// Widths the user dragged columns to, by title. A column without one
+    /// gets its default width (fitted to its content; the name column takes
+    /// the space left over).
+    pub widths: HashMap<String, f32>,
     /// Set to scroll the selected row into view on the next frame.
     pub scroll_to_selected: bool,
-    /// Scroll position and column layout of the last frame, to carry the
-    /// position over when the set of columns (and so the table's stored
-    /// state) changes.
-    pub scroll_y: f32,
-    pub last_cols: usize,
     /// uid of the row the open context menu was opened on.
     pub menu_uid: Option<Box<str>>,
-    /// Bumped to forget the column widths the user dragged.
-    pub widths_generation: u32,
+    /// Default widths fitted to the content, by title, and how complete the
+    /// data was when they were measured.
+    fitted: HashMap<String, f32>,
+    fitted_for: Fit,
+}
+
+impl TableUi {
+    /// Back to the default columns and widths.
+    pub fn reset_columns(&mut self) {
+        self.col_visible.clear();
+        self.widths.clear();
+        self.fitted.clear();
+        self.fitted_for = Fit::None;
+    }
+}
+
+/// How much of a table the fitted widths were measured on. They are measured
+/// on the first rows to arrive, again once the table is complete, and then
+/// left alone: columns that keep changing width under the pointer are worse
+/// than columns that are a little too narrow for a row that arrived later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fit {
+    #[default]
+    None,
+    Partial,
+    Complete,
 }
 
 /// A column as displayed: either from the snapshot or computed in the UI.
@@ -60,7 +83,21 @@ fn col_visible(tui: &TableUi, col: &Column) -> bool {
     tui.col_visible.get(&*col.title).copied().unwrap_or(col.visible)
 }
 
-/// Preferred width of a column and whether it absorbs leftover space.
+/// Narrowest a column can be dragged to.
+pub const MIN_COL_WIDTH: f32 = 40.0;
+/// Widest a column can be dragged to.
+pub const MAX_COL_WIDTH: f32 = 1600.0;
+/// Narrowest the flexible (name) column ever gets.
+const MIN_FLEX_WIDTH: f32 = 140.0;
+/// Room the flexible column keeps (up to what its content needs) before
+/// less important columns are left out to make it: names are what a table
+/// is read by.
+const COMFORT_FLEX_WIDTH: f32 = 280.0;
+/// Widest a fitted default gets (a user can drag it wider).
+const MAX_FIT_WIDTH: f32 = 340.0;
+
+/// Fallback width of a column before its content has been measured, and
+/// whether it absorbs leftover space.
 fn preferred_width(col: &Column) -> (f32, bool) {
     let title = col.title.to_ascii_lowercase();
     let w = match (col.source, col.kind) {
@@ -90,10 +127,36 @@ fn preferred_width(col: &Column) -> (f32, bool) {
     (w, false)
 }
 
-fn dcol_width(c: &DCol, snap: &Snapshot) -> (f32, bool) {
+/// Whether a column takes the space the others leave (unless the user has
+/// given it a width).
+fn is_flexible(c: &DCol, snap: &Snapshot) -> bool {
     match c {
-        DCol::Real(i) => preferred_width(&snap.columns[*i]),
-        DCol::PodCpu | DCol::PodMem => (68.0, false),
+        DCol::Real(i) => preferred_width(&snap.columns[*i]).1,
+        _ => false,
+    }
+}
+
+/// Columns whose cells are drawn specially, at a fixed width.
+fn fixed_width(key: &ResourceKey, c: &DCol, snap: &Snapshot) -> Option<f32> {
+    match c {
+        DCol::PodCpu | DCol::PodMem => Some(76.0),
+        // Usage bar and a percentage.
+        DCol::Real(i) if key.is("", "nodes") && matches!(&*snap.columns[*i].title, "CPU" | "Memory") => Some(96.0),
+        DCol::Real(i) if snap.columns[*i].source == ColSource::Age => Some(64.0),
+        _ => None,
+    }
+}
+
+/// The width a column has when the user has not dragged it.
+fn default_width(key: &ResourceKey, c: &DCol, snap: &Snapshot, tui: &TableUi) -> f32 {
+    if let Some(w) = fixed_width(key, c, snap) {
+        return w;
+    }
+    let title = c.title(snap);
+    match (tui.fitted.get(title), c) {
+        (Some(w), _) => *w,
+        (None, DCol::Real(i)) => preferred_width(&snap.columns[*i]).0,
+        (None, _) => 76.0,
     }
 }
 
@@ -120,9 +183,6 @@ fn droppability(c: &DCol, snap: &Snapshot) -> u8 {
     }
 }
 
-/// Columns to draw, in order. When `available` is too narrow for all of
-/// them (e.g. the detail panel is open) the least important ones are left
-/// out instead of clipping the table.
 /// The columns ticked in the column chooser, before any are dropped for
 /// lack of space. Never empty for a table that has columns.
 pub fn chosen_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics) -> Vec<DCol> {
@@ -151,26 +211,201 @@ pub fn chosen_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics
     out
 }
 
-pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
-    let mut out = chosen_columns(key, snap, tui, metrics);
-    const GAP: f32 = 8.0;
-    let mut total: f32 = out.iter().map(|c| dcol_width(c, snap).0 + GAP).sum();
-    while total > available {
-        let victim = out
+/// A column as laid out: what it shows and how wide it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Laid {
+    pub col: DCol,
+    pub width: f32,
+    /// Takes the space the other columns leave.
+    pub flexible: bool,
+}
+
+/// Lays the chosen columns out in `available` points (column gaps of `gap`
+/// included).
+///
+/// Columns keep the width the user gave them, or else their default width;
+/// the flexible column (the name) takes what is left. When that does not
+/// fit (the window is narrow, the detail panel is open), the flexible column
+/// shrinks to its minimum first, then the least important columns are left
+/// out, and only then are the remaining ones squeezed. A table never runs
+/// off the right edge, and a column the user widened is never the reason
+/// another one disappears while they drag (see `max_drag_width`).
+pub fn layout_columns(
+    key: &ResourceKey,
+    snap: &Snapshot,
+    tui: &TableUi,
+    metrics: &Metrics,
+    available: f32,
+    gap: f32,
+) -> Vec<Laid> {
+    let mut cols: Vec<Laid> = chosen_columns(key, snap, tui, metrics)
+        .into_iter()
+        .map(|c| {
+            let user = tui.widths.get(c.title(snap)).copied();
+            let flexible = user.is_none() && is_flexible(&c, snap);
+            let width = user.unwrap_or_else(|| default_width(key, &c, snap, tui));
+            Laid { col: c, width, flexible }
+        })
+        .collect();
+    // What the flexible column needs to be readable: its content, within
+    // limits.
+    let comfort = |l: &Laid| -> f32 {
+        let fit = tui.fitted.get(l.col.title(snap)).copied().unwrap_or(MIN_FLEX_WIDTH);
+        fit.clamp(MIN_FLEX_WIDTH, COMFORT_FLEX_WIDTH)
+    };
+    let need = |cols: &[Laid]| -> f32 {
+        cols.iter().map(|l| if l.flexible { comfort(l) } else { l.width } + gap).sum::<f32>() - gap
+    };
+    while need(&cols) > available {
+        let victim = cols
             .iter()
             .enumerate()
-            .filter(|(_, c)| droppability(c, snap) > 0)
-            .max_by_key(|(i, c)| (droppability(c, snap), *i))
+            .filter(|(_, l)| droppability(&l.col, snap) > 0)
+            .max_by_key(|(i, l)| (droppability(&l.col, snap), *i))
             .map(|(i, _)| i);
         match victim {
-            Some(i) => {
-                total -= dcol_width(&out[i], snap).0 + GAP;
-                out.remove(i);
+            Some(i) if cols.len() > 1 => {
+                cols.remove(i);
             }
-            None => break,
+            _ => break,
         }
     }
+    let fixed: f32 = cols.iter().filter(|l| !l.flexible).map(|l| l.width + gap).sum();
+    let flex_count = cols.iter().filter(|l| l.flexible).count();
+    let gaps_of_flex = gap * flex_count as f32;
+    if flex_count > 0 {
+        let share = ((available - fixed - gaps_of_flex + gap) / flex_count as f32).floor();
+        for l in cols.iter_mut().filter(|l| l.flexible) {
+            l.width = share.max(MIN_FLEX_WIDTH).max(MIN_COL_WIDTH);
+        }
+    }
+    // Still too wide (only columns that are never dropped are left, or the
+    // user made them wide): squeeze everything proportionally.
+    let total: f32 = cols.iter().map(|l| l.width + gap).sum::<f32>() - gap;
+    if total > available && total > 0.0 {
+        let room = (available - gap * cols.len().saturating_sub(1) as f32).max(0.0);
+        let sum: f32 = cols.iter().map(|l| l.width).sum();
+        for l in &mut cols {
+            l.width = (l.width * room / sum).floor().max(MIN_COL_WIDTH.min(l.width));
+        }
+    }
+    cols
+}
+
+/// Kept for callers that only need which columns are shown.
+pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
+    layout_columns(key, snap, tui, metrics, available, 8.0).into_iter().map(|l| l.col).collect()
+}
+
+/// How wide column `index` of `cols` may be dragged without anything else
+/// having to make room: the flexible column gives up space down to its
+/// minimum, and nothing is ever dropped because of a drag.
+pub fn max_drag_width(cols: &[Laid], index: usize, available: f32, gap: f32) -> f32 {
+    let used: f32 = cols
+        .iter()
+        .enumerate()
+        .map(|(i, l)| if l.flexible && i != index { MIN_FLEX_WIDTH.min(l.width) } else { l.width } + gap)
+        .sum::<f32>()
+        - gap;
+    let w = cols.get(index).map(|l| l.width).unwrap_or(0.0);
+    (w + (available - used).max(0.0)).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
+}
+
+/// Widths to store when the boundary after column `index` is dragged by
+/// `delta` points from where it was when the drag started (`start`).
+///
+/// The boundary works like a splitter: what the column gains is taken from
+/// the columns to its right (the next one first, each down to its minimum),
+/// and what it gives up goes to the next column. The boundary therefore
+/// stays under the pointer, columns to the left never move, and the table
+/// keeps its total width. Only the last column, with nothing to its right,
+/// grows into whatever room the flexible column can give.
+/// Flexible columns are not given a width: they take what is left, which
+/// comes out right because the total does not change.
+pub fn drag_widths(start: &[Laid], index: usize, delta: f32, available: f32, gap: f32) -> Vec<(usize, f32)> {
+    let Some(this) = start.get(index) else { return Vec::new() };
+    let min_of = |l: &Laid| if l.flexible { MIN_FLEX_WIDTH.min(l.width) } else { MIN_COL_WIDTH.min(l.width) };
+    let mut out = Vec::new();
+    let put = |out: &mut Vec<(usize, f32)>, i: usize, w: f32| {
+        if !start[i].flexible {
+            out.push((i, w.round()));
+        }
+    };
+    if index + 1 == start.len() {
+        let max = max_drag_width(start, index, available, gap);
+        out.push((index, (this.width + delta).clamp(MIN_COL_WIDTH.min(this.width), max).round()));
+        return out;
+    }
+    if delta >= 0.0 {
+        let mut need = delta;
+        for (j, l) in start.iter().enumerate().skip(index + 1) {
+            if need <= 0.0 {
+                break;
+            }
+            let take = need.min((l.width - min_of(l)).max(0.0));
+            if take > 0.0 {
+                put(&mut out, j, l.width - take);
+                need -= take;
+            }
+        }
+        put(&mut out, index, this.width + delta - need);
+    } else {
+        let give = (-delta).min((this.width - min_of(this)).max(0.0));
+        put(&mut out, index, this.width - give);
+        put(&mut out, index + 1, start[index + 1].width + give);
+    }
     out
+}
+
+/// Measures default widths from the content, the first time a table has
+/// rows and again once it has loaded completely.
+pub fn fit_widths(ui: &Ui, key: &ResourceKey, cache: &ViewCache, tui: &mut TableUi) {
+    let snap = &cache.snap;
+    if snap.rows.is_empty() {
+        return;
+    }
+    let complete = matches!(snap.state, LoadState::Live | LoadState::Polling);
+    let want = if complete { Fit::Complete } else { Fit::Partial };
+    if tui.fitted_for == want || tui.fitted_for == Fit::Complete {
+        return;
+    }
+    tui.fitted_for = want;
+    tui.fitted.clear();
+    // The longest values among a sample of rows (spread over the table so
+    // one namespace's naming does not decide alone); measuring every row of
+    // a 5,000-pod table is not worth it for a default.
+    const SAMPLE: usize = 400;
+    let n = snap.rows.len();
+    let step = (n / SAMPLE).max(1);
+    let body = egui::FontId::proportional(13.0);
+    let header = egui::FontId::proportional(12.0);
+    for col in snap.columns.iter() {
+        if col.source == ColSource::Age {
+            continue;
+        }
+        let mut longest: Vec<&str> = Vec::new();
+        let mut longest_chars = 0usize;
+        for row in snap.rows.iter().step_by(step) {
+            let text = row.text(col);
+            let chars = text.chars().count();
+            if chars > longest_chars {
+                longest_chars = chars;
+                longest.clear();
+            }
+            if chars + 2 >= longest_chars && longest.len() < 6 && !text.is_empty() {
+                longest.push(text);
+            }
+        }
+        let measure = |text: &str, font: &egui::FontId| {
+            ui.painter().layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE).size().x
+        };
+        let content = longest.iter().map(|t| measure(t, &body)).fold(0.0, f32::max);
+        // Room for the sort arrow next to the title.
+        let title = measure(&col.title, &header) + 20.0;
+        let w = (content + 16.0).max(title).clamp(MIN_COL_WIDTH + 8.0, MAX_FIT_WIDTH);
+        tui.fitted.insert(col.title.to_string(), w.ceil());
+    }
+    let _ = key;
 }
 
 /// Filtered + sorted row order, cached across frames.
@@ -202,8 +437,117 @@ impl Default for ViewCache {
     }
 }
 
-fn matches(row: &Row, terms: &[String]) -> bool {
-    terms.iter().all(|t| memfind(row.search.as_bytes(), t.as_bytes()))
+/// One word of the quick filter.
+///
+/// A plain word matches anywhere in the row. `column:value` matches only in
+/// that column (`node:aks-1`, `status:crash`, `ns:kube`; a column title
+/// can be shortened to any prefix, `ns` stands for the namespace and
+/// `label` for the labels). A leading `!` (or `-`) keeps the rows that do
+/// not match, and `column:=value` wants the whole value (so that
+/// `node:=n1` does not also find `n10`). A word whose prefix names no column is matched as plain text,
+/// so `http://…` still finds what it looks like.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Term {
+    pub field: Option<Field>,
+    pub text: String,
+    pub negate: bool,
+    /// `column:=value`: the whole value, not a part of it.
+    pub exact: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Name,
+    Namespace,
+    Labels,
+    Column(usize),
+}
+
+/// Splits the filter into terms against the table's columns.
+pub fn parse_filter(filter: &str, snap: &Snapshot) -> Vec<Term> {
+    filter
+        .to_lowercase()
+        .split_whitespace()
+        .filter_map(|word| {
+            let (negate, word) = match word.strip_prefix('!').or_else(|| word.strip_prefix('-').filter(|w| !w.is_empty())) {
+                Some(rest) => (true, rest),
+                None => (false, word),
+            };
+            if word.is_empty() {
+                return None;
+            }
+            if let Some((key, value)) = word.split_once(':') {
+                if !key.is_empty() {
+                    if let Some(field) = resolve_field(key, snap) {
+                        let (exact, value) = match value.strip_prefix('=') {
+                            Some(v) => (true, v),
+                            None => (false, value),
+                        };
+                        return Some(Term { field: Some(field), text: value.to_string(), negate, exact });
+                    }
+                }
+            }
+            Some(Term { field: None, text: word.to_string(), negate, exact: false })
+        })
+        .collect()
+}
+
+fn resolve_field(key: &str, snap: &Snapshot) -> Option<Field> {
+    match key {
+        "ns" | "namespace" => return Some(Field::Namespace),
+        "name" => return Some(Field::Name),
+        "label" | "labels" | "l" => return Some(Field::Labels),
+        _ => {}
+    }
+    let squash = |t: &str| t.to_lowercase().replace([' ', '-', '_'], "");
+    let key_sq = squash(key);
+    let pick = |c: &Column| match c.source {
+        ColSource::Name => Field::Name,
+        ColSource::Namespace => Field::Namespace,
+        _ => Field::Column(snap.columns.iter().position(|x| std::ptr::eq(x, c)).unwrap_or(0)),
+    };
+    // Exact title first, then a title that starts with the key.
+    let usable = |c: &&Column| c.source != ColSource::Age;
+    if let Some(c) = snap.columns.iter().filter(usable).find(|c| squash(&c.title) == key_sq) {
+        return Some(pick(c));
+    }
+    snap.columns.iter().filter(usable).find(|c| squash(&c.title).starts_with(&key_sq)).map(pick)
+}
+
+fn term_matches(row: &Row, snap: &Snapshot, term: &Term) -> bool {
+    let test = |hay: &str| {
+        if term.exact {
+            hay.eq_ignore_ascii_case(&term.text) || (!hay.is_ascii() && hay.to_lowercase() == term.text)
+        } else {
+            contains_lower(hay, &term.text)
+        }
+    };
+    let hit = match term.field {
+        None => memfind(row.search.as_bytes(), term.text.as_bytes()),
+        Some(Field::Name) => test(&row.name),
+        Some(Field::Namespace) => test(&row.namespace),
+        // Exact for labels means one whole `key=value` pair.
+        Some(Field::Labels) if term.exact => row.labels.split(' ').any(|p| p.eq_ignore_ascii_case(&term.text)),
+        Some(Field::Labels) => test(&row.labels),
+        Some(Field::Column(i)) => snap.columns.get(i).is_some_and(|c| test(row.text(c))),
+    };
+    hit != term.negate
+}
+
+/// Case-insensitive substring test against an already lower-cased needle.
+fn contains_lower(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.bytes().any(|b| b.is_ascii_uppercase()) || !hay.is_ascii() {
+        memfind(hay.to_lowercase().as_bytes(), needle.as_bytes())
+    } else {
+        memfind(hay.as_bytes(), needle.as_bytes())
+    }
+}
+
+fn matches(row: &Row, snap: &Snapshot, terms: &[Term]) -> bool {
+    terms.iter().all(|t| term_matches(row, snap, t))
 }
 
 fn memfind(hay: &[u8], needle: &[u8]) -> bool {
@@ -278,14 +622,14 @@ impl ViewCache {
         }
 
         let started = Instant::now();
-        let terms: Vec<String> = tui.filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+        let terms = parse_filter(&tui.filter, &latest);
         let filter_ns = key.namespaced && !ns_filter.is_empty();
         let mut order: Vec<u32> = Vec::with_capacity(latest.rows.len());
         for (i, row) in latest.rows.iter().enumerate() {
             if filter_ns && !ns_filter.contains(&*row.namespace) {
                 continue;
             }
-            if !terms.is_empty() && !matches(row, &terms) {
+            if !terms.is_empty() && !matches(row, &latest, &terms) {
                 continue;
             }
             order.push(i as u32);
@@ -405,6 +749,8 @@ pub enum RowAction {
     Uncordon,
     Suspend,
     Resume,
+    /// The pods table, narrowed to the pods on this node / in this namespace.
+    ShowPods,
 }
 
 /// Which actions make sense for a resource type.
@@ -428,6 +774,9 @@ pub fn actions_for(key: &ResourceKey) -> Vec<(RowAction, egui_material_icons::Ma
     }
     if key.group.as_ref() == "apps" && matches!(key.plural.as_ref(), "deployments" | "statefulsets" | "daemonsets") {
         v.push((RowAction::Restart, icons::ICON_RESTART_ALT, "Restart"));
+    }
+    if key.is("", "nodes") || key.is("", "namespaces") {
+        v.push((RowAction::ShowPods, icons::ICON_DEPLOYED_CODE, "Show pods"));
     }
     if key.is("", "nodes") {
         v.push((RowAction::Cordon, icons::ICON_BLOCK, "Cordon"));
@@ -454,61 +803,48 @@ pub fn show(
     key: &ResourceKey,
     cache: &ViewCache,
     tui: &mut TableUi,
-    cols: &[DCol],
+    laid: &[Laid],
     metrics: &Metrics,
     now: i64,
 ) -> TableOutput {
     let snap = &cache.snap;
     let mut out = TableOutput::default();
-    if cols.is_empty() {
+    if laid.is_empty() {
         // (A row without cells is not something the table widget can draw.)
         return out;
     }
+    let cols: Vec<DCol> = laid.iter().map(|l| l.col).collect();
+    let cols = &cols[..];
     let (sort_title, sort_desc) = effective_sort(snap, tui);
     let mut clicked_header: Option<String> = None;
     let selected_uid = tui.selected.clone();
     let menu_items = actions_for(key);
     let is_nodes = key.is("", "nodes");
+    let available = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    let table_left = ui.cursor().left();
+    let table_top = ui.cursor().top();
 
     ui.spacing_mut().item_spacing.y = 0.0;
-    // No elastic overscroll: besides being out of place in a data table, it
-    // misfires when a scroll position is carried over (below) into stored
-    // state that still remembers a shorter list, and the table then coasts
-    // away from the row that was just opened.
+    // No elastic overscroll: it is out of place in a data table, and makes
+    // the table coast away from a row that was just scrolled to.
     ui.spacing_mut().scroll.kinetic.rubber_band = false;
     // The context menu belongs to a row position; rows can move under it.
     let mut menu_uid = tui.menu_uid.take();
     let mut menu_open = false;
-    // Stored widths are kept per set of columns, by identity: widths the
-    // user dragged survive the detail panel opening and closing (which
-    // changes how many columns fit) and switching a column off and on
-    // again, and are never applied to a different column that happens to
-    // be in the same position. The scroll position is carried over below.
-    let col_ids: Vec<&str> = cols.iter().map(|c| c.title(snap)).collect();
+    // Widths are decided here, every frame (`layout_columns`), and given to
+    // the table as exact sizes; the table widget's own resizing (which keeps
+    // its widths in its own state and fights a flexible column) is not used.
+    // Resizing is done with the handles drawn after the table.
     let mut builder = TableBuilder::new(ui)
-        .id_salt(("resource-table", key.id(), &col_ids, tui.widths_generation))
+        .id_salt(("resource-table", key.id()))
         .striped(false)
-        .resizable(true)
+        .resizable(false)
         .sense(Sense::click())
         .auto_shrink([false, false])
         .cell_layout(Layout::left_to_right(Align::Center));
-    for c in cols {
-        let (width, flexible) = dcol_width(c, snap);
-        builder = builder.column(if flexible {
-            // Not resizable: a resizable column keeps its stored width, so
-            // it would not give space back when the table gets narrower
-            // (detail panel opening) and would push the rest off-screen.
-            TableColumn::remainder().at_least(width.min(160.0)).clip(true).resizable(false)
-        } else {
-            TableColumn::initial(width).at_least(36.0).clip(true)
-        });
-    }
-    let layout_sig = col_layout_signature(&col_ids, tui.widths_generation);
-    if tui.last_cols != layout_sig {
-        if tui.last_cols != 0 {
-            builder = builder.vertical_scroll_offset(tui.scroll_y);
-        }
-        tui.last_cols = layout_sig;
+    for l in laid {
+        builder = builder.column(TableColumn::exact(l.width).clip(true).resizable(false));
     }
     if tui.scroll_to_selected {
         tui.scroll_to_selected = false;
@@ -516,11 +852,13 @@ pub fn show(
             builder = builder.scroll_to_row(pos, None);
         }
     }
+    let mut header_bottom = table_top;
 
     let scroll = builder
         .header(28.0, |mut header| {
             for c in cols {
                 header.col(|ui| {
+                    header_bottom = header_bottom.max(ui.max_rect().bottom());
                     let title = c.title(snap);
                     let active = title.eq_ignore_ascii_case(&sort_title);
                     let rich = RichText::new(title).size(12.0).color(if active { pal.text } else { pal.muted });
@@ -533,6 +871,9 @@ pub fn show(
                     };
                     if clicked {
                         clicked_header = Some(title.to_string());
+                    }
+                    if ui.min_rect().width() > ui.max_rect().width() {
+                        ui.response().on_hover_text(title);
                     }
                 });
             }
@@ -654,8 +995,12 @@ pub fn show(
             });
         });
 
-    tui.scroll_y = scroll.state.clamped_offset().y;
+    let _ = scroll;
     tui.menu_uid = menu_uid.filter(|_| menu_open);
+
+    // Column resize handles: on the boundary after each column, over the
+    // header (where a drag cannot be mistaken for a click on a row).
+    resize_handles(ui, pal, snap, tui, laid, table_left, table_top, header_bottom, available, gap);
 
     if let Some(title) = clicked_header {
         tui.sort = Some(if title.eq_ignore_ascii_case(&sort_title) {
@@ -667,13 +1012,70 @@ pub fn show(
     out
 }
 
-/// Identifies a column layout (never 0, which means "none yet").
-fn col_layout_signature(titles: &[&str], generation: u32) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    titles.hash(&mut h);
-    generation.hash(&mut h);
-    (h.finish() as usize).max(1)
+#[allow(clippy::too_many_arguments)]
+fn resize_handles(
+    ui: &mut Ui,
+    pal: &Palette,
+    snap: &Snapshot,
+    tui: &mut TableUi,
+    laid: &[Laid],
+    left: f32,
+    top: f32,
+    header_bottom: f32,
+    available: f32,
+    gap: f32,
+) {
+    let mut x = left;
+    let grab = 4.0;
+    for (i, l) in laid.iter().enumerate() {
+        x += l.width;
+        let boundary = x + gap / 2.0;
+        x += gap;
+        // Nothing to drag after the last column when it reaches the edge.
+        if i + 1 == laid.len() && boundary >= left + available - 2.0 {
+            break;
+        }
+        let title = l.col.title(snap).to_string();
+        let rect = egui::Rect::from_min_max(egui::pos2(boundary - grab, top), egui::pos2(boundary + grab, header_bottom));
+        let id = ui.scope_id().with(("col-resize", &title));
+        let resp = ui.interact(rect, id, Sense::click_and_drag());
+        let resp = resp.on_hover_text_at_pointer("Drag to resize · double-click for the default width");
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+        }
+        if resp.double_clicked() {
+            tui.widths.remove(&title);
+        } else if resp.drag_started() {
+            // The layout as it is on screen is where the drag starts from;
+            // each frame of the drag is worked out from it afresh.
+            ui.data_mut(|d| d.insert_temp(id, std::sync::Arc::new(laid.to_vec())));
+        } else if resp.dragged() {
+            let start: std::sync::Arc<Vec<Laid>> =
+                ui.data(|d| d.get_temp(id)).unwrap_or_else(|| std::sync::Arc::new(laid.to_vec()));
+            let moved = ui.input(|inp| match (inp.pointer.press_origin(), inp.pointer.latest_pos()) {
+                (Some(a), Some(b)) => b.x - a.x,
+                _ => 0.0,
+            });
+            // (Only while the columns are the ones the drag started with.)
+            if start.len() == laid.len() && start.iter().zip(laid).all(|(a, b)| a.col == b.col) {
+                for (j, w) in drag_widths(&start, i, moved, available, gap) {
+                    tui.widths.insert(start[j].col.title(snap).to_string(), w);
+                }
+            }
+        }
+        let color = if resp.dragged() {
+            pal.accent
+        } else if resp.hovered() {
+            pal.muted
+        } else {
+            pal.border
+        };
+        let y = (header_bottom - top) * 0.25;
+        ui.painter().line_segment(
+            [egui::pos2(boundary, top + y), egui::pos2(boundary, header_bottom - y)],
+            egui::Stroke::new(1.0, color),
+        );
+    }
 }
 
 fn node_usage_cell(ui: &mut Ui, pal: &Palette, row: &Row, title: &str, capacity: f64, text: &str, metrics: &Metrics) {
@@ -697,6 +1099,155 @@ fn node_usage_cell(ui: &mut Ui, pal: &Palette, row: &Row, title: &str, capacity:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use skiff_core::Cell;
+
+    fn col(title: &str, source: ColSource, kind: ColKind) -> Column {
+        Column { title: title.into(), source, kind, visible: true }
+    }
+
+    /// A pods-like table: Name, Namespace, Status, Node, Age.
+    fn pods_snapshot(rows: &[(&str, &str, &str, &str)]) -> Snapshot {
+        let columns: Vec<Column> = vec![
+            col("Name", ColSource::Name, ColKind::Text),
+            col("Namespace", ColSource::Namespace, ColKind::Text),
+            col("Status", ColSource::Cell(0), ColKind::Status),
+            col("Node", ColSource::Cell(1), ColKind::Text),
+            col("Age", ColSource::Age, ColKind::Time),
+        ];
+        let rows = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ns, status, node))| {
+                let search = format!("{name} {ns} {status} {node} app={name}").to_lowercase();
+                Arc::new(Row {
+                    uid: format!("u{i}").into(),
+                    name: (*name).into(),
+                    namespace: (*ns).into(),
+                    created: 0,
+                    deleting: false,
+                    tone: Tone::Normal,
+                    rv: "1".into(),
+                    cells: vec![Cell::text(*status), Cell::text(*node)].into_boxed_slice(),
+                    owner: None,
+                    labels: format!("app={name}").into(),
+                    search: search.into(),
+                })
+            })
+            .collect();
+        Snapshot { generation: 1, columns: Arc::from(columns), rows, state: LoadState::Live, error: None, error_code: 0, default_sort: None }
+    }
+
+    fn pods_key() -> ResourceKey {
+        skiff_core::kinds::pods()
+    }
+
+    fn filtered(snap: &Snapshot, filter: &str) -> Vec<String> {
+        let terms = parse_filter(filter, snap);
+        snap.rows.iter().filter(|r| matches(r, snap, &terms)).map(|r| r.name.to_string()).collect()
+    }
+
+    #[test]
+    fn column_filters() {
+        let snap = pods_snapshot(&[
+            ("web-1", "shop", "Running", "node-1"),
+            ("web-2", "shop", "CrashLoopBackOff", "node-10"),
+            ("db-0", "data", "Running", "node-1"),
+        ]);
+        assert_eq!(filtered(&snap, "node:node-1"), ["web-1", "web-2", "db-0"], "substring by default");
+        assert_eq!(filtered(&snap, "node:=node-1"), ["web-1", "db-0"], "= wants the whole value");
+        assert_eq!(filtered(&snap, "NODE:=NODE-10"), ["web-2"], "case does not matter");
+        assert_eq!(filtered(&snap, "ns:data"), ["db-0"]);
+        assert_eq!(filtered(&snap, "st:crash"), ["web-2"], "a prefix of the title is enough");
+        assert_eq!(filtered(&snap, "!running"), ["web-2"]);
+        assert_eq!(filtered(&snap, "-ns:shop"), ["db-0"]);
+        assert_eq!(filtered(&snap, "web node:=node-1"), ["web-1"], "terms combine");
+        assert_eq!(filtered(&snap, "label:=app=db-0"), ["db-0"]);
+        // A prefix that names no column is plain text.
+        assert_eq!(filtered(&snap, "bogus:x"), Vec::<String>::new());
+        assert_eq!(parse_filter("http://x", &snap)[0].field, None);
+        // Age is not text, so `age:` is not a column filter.
+        assert_eq!(parse_filter("age:1", &snap)[0].field, None);
+    }
+
+    #[test]
+    fn layout_fills_the_width_with_the_name_column() {
+        let snap = pods_snapshot(&[("a", "b", "Running", "n")]);
+        let tui = TableUi::default();
+        let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), 1200.0, 8.0);
+        assert_eq!(laid.len(), 5);
+        let total: f32 = laid.iter().map(|l| l.width).sum::<f32>() + 8.0 * 4.0;
+        assert!((total - 1200.0).abs() <= 4.0, "fills the width: {total}");
+        assert!(laid[0].flexible);
+    }
+
+    #[test]
+    fn a_dragged_width_is_kept_and_the_name_column_gives_way() {
+        let snap = pods_snapshot(&[("a", "b", "Running", "n")]);
+        let mut tui = TableUi::default();
+        tui.widths.insert("Status".into(), 400.0);
+        let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), 1000.0, 8.0);
+        let status = laid.iter().find(|l| l.col == DCol::Real(2)).unwrap();
+        assert_eq!(status.width, 400.0);
+        let total: f32 = laid.iter().map(|l| l.width).sum::<f32>() + 8.0 * (laid.len() - 1) as f32;
+        assert!(total <= 1000.5, "never wider than the space: {total}");
+
+        // The user can size the name column too; it then keeps that width.
+        tui.widths.insert("Name".into(), 180.0);
+        let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), 1400.0, 8.0);
+        assert_eq!(laid[0].width, 180.0);
+        assert!(!laid[0].flexible);
+    }
+
+    #[test]
+    fn narrow_tables_drop_columns_instead_of_overflowing() {
+        let snap = pods_snapshot(&[("a", "b", "Running", "n")]);
+        let tui = TableUi::default();
+        for width in [200.0, 320.0, 480.0, 640.0, 900.0] {
+            let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), width, 8.0);
+            let total: f32 = laid.iter().map(|l| l.width).sum::<f32>() + 8.0 * (laid.len() - 1) as f32;
+            assert!(total <= width + 0.5, "{width}: {total}");
+            assert!(laid.iter().any(|l| l.col == DCol::Real(0)), "{width}: the name stays");
+        }
+    }
+
+    #[test]
+    fn dragging_never_pushes_columns_out() {
+        let snap = pods_snapshot(&[("a", "b", "Running", "n")]);
+        let mut tui = TableUi::default();
+        let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), 900.0, 8.0);
+        let before = laid.len();
+        let max = max_drag_width(&laid, 2, 900.0, 8.0);
+        tui.widths.insert("Status".into(), max);
+        let laid = layout_columns(&pods_key(), &snap, &tui, &Metrics::default(), 900.0, 8.0);
+        assert_eq!(laid.len(), before, "the widest drag still fits every column");
+        let total: f32 = laid.iter().map(|l| l.width).sum::<f32>() + 8.0 * (laid.len() - 1) as f32;
+        assert!(total <= 900.5, "{total}");
+    }
+
+    #[test]
+    fn a_dragged_boundary_follows_the_pointer() {
+        let snap = pods_snapshot(&[("a", "b", "Running", "n")]);
+        let mut tui = TableUi::default();
+        let key = pods_key();
+        let start = layout_columns(&key, &snap, &tui, &Metrics::default(), 1100.0, 8.0);
+        let edge = |laid: &[Laid], i: usize| laid[..=i].iter().map(|l| l.width + 8.0).sum::<f32>();
+        for (index, delta) in [(1usize, 60.0f32), (1, -30.0), (0, -50.0), (0, 40.0), (2, 25.0)] {
+            tui.widths.clear();
+            for (j, w) in drag_widths(&start, index, delta, 1100.0, 8.0) {
+                tui.widths.insert(start[j].col.title(&snap).to_string(), w);
+            }
+            let after = layout_columns(&key, &snap, &tui, &Metrics::default(), 1100.0, 8.0);
+            assert_eq!(after.len(), start.len());
+            let moved = edge(&after, index) - edge(&start, index);
+            assert!((moved - delta).abs() < 1.5, "boundary {index} by {delta}: moved {moved}");
+            for k in 0..index {
+                assert!((edge(&after, k) - edge(&start, k)).abs() < 1.5, "boundary {k} left of the drag stays");
+            }
+            let total = edge(&after, after.len() - 1) - 8.0;
+            assert!(total <= 1100.5, "{total}");
+        }
+    }
 
     #[test]
     fn substring_search() {

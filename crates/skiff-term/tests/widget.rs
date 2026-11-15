@@ -286,3 +286,35 @@ fn resize_is_reported_and_wheel_scrolls() {
     h.run();
     assert_eq!(h.state().term.display_offset(), 0);
 }
+
+#[test]
+fn find_walks_through_the_scrollback() {
+    let mut t = skiff_term::TerminalView::new();
+    for i in 0..60 {
+        t.feed(format!("line {i}{}\r\n", if i % 20 == 5 { " needle" } else { "" }).as_bytes());
+    }
+    // Matches on lines 5, 25 and 45; a new search starts at the newest.
+    let r = t.find("NEEDLE", true);
+    assert!(r.is_none(), "a capital letter makes the search case-sensitive");
+    let r = t.find("needle", true).expect("found");
+    assert_eq!((r.index, r.total), (3, 3));
+    assert_eq!(t.selection_text().as_deref(), Some("needle"));
+    let r = t.find("needle", true).expect("older");
+    assert_eq!(r.index, 2);
+    // Scrolled back to show it.
+    assert!(t.display_offset() > 0 || (0..24).any(|row| t.row_text(row) == "line 25 needle"));
+    let r = t.find("needle", true).expect("oldest");
+    assert_eq!(r.index, 1);
+    let r = t.find("needle", true).expect("wraps");
+    assert_eq!(r.index, 3);
+    let r = t.find("needle", false).expect("newer wraps to the oldest");
+    assert_eq!(r.index, 1);
+    // Regex characters are taken literally.
+    t.feed(b"a.b (x)\r\n");
+    assert!(t.find("(x)", true).is_some());
+    assert!(t.find("a.b", true).is_some());
+    t.feed(b"axb\r\n");
+    assert_eq!(t.find("a.b", true).map(|r| r.total), Some(1), "the dot is not a wildcard");
+    t.end_find();
+    assert_eq!(t.selection_text(), None);
+}

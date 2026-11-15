@@ -18,7 +18,8 @@ pub fn sh_quote(word: &str) -> String {
 /// (a new terminal window does not inherit this app's environment).
 fn kubectl(context: &str) -> String {
     let mut cmd = String::new();
-    if let Ok(kc) = std::env::var("KUBECONFIG") {
+    // The files chosen in Settings, else whatever this app was started with.
+    if let Some(kc) = skiff_core::kubeconfig::kubeconfig_env_value().or_else(|| std::env::var("KUBECONFIG").ok()) {
         if !kc.is_empty() {
             cmd.push_str(&format!("KUBECONFIG={} ", sh_quote(&kc)));
         }

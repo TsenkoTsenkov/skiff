@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use kube::config::{KubeConfigOptions, Kubeconfig};
+use kube::config::KubeConfigOptions;
 use kube::discovery::{verbs, Discovery, Scope};
 use kube::{Client, Config};
 use parking_lot::Mutex;
@@ -47,11 +47,14 @@ pub struct ContextInfo {
 pub struct Contexts {
     pub current: Option<String>,
     pub items: Vec<ContextInfo>,
+    /// Some of the kubeconfig files could not be read (the others were).
+    pub warning: Option<String>,
 }
 
-/// Reads the kubeconfig (honouring `$KUBECONFIG`) and lists its contexts.
+/// Reads the kubeconfig files in effect (see [`crate::kubeconfig`]) and
+/// lists their contexts.
 pub fn load_contexts() -> Result<Contexts, String> {
-    let kc = Kubeconfig::read().map_err(|e| format!("cannot read kubeconfig: {e}"))?;
+    let (kc, warning) = crate::kubeconfig::read_kubeconfig()?;
     let items = kc
         .contexts
         .iter()
@@ -74,7 +77,7 @@ pub fn load_contexts() -> Result<Contexts, String> {
             }
         })
         .collect();
-    Ok(Contexts { current: kc.current_context.clone(), items })
+    Ok(Contexts { current: kc.current_context.clone(), items, warning })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,7 +148,7 @@ pub struct Session {
 
 /// Builds a client for a kubeconfig context; also returns the server URL.
 async fn build_client(context: &str) -> Result<(Client, String), String> {
-    let kc = Kubeconfig::read().map_err(|e| format!("cannot read kubeconfig: {e}"))?;
+    let (kc, _) = crate::kubeconfig::read_kubeconfig()?;
     let opts = KubeConfigOptions { context: Some(context.to_string()), ..Default::default() };
     let mut cfg = Config::from_custom_kubeconfig(kc, &opts)
         .await

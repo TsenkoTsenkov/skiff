@@ -8,6 +8,7 @@ pub mod cells;
 pub mod exec;
 pub mod forward;
 pub mod kinds;
+pub mod kubeconfig;
 pub mod logs;
 pub mod ops;
 pub mod session;

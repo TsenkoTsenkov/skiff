@@ -13,10 +13,11 @@ use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
@@ -131,6 +132,9 @@ pub struct TermOutput {
 /// A terminal emulator widget. See the crate docs.
 pub struct TerminalView {
     term: Term<Listener>,
+    /// Find-in-scrollback state: the compiled pattern and the match that was
+    /// last moved to.
+    search: Option<Search>,
     parser: Processor<StdSyncHandler>,
     events: mpsc::Receiver<TermEvent>,
     /// Replies generated while parsing, delivered with the next `TermOutput`.
@@ -149,6 +153,24 @@ pub struct TerminalView {
     /// (fg, bg, dim) -> the fg to draw with, for the current style.
     legible: std::cell::RefCell<std::collections::HashMap<(Color32, Color32, bool), Color32>>,
 }
+
+struct Search {
+    needle: String,
+    regex: RegexSearch,
+    current: Option<Match>,
+}
+
+/// Where a find landed: the match's position among all matches (1-based,
+/// oldest first) and how many there are (counting stops at
+/// [`MAX_COUNTED_MATCHES`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindResult {
+    pub index: usize,
+    pub total: usize,
+}
+
+/// Matches beyond this many are not counted (the count shows as "1000+").
+pub const MAX_COUNTED_MATCHES: usize = 1000;
 
 /// Follows the byte stream just closely enough to enforce the limits above.
 #[derive(Default)]
@@ -233,6 +255,18 @@ struct Run {
 
 fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.r, c.g, c.b)
+}
+
+/// `text` as a regex that matches it literally.
+fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Relative luminance (WCAG).
@@ -357,6 +391,7 @@ impl TerminalView {
         let size = GridSize { cols: 80, rows: 24 };
         Self {
             term: Term::new(Config::default(), &size, Listener(tx)),
+            search: None,
             parser: Processor::new(),
             events: rx,
             pending_input: Vec::new(),
@@ -631,6 +666,70 @@ impl TerminalView {
         let mut sel = Selection::new(SelectionType::Simple, top, Side::Left);
         sel.update(bottom, Side::Right);
         self.term.selection = Some(sel);
+    }
+
+    /// Finds `needle` (plain text; case-insensitive unless it contains a
+    /// capital letter) on screen and in the scrollback, selects the match and
+    /// scrolls it into view. `older` moves up from the current match (or, for
+    /// a new search, from the bottom of the screen), otherwise down;
+    /// either way the search wraps around. `None` when nothing matches.
+    pub fn find(&mut self, needle: &str, older: bool) -> Option<FindResult> {
+        if needle.is_empty() {
+            self.end_find();
+            return None;
+        }
+        let fresh = self.search.as_ref().is_none_or(|s| s.needle != needle);
+        if fresh {
+            let pattern = escape_regex(needle);
+            let regex = RegexSearch::new(&pattern).ok()?;
+            self.search = Some(Search { needle: needle.to_string(), regex, current: None });
+        }
+        let grid = self.term.grid();
+        let offset = grid.display_offset() as i32;
+        let screen = grid.screen_lines() as i32;
+        let last_col = grid.last_column();
+        let search = self.search.as_mut()?;
+        let (origin, direction, side) = match (&search.current, older) {
+            (Some(m), true) => (m.start().sub(&self.term, Boundary::None, 1), Direction::Left, Side::Right),
+            (Some(m), false) => (m.end().add(&self.term, Boundary::None, 1), Direction::Right, Side::Left),
+            // A new search starts from the newest output in view.
+            (None, true) => (Point::new(Line(screen - 1 - offset), last_col), Direction::Left, Side::Right),
+            (None, false) => (Point::new(Line(-offset), Column(0)), Direction::Right, Side::Left),
+        };
+        let found = self.term.search_next(&mut search.regex, origin, direction, side, None);
+        let Some(m) = found else {
+            search.current = None;
+            self.term.selection = None;
+            return None;
+        };
+        search.current = Some(m.clone());
+        let mut sel = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
+        sel.update(*m.end(), Side::Right);
+        self.term.selection = Some(sel);
+        self.term.scroll_to_point(*m.start());
+        // Position among all matches, oldest first.
+        let top = Point::new(self.term.grid().topmost_line(), Column(0));
+        let bottom = Point::new(self.term.grid().bottommost_line(), last_col);
+        let search = self.search.as_mut()?;
+        let mut index = 0;
+        let mut total = 0;
+        for hit in RegexIter::new(top, bottom, Direction::Right, &self.term, &mut search.regex) {
+            total += 1;
+            if hit.start() == m.start() {
+                index = total;
+            }
+            if total >= MAX_COUNTED_MATCHES {
+                break;
+            }
+        }
+        Some(FindResult { index, total })
+    }
+
+    /// Forgets the current find (and the selection it made).
+    pub fn end_find(&mut self) {
+        if self.search.take().is_some_and(|s| s.current.is_some()) {
+            self.term.selection = None;
+        }
     }
 
     fn drain_term_events(&mut self) {

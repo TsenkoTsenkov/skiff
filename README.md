@@ -53,9 +53,22 @@ that one screen a reset rather than the whole app.
 ## Features
 
 - Every resource type the cluster serves, including custom resources, with
-  live updates, instant filter (`/`), sortable columns, a column chooser and
-  columns that adapt to the available width
+  live updates, instant filter (`/` or `Cmd/Ctrl+F`), sortable columns, a
+  column chooser, and columns sized to their content that you can drag wider
+  or narrower (double-click a column edge for its default width); choices and
+  widths are remembered
+- Column filters: `node:worker-1`, `status:crash`, `ns:kube`,
+  `label:app=web`; a column title can be shortened to any prefix, `:=` asks
+  for the whole value (`node:=worker-1` leaves out `worker-10`) and `!`
+  keeps the rows that do not match (`!status:running`)
+- Pods by node or namespace: "Show pods" on a node or namespace (right-click
+  or the detail panel) opens the pods table filtered to it
 - Multi-cluster: switch kubeconfig contexts instantly; connections stay warm
+- Settings (`Cmd/Ctrl+,`, the gear in the top bar): which kubeconfig files to
+  read (the same as kubectl by default, or files you choose, with any found
+  in `~/.kube` offered), reload them, the clusters they define with their
+  connection state (open, reconnect, disconnect, hide from the menu), theme,
+  log history and column resets
 - Namespace filter (one or many), remembered per cluster
 - Detail panel with tailored summaries (pods and containers, workloads,
   services, ingresses, nodes, config maps, secrets with reveal/copy, PVCs,
@@ -66,15 +79,17 @@ that one screen a reset rather than the whole app.
   underneath your edits); create or update objects from a manifest
   (server-side apply, any number of documents)
 - Pod and workload logs: follow, multi-pod merge, timestamps, wrap,
-  previous container, level and ANSI colouring; find with matches highlighted
-  (Enter / Shift+Enter step through them), showing only matching lines or all
-  lines
+  previous container, level and ANSI colouring; find (`Cmd/Ctrl+F`) with
+  matches highlighted (Enter / Shift+Enter step through them), showing only
+  matching lines or all lines
 - Shells and log tails can also open in your own terminal app via `kubectl`
   (iTerm if installed, else Terminal on macOS; `$TERMINAL` or a common
   terminal on Linux; override with `SKIFF_TERMINAL`)
 - A shell in any container: a real terminal emulator in the dock (colours,
-  full-screen programs such as `vi` and `top`, 10,000 lines of scrollback,
-  mouse selection, copy and paste, resizing with the dock)
+  full-screen programs such as `vi` and `top`, 10,000 lines of scrollback
+  with find (`Cmd+F` on macOS, `Ctrl+Shift+F` elsewhere, since `Ctrl+F`
+  belongs to the shell), mouse selection, copy and paste, resizing with the
+  dock)
 - Port forwarding for pods and services, with a list of active forwards
 - Scale, rollout restart, cordon / uncordon, suspend / resume cron jobs,
   delete (optionally forced)

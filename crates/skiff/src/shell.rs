@@ -24,6 +24,26 @@ pub struct ShellTab {
     /// The terminal had to be started afresh because the emulator failed on
     /// something the container printed.
     display_reset: bool,
+    /// Find in the scrollback: shown, its text, where the last find landed,
+    /// and whether the box should take the keyboard.
+    find_open: bool,
+    find_text: String,
+    find_searched: String,
+    #[cfg(feature = "terminal")]
+    find_result: Option<skiff_term::FindResult>,
+    focus_find: bool,
+}
+
+/// The shortcut that opens find in a shell: Cmd+F on macOS. Elsewhere Ctrl+F
+/// belongs to the shell (cursor forward), so it is Ctrl+Shift+F, as in most
+/// terminal apps.
+pub fn find_shortcut(ctx: &egui::Context) -> egui::KeyboardShortcut {
+    use egui::{Key, KeyboardShortcut, Modifiers};
+    if ctx.os() == egui::os::OperatingSystem::Mac {
+        KeyboardShortcut::new(Modifiers::MAC_CMD, Key::F)
+    } else {
+        KeyboardShortcut::new(Modifiers::CTRL | Modifiers::SHIFT, Key::F)
+    }
 }
 
 /// Output is fed to the terminal a slice at a time and for at most this long
@@ -49,6 +69,85 @@ impl ShellTab {
             #[cfg(feature = "terminal")]
             term: skiff_term::TerminalView::new(),
             display_reset: false,
+            find_open: false,
+            find_text: String::new(),
+            find_searched: String::new(),
+            #[cfg(feature = "terminal")]
+            find_result: None,
+            focus_find: false,
+        }
+    }
+
+    /// Opens the find bar (or gives it the keyboard again).
+    pub fn open_find(&mut self) {
+        self.find_open = true;
+        self.focus_find = true;
+    }
+
+    #[cfg(feature = "terminal")]
+    fn find_bar(&mut self, ui: &mut Ui, pal: &Palette) {
+        let mut close = false;
+        let mut step: Option<bool> = None;
+        ui.horizontal(|ui| {
+            let id = ui.scope_id().with("shell-find");
+            let edit = widgets::search_box(ui, &mut self.find_text, "Find in scrollback", 240.0, id);
+            if std::mem::take(&mut self.focus_find) {
+                edit.request_focus();
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Enter goes back in time (to older output), Shift+Enter
+                // forward; the box keeps the keyboard.
+                step = Some(!ui.input(|i| i.modifiers.shift));
+                ui.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
+                });
+                self.focus_find = true;
+            }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close = true;
+            }
+            if !self.find_text.is_empty() {
+                let (text, color) = match self.find_result {
+                    None => ("no matches".to_string(), pal.err),
+                    Some(r) => {
+                        let total = if r.total >= skiff_term::MAX_COUNTED_MATCHES {
+                            format!("{}+", r.total)
+                        } else {
+                            r.total.to_string()
+                        };
+                        (format!("{} / {total}", r.index), pal.muted)
+                    }
+                };
+                ui.label(RichText::new(text).color(color).size(12.0));
+            }
+            if widgets::icon_button(ui, icons::ICON_KEYBOARD_ARROW_UP, "Older match (Enter)").clicked() {
+                step = Some(true);
+            }
+            if widgets::icon_button(ui, icons::ICON_KEYBOARD_ARROW_DOWN, "Newer match (Shift+Enter)").clicked() {
+                step = Some(false);
+            }
+            if widgets::icon_button(ui, icons::ICON_CLOSE, "Close find (Esc)").clicked() {
+                close = true;
+            }
+        });
+        // Typing searches as you go, from the newest output upwards.
+        let changed = self.find_text != self.find_searched;
+        if changed || step.is_some() {
+            let needle = self.find_text.clone();
+            if changed {
+                self.with_term(|t| t.end_find());
+            }
+            self.find_searched = needle.clone();
+            self.find_result = self.with_term(|t| t.find(&needle, step.unwrap_or(true))).flatten();
+        }
+        if close {
+            self.find_open = false;
+            self.find_text.clear();
+            self.find_searched.clear();
+            self.find_result = None;
+            self.with_term(|t| t.end_find());
+            self.term.request_focus();
         }
     }
 
@@ -217,6 +316,10 @@ impl ShellTab {
                     .color(pal.warn)
                     .size(12.0),
             );
+        }
+        #[cfg(feature = "terminal")]
+        if self.find_open {
+            self.find_bar(ui, pal);
         }
         let focused = self.terminal(ui, pal, &exec);
         if let Some(c) = switch_to {

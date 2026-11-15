@@ -43,14 +43,14 @@ pub struct LogsTab {
 }
 
 impl LogsTab {
-    fn new(session: &Arc<Session>, job: Job<Vec<LogTarget>>) -> Self {
+    fn new(session: &Arc<Session>, job: Job<Vec<LogTarget>>, tail: Option<i64>) -> Self {
         LogsTab {
             session: session.clone(),
             targets_job: Some(job),
             targets: Vec::new(),
             stream: None,
             error: None,
-            options: LogOptions::default(),
+            options: LogOptions { tail, ..LogOptions::default() },
             filter: String::new(),
             wrap: false,
             timestamps: false,
@@ -511,14 +511,32 @@ struct Tab {
     kind: TabKind,
 }
 
-#[derive(Default)]
 pub struct Dock {
     pub open: bool,
+    /// Earlier lines a new log tab loads (Settings).
+    pub default_tail: Option<i64>,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
     /// The dock was drawn in the previous frame.
     was_shown: bool,
+    /// The user's last click was inside the dock (or it was just opened):
+    /// find shortcuts are then for the dock's tab, not for the table.
+    attention: bool,
+}
+
+impl Default for Dock {
+    fn default() -> Self {
+        Dock {
+            open: false,
+            default_tail: LogOptions::default().tail,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            was_shown: false,
+            attention: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -537,10 +555,16 @@ impl Dock {
         self.tabs.push(Tab { id: self.next_id, title, context: context.to_string(), kind });
         self.active = self.tabs.len() - 1;
         self.open = true;
+        self.attention = true;
+    }
+
+    /// Whether a find shortcut pressed now is meant for the dock.
+    pub fn has_attention(&self) -> bool {
+        self.open && !self.tabs.is_empty() && self.attention
     }
 
     pub fn open_logs(&mut self, session: &Arc<Session>, title: String, job: Job<Vec<LogTarget>>) {
-        self.push(title, &session.context, TabKind::Logs(Box::new(LogsTab::new(session, job))));
+        self.push(title, &session.context, TabKind::Logs(Box::new(LogsTab::new(session, job, self.default_tail))));
     }
 
     /// Opens a shell in the pod's first container.
@@ -615,7 +639,21 @@ impl Dock {
         // front, is asking for that shell: it gets the keyboard.
         let mut focus_shell = !self.was_shown;
         self.was_shown = true;
-        Panel::bottom("dock")
+        // Find: Cmd/Ctrl+F in logs; in a shell the terminal's own shortcut
+        // (Ctrl+F is a key the shell uses). Taken before the tab draws: a
+        // focused terminal passes every other key to the remote program.
+        let mut find = false;
+        if self.attention {
+            let active = self.active.min(self.tabs.len() - 1);
+            let shell_shortcut = crate::shell::find_shortcut(ui.ctx());
+            let cmd_f = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
+            find = ui.input_mut(|i| match self.tabs[active].kind {
+                TabKind::Shell(_) => i.consume_shortcut(&shell_shortcut),
+                TabKind::Logs(_) => i.consume_shortcut(&cmd_f) || i.consume_shortcut(&shell_shortcut),
+                TabKind::Forwards => false,
+            });
+        }
+        let panel = Panel::bottom("dock")
             .resizable(true)
             .default_size(300.0)
             .size_range(120.0..=1200.0)
@@ -653,6 +691,13 @@ impl Dock {
                 ui.add_space(2.0);
                 let active = self.active.min(self.tabs.len() - 1);
                 let tab = &mut self.tabs[active];
+                if find {
+                    match &mut tab.kind {
+                        TabKind::Logs(l) => l.focus_filter = true,
+                        TabKind::Shell(s) => s.open_find(),
+                        TabKind::Forwards => {}
+                    }
+                }
                 if focus_shell {
                     if let TabKind::Shell(s) = &mut tab.kind {
                         s.focus();
@@ -664,6 +709,13 @@ impl Dock {
                     TabKind::Forwards => forwards_ui(ui, pal, sessions, &mut out.toasts),
                 });
             });
+        let dock_rect = panel.response.rect;
+        if let Some(pos) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None }) {
+            self.attention = dock_rect.contains(pos);
+        }
+        if out.terminal_focused {
+            self.attention = true;
+        }
         if let Some(i) = close {
             self.tabs.remove(i);
             if self.active >= i && self.active > 0 {
