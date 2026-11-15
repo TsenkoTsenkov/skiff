@@ -65,8 +65,13 @@ that one screen a reset rather than the whole app.
   (the editor follows the object until you type, and tells you if it changed
   underneath your edits); create or update objects from a manifest
   (server-side apply, any number of documents)
-- Pod and workload logs: follow, multi-pod merge, filter, timestamps, wrap,
-  previous container, level colouring
+- Pod and workload logs: follow, multi-pod merge, timestamps, wrap,
+  previous container, level and ANSI colouring; find with matches highlighted
+  (Enter / Shift+Enter step through them), showing only matching lines or all
+  lines
+- Shells and log tails can also open in your own terminal app via `kubectl`
+  (iTerm if installed, else Terminal on macOS; `$TERMINAL` or a common
+  terminal on Linux; override with `SKIFF_TERMINAL`)
 - A shell in any container: a real terminal emulator in the dock (colours,
   full-screen programs such as `vi` and `top`, 10,000 lines of scrollback,
   mouse selection, copy and paste, resizing with the dock)

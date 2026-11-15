@@ -10,6 +10,7 @@ use egui_material_icons::icons;
 use skiff_core::logs::strip_ansi;
 use skiff_core::{ContainerInfo, Job, LogOptions, LogStream, LogTarget, Session, SourceState, Tone};
 
+use crate::log_text;
 use crate::shell::ShellTab;
 use crate::theme::{self, Palette};
 use crate::widgets;
@@ -32,6 +33,13 @@ pub struct LogsTab {
     scanned: u64,
     matched_filter: String,
     matched_stream: usize,
+    /// Show only the lines that match (otherwise all, with matches marked).
+    only_matching: bool,
+    /// The match that next / previous moved to (absolute sequence number).
+    current: Option<u64>,
+    /// Bring the current match into view on the next frame.
+    reveal_current: bool,
+    focus_filter: bool,
 }
 
 impl LogsTab {
@@ -51,6 +59,10 @@ impl LogsTab {
             scanned: 0,
             matched_filter: String::new(),
             matched_stream: 0,
+            only_matching: true,
+            current: None,
+            reveal_current: false,
+            focus_filter: false,
         }
     }
 
@@ -90,6 +102,7 @@ impl LogsTab {
             self.scanned = 0;
             self.matched_filter = needle.clone();
             self.matched_stream = stream_id;
+            self.current = None;
         }
         if needle.is_empty() {
             return;
@@ -111,6 +124,42 @@ impl LogsTab {
         });
     }
 
+    /// Index of the current match in `matched`, if it is still there.
+    fn current_index(&self) -> Option<usize> {
+        let seq = self.current?;
+        self.matched.binary_search(&seq).ok()
+    }
+
+    /// Moves to the next (`forward`) or previous match, wrapping around.
+    fn step_match(&mut self, forward: bool) {
+        let n = self.matched.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.current_index() {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            // Starting out: the newest match going up, the oldest going down.
+            None if forward => 0,
+            None => n - 1,
+        };
+        self.current = self.matched.get(next).copied();
+        self.reveal_current = true;
+    }
+
+    /// The command that follows these logs with `kubectl`.
+    fn kubectl_command(&self, stream: &LogStream) -> String {
+        let targets: Vec<(String, String, String)> =
+            stream.targets.iter().map(|t| (t.namespace.clone(), t.pod.clone(), t.container.clone())).collect();
+        crate::external::logs_command(
+            &self.session.context,
+            &targets,
+            self.options.tail,
+            self.options.previous,
+            self.timestamps,
+        )
+    }
+
     fn ui(&mut self, ui: &mut Ui, pal: &Palette, toasts: &mut Vec<(String, Tone)>) {
         if let Some(err) = &self.error {
             widgets::empty_state(ui, icons::ICON_ERROR, "Couldn't open logs", err, pal);
@@ -123,12 +172,55 @@ impl LogsTab {
         self.update_filter(&stream);
         let filtering = !self.matched_filter.is_empty();
         let (total, dropped) = stream.with(|b| (b.lines.len(), b.dropped));
-        let shown = if filtering { self.matched.len() } else { total };
+        let only = filtering && self.only_matching;
+        let shown = if only { self.matched.len() } else { total };
 
         let mut restart = false;
         ui.horizontal(|ui| {
             let id = egui::Id::unique("log-filter").with(Arc::as_ptr(&stream) as usize);
-            widgets::search_box(ui, &mut self.filter, "Filter lines", 220.0, id);
+            let edit = widgets::search_box(ui, &mut self.filter, "Find in logs", 260.0, id);
+            if std::mem::take(&mut self.focus_filter) {
+                edit.request_focus();
+            }
+            // Enter / Shift+Enter step through the matches and keep the
+            // keyboard in the box.
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let back = ui.input(|i| i.modifiers.shift);
+                // Taken here: the table drawn after the dock opens the
+                // selected row on Enter.
+                ui.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
+                });
+                self.step_match(!back);
+                self.focus_filter = true;
+            }
+            if filtering {
+                let pos = self.current_index().map(|i| i + 1);
+                let count = match (pos, self.matched.len()) {
+                    (_, 0) => "no matches".to_string(),
+                    (Some(p), n) => format!("{} / {}", widgets::thousands(p), widgets::thousands(n)),
+                    (None, n) => widgets::plural(n, "match"),
+                };
+                let color = if self.matched.is_empty() { pal.err } else { pal.muted };
+                ui.label(RichText::new(count).color(color).size(12.0));
+                if widgets::icon_button(ui, icons::ICON_KEYBOARD_ARROW_UP, "Previous match (Shift+Enter)").clicked() {
+                    self.step_match(false);
+                }
+                if widgets::icon_button(ui, icons::ICON_KEYBOARD_ARROW_DOWN, "Next match (Enter)").clicked() {
+                    self.step_match(true);
+                }
+                let tip = if self.only_matching {
+                    "Showing only matching lines — click to show all lines with matches highlighted"
+                } else {
+                    "Showing all lines — click to show only matching lines"
+                };
+                if widgets::icon_toggle(ui, self.only_matching, icons::ICON_FILTER_LIST, tip, pal).clicked() {
+                    self.only_matching = !self.only_matching;
+                    self.reveal_current = self.current.is_some();
+                }
+                ui.add_space(6.0);
+            }
             if widgets::icon_toggle(ui, self.wrap, icons::ICON_WRAP_TEXT, "Wrap long lines", pal).clicked() {
                 self.wrap = !self.wrap;
             }
@@ -168,6 +260,12 @@ impl LogsTab {
                 stream.clear();
                 self.matched.clear();
                 self.scanned = 0;
+            }
+            if widgets::icon_button(ui, icons::ICON_OPEN_IN_NEW, "Follow these logs in your terminal app (kubectl)").clicked() {
+                match crate::external::open(&self.kubectl_command(&stream)) {
+                    Ok(app) => toasts.push((format!("Opened in {app}"), Tone::Normal)),
+                    Err(e) => toasts.push((e, Tone::Err)),
+                }
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -222,30 +320,55 @@ impl LogsTab {
         let font = theme::mono(12.0);
         let timestamps = self.timestamps;
         let wrap = self.wrap;
+        let ansi = log_text::ansi16(pal.dark);
+        let needle = self.matched_filter.clone();
+        let current_seq = self.current;
+        let look = log_text::Look {
+            font: font.clone(),
+            default: pal.text,
+            match_fg: egui::Color32::from_rgb(0x1A, 0x1A, 0x1A),
+            match_bg: egui::Color32::from_rgb(0xF5, 0xD5, 0x4A),
+            current_bg: egui::Color32::from_rgb(0xFF, 0x96, 0x32),
+        };
+        // The row to bring into view: where the current match is drawn.
+        let reveal_row: Option<usize> = if std::mem::take(&mut self.reveal_current) {
+            match (self.current_index(), self.current) {
+                (Some(i), _) if only => Some(i),
+                (Some(_), Some(seq)) => seq.checked_sub(dropped).map(|r| r as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         Frame::new().fill(pal.bg).inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| {
             ui.style_mut().interaction.selectable_labels = true;
             ui.style_mut().interaction.multi_widget_text_select = true;
             ui.spacing_mut().item_spacing.y = 0.0;
             if shown == 0 {
-                let msg = if filtering { "No lines match the filter" } else { "No log output yet" };
+                let msg = if only { "No lines match the filter" } else { "No log output yet" };
                 widgets::empty_state(ui, icons::ICON_SUBJECT, msg, "", pal);
                 return;
             }
             let mut area = if wrap { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() }
                 .auto_shrink([false, false])
                 .stick_to_bottom(true);
-            let jump = std::mem::take(&mut self.jump_to_end);
+            let jump = std::mem::take(&mut self.jump_to_end) && reveal_row.is_none();
             if jump && !wrap {
                 // Any offset past the end is clamped to the last row. (An
                 // "infinite" offset overflows the row arithmetic.)
                 area = area.vertical_scroll_offset(shown as f32 * LOG_ROW);
             }
+            if let (Some(row), false) = (reveal_row, wrap) {
+                let half = (ui.available_height() / 2.0 - LOG_ROW).max(0.0);
+                area = area.vertical_scroll_offset((row as f32 * LOG_ROW - half).max(0.0));
+            }
             let line_job = |ui: &Ui, buf: &skiff_core::logs::LogBuffer, row: usize| -> Option<LayoutJob> {
                 // The stream may have evicted lines since the filter was
                 // brought up to date; such rows simply are not drawn.
-                let idx = if filtering { self.matched.get(row)?.checked_sub(buf.dropped)? as usize } else { row };
+                let idx = if only { self.matched.get(row)?.checked_sub(buf.dropped)? as usize } else { row };
                 let line = buf.lines.get(idx)?;
+                let seq = buf.dropped + idx as u64;
                 let mut job = LayoutJob::default();
                 if wrap {
                     job.wrap.max_width = ui.available_width();
@@ -262,8 +385,10 @@ impl LogsTab {
                     job.append(prefixes.get(src).map(String::as_str).unwrap_or("?"), 0.0, fmt(pal.series(src)));
                     job.append("  ", 0.0, fmt(pal.faint));
                 }
-                let text = strip_ansi(&line.text);
-                job.append(&text, 0.0, fmt(level_color(&text, pal)));
+                let parsed = log_text::parse(&line.text, &ansi);
+                let matches = log_text::find_all(&parsed.text, &needle);
+                let look = log_text::Look { default: level_color(&parsed.text, pal), ..look.clone() };
+                log_text::append(&mut job, &parsed, &matches, current_seq == Some(seq), &look);
                 Some(job)
             };
             if wrap {
@@ -274,8 +399,9 @@ impl LogsTab {
                 const WRAP_WINDOW: usize = 1000;
                 let first = shown.saturating_sub(WRAP_WINDOW);
                 area.show(ui, |ui| {
-                    let jobs: Vec<LayoutJob> =
-                        stream.with(|buf| (first..shown).filter_map(|row| line_job(ui, buf, row)).collect());
+                    let jobs: Vec<(usize, LayoutJob)> = stream.with(|buf| {
+                        (first..shown).filter_map(|row| line_job(ui, buf, row).map(|j| (row, j))).collect()
+                    });
                     if first > 0 {
                         ui.label(
                             RichText::new(format!("{} earlier lines hidden while wrapping", widgets::thousands(first)))
@@ -283,8 +409,11 @@ impl LogsTab {
                                 .size(11.5),
                         );
                     }
-                    for job in jobs {
-                        ui.add(egui::Label::new(job).selectable(true));
+                    for (row, job) in jobs {
+                        let resp = ui.add(egui::Label::new(job).selectable(true));
+                        if reveal_row == Some(row) {
+                            resp.scroll_to_me(Some(Align::Center));
+                        }
                     }
                     if jump {
                         ui.scroll_to_cursor(Some(Align::BOTTOM));
@@ -313,7 +442,7 @@ impl LogsTab {
     }
 
     fn collect_text(&self, stream: &Arc<LogStream>) -> String {
-        let filtering = !self.matched_filter.is_empty();
+        let filtering = !self.matched_filter.is_empty() && self.only_matching;
         stream.with(|buf| {
             let mut out = String::new();
             let mut push = |line: &skiff_core::LogLine| {
@@ -531,7 +660,7 @@ impl Dock {
                 }
                 ui.push_id(tab.id, |ui| match &mut tab.kind {
                     TabKind::Logs(l) => l.ui(ui, pal, &mut out.toasts),
-                    TabKind::Shell(s) => out.terminal_focused = s.ui(ui, pal),
+                    TabKind::Shell(s) => out.terminal_focused = s.ui(ui, pal, &mut out.toasts),
                     TabKind::Forwards => forwards_ui(ui, pal, sessions, &mut out.toasts),
                 });
             });
