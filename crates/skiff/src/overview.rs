@@ -136,6 +136,26 @@ fn limited_access(ui: &mut Ui, pal: &Palette, home: Option<&str>) -> Option<Acti
 
 /// Alerts shown before "… and N more".
 const MAX_ALERTS: usize = 12;
+/// Characters of an alert's name shown in its row (the rest on hover).
+const MAX_ALERT_NAME: usize = 48;
+
+/// The line under the listed alerts: how many more there are. `more` are
+/// in the selected scope and not listed; `omitted` are firing in the
+/// cluster but were not kept (`Alerts::omitted`), so which scope they
+/// belong to is not known.
+fn more_alerts_text(more: usize, omitted: usize, whole_cluster: bool) -> Option<String> {
+    match (more, omitted) {
+        (0, 0) => None,
+        (more, 0) => Some(format!("… and {} more", widgets::thousands(more))),
+        (more, omitted) if whole_cluster => Some(format!("… and {} more", widgets::thousands(more + omitted))),
+        (0, omitted) => Some(format!("… and {} less severe in the cluster that are not counted here", widgets::thousands(omitted))),
+        (more, omitted) => Some(format!(
+            "… and {} more, and {} less severe in the cluster that are not counted here",
+            widgets::thousands(more),
+            widgets::thousands(omitted)
+        )),
+    }
+}
 
 /// The object an alert is about, as something that can be opened. A node
 /// that the alert knows by address only is looked up among the nodes.
@@ -198,7 +218,8 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         let title = if alerts.loaded && alerts.error.is_none() {
-            format!("Firing alerts · {}", shown.len())
+            // (Not every alert was kept: the count is a lower bound.)
+            format!("Firing alerts · {}{}", shown.len(), if alerts.omitted > 0 { "+" } else { "" })
         } else {
             "Firing alerts".to_string()
         };
@@ -245,7 +266,11 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
                         ui.set_min_width(62.0);
                         widgets::pill(ui, severity_text(&alert.severity), color, pal);
                     });
-                    ui.label(widgets::semibold(&alert.name, 13.0).color(pal.text));
+                    let name = widgets::clipped(&alert.name, MAX_ALERT_NAME);
+                    let label = ui.label(widgets::semibold(&*name, 13.0).color(pal.text));
+                    if *name != alert.name {
+                        label.on_hover_text(&alert.name);
+                    }
                     match alert_object(alert, nodes) {
                         Some((key, namespace, name)) => {
                             ui.label(RichText::new(&*key.kind).color(pal.muted).size(12.0));
@@ -278,9 +303,9 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
                     });
                 });
             }
-            if shown.len() > MAX_ALERTS {
+            if let Some(more) = more_alerts_text(shown.len().saturating_sub(MAX_ALERTS), alerts.omitted, ns.is_empty()) {
                 ui.add_space(4.0);
-                ui.label(RichText::new(format!("… and {} more", shown.len() - MAX_ALERTS)).color(pal.muted));
+                ui.label(RichText::new(more).color(pal.muted));
             }
         });
     action
@@ -489,4 +514,29 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
         ui.add_space(20.0);
     });
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_line_under_the_alerts_counts_what_is_not_listed() {
+        assert_eq!(more_alerts_text(0, 0, true), None);
+        assert_eq!(more_alerts_text(3, 0, false).as_deref(), Some("… and 3 more"));
+        // Alerts the cluster has but Skiff did not keep are part of "more"
+        // for the whole cluster, and named apart for a selection of
+        // namespaces (nobody knows which of them belong to it).
+        assert_eq!(more_alerts_text(1988, 50, true).as_deref(), Some("… and 2,038 more"));
+        assert_eq!(
+            more_alerts_text(2, 50, false).as_deref(),
+            Some("… and 2 more, and 50 less severe in the cluster that are not counted here")
+        );
+        assert_eq!(
+            more_alerts_text(0, 50, false).as_deref(),
+            Some("… and 50 less severe in the cluster that are not counted here")
+        );
+        assert_eq!(widgets::clipped("KubePodCrashLooping", 48), "KubePodCrashLooping");
+        assert_eq!(widgets::clipped("ééé and more", 3), "ééé…");
+    }
 }

@@ -20,12 +20,19 @@ use crate::session::{ContextInfo, Contexts};
 /// `~/.kube/config`) or an explicit list of entries. An entry is a file, a
 /// directory (every file directly in it), and may start with `~` and use
 /// `*` / `?` wildcards in its last path component
-/// (`~/.kube/conf.d/*.yaml`).
+/// (`~/.kube/conf.d/*.yaml`). The entry [`DEFAULT_ENTRY`] stands for the
+/// kubectl default, so a list can add to it instead of replacing it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KubeconfigSources {
     /// `None`: the kubectl default, re-evaluated on every load.
     entries: Option<Vec<String>>,
 }
+
+/// The entry of an explicit list that stands for the kubectl default: the
+/// files `$KUBECONFIG` lists, else `~/.kube/config`. It is resolved on
+/// every load, like the default itself, so a list that starts with it
+/// keeps following the environment.
+pub const DEFAULT_ENTRY: &str = "$KUBECONFIG";
 
 impl KubeconfigSources {
     /// `$KUBECONFIG` (a path list), else `~/.kube/config`.
@@ -54,12 +61,13 @@ impl KubeconfigSources {
     }
 
     /// The same sources with one more entry. Starting from the default
-    /// keeps what the default currently resolves to, so adding a file from
-    /// the UI does not hide the clusters that were already listed.
+    /// gives [`DEFAULT_ENTRY`] and then the entry, so adding a file from
+    /// the UI neither hides the clusters that were already listed nor
+    /// freezes them at what `$KUBECONFIG` holds today.
     pub fn with_entry(&self, entry: impl Into<String>) -> Self {
         let mut entries: Vec<String> = match &self.entries {
             Some(e) => e.clone(),
-            None => default_paths().iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            None => vec![DEFAULT_ENTRY.to_string()],
         };
         let entry = entry.into();
         if !entry.trim().is_empty() && !entries.contains(&entry) {
@@ -245,8 +253,9 @@ fn contexts_of(kc: &Kubeconfig, origin: &HashMap<String, PathBuf>) -> Contexts {
             let server = cluster.and_then(|c| c.server.clone()).unwrap_or_default();
             let insecure = cluster.and_then(|c| c.insecure_skip_tls_verify).unwrap_or(false)
                 || server.trim_start().to_ascii_lowercase().starts_with("http://");
-            let exec_command =
-                auth_of(kc, &user).and_then(|a| a.exec.as_ref()).and_then(|e| e.command.as_deref()).map(command_name);
+            let exec = auth_of(kc, &user).and_then(|a| a.exec.as_ref());
+            let exec_command = exec.and_then(|e| e.command.as_deref()).map(command_name);
+            let exec_missing = exec.is_some_and(plugin_is_missing);
             ContextInfo {
                 name: c.name.clone(),
                 namespace: ctx.and_then(|c| c.namespace.clone()),
@@ -257,6 +266,7 @@ fn contexts_of(kc: &Kubeconfig, origin: &HashMap<String, PathBuf>) -> Contexts {
                 server,
                 insecure,
                 exec_command,
+                exec_missing,
             }
         })
         .collect();
@@ -306,7 +316,12 @@ fn expand_tilde(entry: &str, home: Option<&Path>) -> PathBuf {
 }
 
 fn expand_entry(entry: &str, out: &mut Vec<PathBuf>) {
-    expand_entry_with(entry.trim(), home_dir().as_deref(), out)
+    let entry = entry.trim();
+    if entry == DEFAULT_ENTRY {
+        out.extend(default_paths());
+    } else {
+        expand_entry_with(entry, home_dir().as_deref(), out)
+    }
 }
 
 fn expand_entry_with(entry: &str, home: Option<&Path>, out: &mut Vec<PathBuf>) {
@@ -635,6 +650,23 @@ mod tests {
         assert_eq!(s.entries(), Some(&["/x/a".to_string(), "/x/b".to_string()][..]));
         let s = s.with_entry("/x/c").with_entry("/x/a");
         assert_eq!(s.resolve(), [PathBuf::from("/x/a"), PathBuf::from("/x/b"), PathBuf::from("/x/c")]);
+
+        // Adding to the default keeps it the default, by name: whatever
+        // $KUBECONFIG / ~/.kube/config resolve to at each load, then the
+        // new entry.
+        let added = KubeconfigSources::from_env().with_entry("/x/new.yaml");
+        assert!(!added.is_default());
+        assert_eq!(added.entries(), Some(&[DEFAULT_ENTRY.to_string(), "/x/new.yaml".to_string()][..]));
+        let mut want = default_paths();
+        want.push(PathBuf::from("/x/new.yaml"));
+        let mut seen = HashSet::new();
+        want.retain(|p| seen.insert(p.clone()));
+        assert_eq!(added.resolve(), want);
+        // The entry is the default wherever it stands, and spaces around
+        // it do not matter.
+        let last = KubeconfigSources::explicit(["/x/first.yaml", " $KUBECONFIG "]);
+        assert_eq!(last.resolve()[0], PathBuf::from("/x/first.yaml"));
+        assert_eq!(last.resolve().len(), 1 + default_paths().iter().filter(|p| *p != Path::new("/x/first.yaml")).count());
         // An explicit empty list reads nothing at all.
         assert!(load(&KubeconfigSources::explicit(Vec::<String>::new())).searched.is_empty());
     }

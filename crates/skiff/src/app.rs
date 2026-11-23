@@ -211,31 +211,29 @@ fn config_sources(config: &Config) -> KubeconfigSources {
 /// The `kubeconfigs` list to save when `entry` is added from the UI.
 ///
 /// The first entry starts the list, and from then on only the list is
-/// read. So that the clusters shown until now stay, it starts with what
-/// was read until now: the files of `$KUBECONFIG` (`kubeconfig_env`) when
-/// that lists any, else `~/.kube/config`, written like that rather than
-/// as this user's home directory, so that the file also means the right
-/// thing for another user or on another computer.
-fn kubeconfigs_with_added(listed: Option<&[String]>, kubeconfig_env: Option<std::ffi::OsString>, entry: &str) -> KubeconfigSources {
-    let current: Vec<String> = match listed {
-        Some(entries) => entries.to_vec(),
-        None => {
-            let from_env: Vec<String> = kubeconfig_env
-                .map(|v| {
-                    std::env::split_paths(&v)
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if from_env.is_empty() {
-                vec!["~/.kube/config".to_string()]
-            } else {
-                from_env
-            }
-        }
-    };
-    KubeconfigSources::explicit(current).with_entry(entry)
+/// read. So that the clusters shown until now stay, and keep following
+/// the environment, the list starts with
+/// [`skiff_core::kubeconfig::DEFAULT_ENTRY`] (`"$KUBECONFIG"`), which is
+/// resolved on every load to the files `$KUBECONFIG` lists, else
+/// `~/.kube/config`: nothing of this computer or this moment is written
+/// into the file.
+fn kubeconfigs_with_added(listed: Option<&[String]>, entry: &str) -> KubeconfigSources {
+    match listed {
+        Some(entries) => KubeconfigSources::explicit(entries.iter().cloned()),
+        None => KubeconfigSources::from_env(),
+    }
+    .with_entry(entry)
+}
+
+/// The text on the system clipboard, for [`SkiffApp::clipboard_reader`]:
+/// `Some("")` when it holds something that is not text (or nothing),
+/// `None` when it could not be read at all.
+fn system_clipboard_text() -> Option<String> {
+    match arboard::Clipboard::new().ok()?.get_text() {
+        Ok(text) => Some(text),
+        Err(arboard::Error::ContentNotAvailable) => Some(String::new()),
+        Err(_) => None,
+    }
 }
 
 /// Whether a native "open file" dialog can be expected to appear. On
@@ -409,12 +407,13 @@ pub struct SkiffApp {
     /// whether the clipboard still holds it.
     secret_hash: u64,
     secret_hasher: std::collections::hash_map::RandomState,
-    /// Reads the system clipboard's text (`None`: it has none, or it
-    /// could not be read). With it, a copied secret is only cleared while
-    /// the clipboard still holds it, so that something copied in another
-    /// app in the meantime is left alone. Without it nothing can be
-    /// checked, and the clipboard is cleared whenever nothing else was
-    /// copied in Skiff.
+    /// Reads the system clipboard's text: `Some("")` when it holds no
+    /// text, `None` when it could not be read. With it, a copied secret
+    /// is left alone when the clipboard is known to hold something else
+    /// by then (copied in another app). Without it, or when the read
+    /// fails, nothing is known, and the clipboard is cleared whenever
+    /// nothing else was copied in Skiff: a secret is never left behind
+    /// because of a clipboard that would not answer.
     pub clipboard_reader: Option<Box<dyn Fn() -> Option<String>>>,
     /// A secret was copied during this frame.
     secret_copied: bool,
@@ -605,6 +604,7 @@ impl SkiffApp {
         app.updater.enable();
         app.native_file_dialog = native_file_dialog_available();
         app.headless = false;
+        app.clipboard_reader = Some(Box::new(system_clipboard_text));
         app.open_files = true;
         app.settings_stamps = app.read_settings_stamps();
         let (keymap, error) = Keymap::load();
@@ -1016,10 +1016,10 @@ impl SkiffApp {
     /// copied in Skiff first. `what` names it in the notification.
     ///
     /// (egui cannot read the clipboard back. Where there is a
-    /// [`SkiffApp::clipboard_reader`], the clipboard is cleared only if it
-    /// still holds the secret; otherwise that is not known, and it is
-    /// cleared whenever nothing else was copied from Skiff in the
-    /// meantime. The notification says which.)
+    /// [`SkiffApp::clipboard_reader`], the clipboard is left alone when
+    /// it is found to hold something else by then; where there is none,
+    /// or the read fails, it is cleared whenever nothing else was copied
+    /// from Skiff in the meantime. The notification says which.)
     pub fn copy_secret(&mut self, ctx: &egui::Context, text: String, what: &str) {
         use std::hash::BuildHasher;
         self.secret_hash = self.secret_hasher.hash_one(&text);
@@ -1031,13 +1031,12 @@ impl SkiffApp {
     }
 
     /// Whether the secret copied last is still what the clipboard holds,
-    /// as far as that can be known: `None` without a reader.
+    /// as far as that can be known: `None` without a reader, or when the
+    /// clipboard could not be read.
     fn clipboard_holds_secret(&self) -> Option<bool> {
         use std::hash::BuildHasher;
-        let read = self.clipboard_reader.as_ref()?;
-        // (A clipboard that cannot be read, or holds no text, is not
-        // known to hold the secret: left alone rather than wiped.)
-        Some(read().is_some_and(|text| self.secret_hasher.hash_one(&text) == self.secret_hash))
+        let text = (self.clipboard_reader.as_ref()?)()?;
+        Some(self.secret_hasher.hash_one(&text) == self.secret_hash)
     }
 
     /// Whether a copied secret is waiting to be cleared from the clipboard.
@@ -1062,7 +1061,9 @@ impl SkiffApp {
             if left.is_zero() {
                 self.secret_clear_at = None;
                 // Read once, now, not every frame. Something copied in
-                // another app since is not ours to clear (nor to announce).
+                // another app since is not ours to clear (nor to announce);
+                // a clipboard that cannot be read is cleared, as the
+                // secret may well still be on it.
                 if self.clipboard_holds_secret().unwrap_or(true) {
                     ctx.copy_text(String::new());
                     self.toast("Clipboard cleared", Tone::Normal);
@@ -1170,6 +1171,7 @@ impl SkiffApp {
                     read_only: self.cluster_read_only(&c.name),
                     confirm: cluster.confirm,
                     plugin: c.exec_command.clone(),
+                    plugin_missing: c.exec_missing,
                 }
             })
             .collect();
@@ -1452,7 +1454,7 @@ impl SkiffApp {
         // Added to what is read today, so that the clusters from
         // $KUBECONFIG / ~/.kube/config stay.
         let starts_list = self.config.kubeconfigs().is_none();
-        let saved = kubeconfigs_with_added(self.config.kubeconfigs(), std::env::var_os("KUBECONFIG"), &entry);
+        let saved = kubeconfigs_with_added(self.config.kubeconfigs(), &entry);
         let in_effect = if self.cli_kubeconfigs { self.core.kubeconfig_sources().with_entry(entry.clone()) } else { saved.clone() };
         self.edit_config(|c| c.set_kubeconfigs(saved.entries()));
         self.core.set_kubeconfig_sources(in_effect);
@@ -1462,7 +1464,7 @@ impl SkiffApp {
         if starts_list && self.config.kubeconfigs().is_some() {
             // From now on the list decides, which is easy to miss.
             text.push_str(
-                ". Skiff now reads the kubeconfig list in config.json and no longer follows $KUBECONFIG; see Settings > Clusters.",
+                ". Skiff now reads the kubeconfig list in config.json: \"$KUBECONFIG\" (kubectl's own locations, still followed) and this file; see Settings > Clusters.",
             );
         }
         self.toast(text, Tone::Ok);
@@ -4247,22 +4249,18 @@ mod tests {
     #[test]
     fn the_first_added_kubeconfig_keeps_what_was_read_before() {
         let entries = |s: KubeconfigSources| s.entries().map(<[String]>::to_vec).unwrap_or_default();
-        // No list and no $KUBECONFIG: the default file, not this user's
-        // expanded home directory.
-        for env in [None, Some(std::ffi::OsString::new())] {
-            assert_eq!(entries(kubeconfigs_with_added(None, env, "/x/staging.yaml")), ["~/.kube/config", "/x/staging.yaml"]);
-        }
-        // $KUBECONFIG's files, in order.
-        let env = std::env::join_paths(["/tmp/kind.yaml", "/tmp/other.yaml"]).unwrap();
-        assert_eq!(
-            entries(kubeconfigs_with_added(None, Some(env.clone()), "/x/staging.yaml")),
-            ["/tmp/kind.yaml", "/tmp/other.yaml", "/x/staging.yaml"]
-        );
-        // A list that exists is added to, whatever the environment says,
-        // and not twice.
+        // No list yet: the default by name (resolved at every load, so a
+        // $KUBECONFIG that changes later is still followed), not the
+        // files it holds today or this user's home directory.
+        assert_eq!(entries(kubeconfigs_with_added(None, "/x/staging.yaml")), ["$KUBECONFIG", "/x/staging.yaml"]);
+        // A list that exists is added to, and not twice.
         let listed = ["~/a".to_string()];
-        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), Some(env.clone()), "/b")), ["~/a", "/b"]);
-        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), Some(env), "~/a")), ["~/a"]);
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), "/b")), ["~/a", "/b"]);
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), "~/a")), ["~/a"]);
+        // What is saved reads back as the same sources.
+        let mut config = Config::default();
+        config.set_kubeconfigs(kubeconfigs_with_added(None, "/x/staging.yaml").entries());
+        assert_eq!(entries(config_sources(&config)), ["$KUBECONFIG", "/x/staging.yaml"]);
     }
 
     #[test]

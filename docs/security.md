@@ -70,8 +70,10 @@ is embedded, and neither `kubectl` nor `helm` is bundled; your own
   hidden until you reveal them.
 - A value or a Secret's YAML that you copy with Skiff's copy button is
   cleared from the clipboard after 60 seconds, unless you copied something
-  else since (where Skiff cannot read the clipboard to tell: something
-  else in Skiff). Two gaps: text you select and copy by hand from a
+  else since. Skiff reads the clipboard once, at that moment, to tell: if
+  it holds anything other than the copied value, in Skiff or in another
+  app, it is left alone. If the clipboard cannot be read, it is cleared
+  unless something else was copied in Skiff. Two gaps: text you select and copy by hand from a
   revealed value is not tracked, and a secret still on the clipboard when
   you quit Skiff within those 60 seconds stays there.
 
@@ -111,9 +113,11 @@ cluster can be hostile or simply broken.
 - Deleting always asks. With **Ask before changes** on for a cluster, so
   do restart, scale, cordon, suspend and apply.
 - **Read-only** makes Skiff refuse every change to a cluster, including
-  new shells and port-forwards. If the config file that holds this
-  setting cannot be read, every cluster is treated as read-only. It is a guard against mistakes inside Skiff,
-  not access control; see [clusters.md](clusters.md#read-only-clusters).
+  new shells and port-forwards (ones that are already open keep running
+  until you close them). If the config file that holds this setting
+  cannot be read, every cluster is treated as read-only. It is a guard
+  against mistakes inside Skiff, not access control; see
+  [clusters.md](clusters.md#read-only-clusters).
 
 ## Updates
 

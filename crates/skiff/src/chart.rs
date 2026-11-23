@@ -385,6 +385,27 @@ pub fn common_prefix(names: &[&str]) -> usize {
     }
 }
 
+/// Characters of a series name shown in the legend.
+const MAX_LEGEND_NAME: usize = 32;
+/// Characters of a series name shown in the readout under the crosshair
+/// and in hover texts.
+const MAX_READOUT_NAME: usize = 64;
+
+/// `name` in at most `max` characters: the start and the end with `…`
+/// between them, as the end is what tells pod names apart. Series names
+/// are label values, which can be as long as whoever wrote them liked.
+pub fn clip_name(name: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    let count = name.chars().count();
+    if count <= max.max(3) {
+        return name.into();
+    }
+    let keep = max.max(3) - 1;
+    let (head, tail) = (keep / 2, keep - keep / 2);
+    let head_end = name.char_indices().nth(head).map_or(name.len(), |(i, _)| i);
+    let tail_start = name.char_indices().nth(count - tail).map_or(name.len(), |(i, _)| i);
+    format!("{}…{}", &name[..head_end], &name[tail_start..]).into()
+}
+
 // ---------------------------------------------------------------------------
 // Painting
 
@@ -473,7 +494,7 @@ fn legend(ui: &mut Ui, pal: &Palette, lines: &[Line<'_>], hidden: usize, unit: U
             );
             match entry {
                 Some(line) if line.short != line.name => {
-                    resp.on_hover_text(line.name);
+                    resp.on_hover_text(clip_name(line.name, 4 * MAX_READOUT_NAME));
                 }
                 _ => {}
             }
@@ -550,9 +571,9 @@ pub fn show(
         lines.push(Line {
             name: &s.name,
             short: if cut > 0 {
-                format!("…{}", &s.name[cut..])
+                format!("…{}", clip_name(&s.name[cut..], MAX_LEGEND_NAME - 1))
             } else {
-                s.name.clone()
+                clip_name(&s.name, MAX_LEGEND_NAME).into_owned()
             },
             color: pal.series(i),
             reference: false,
@@ -563,7 +584,7 @@ pub fn show(
     for s in references {
         lines.push(Line {
             name: &s.name,
-            short: s.name.clone(),
+            short: clip_name(&s.name, MAX_LEGEND_NAME).into_owned(),
             color: reference_color(&s.name, pal),
             reference: true,
             points: vec![],
@@ -582,7 +603,7 @@ pub fn show(
         .chain(
             lines
                 .iter()
-                .filter_map(|l| Some(format!("{} {}", l.name, format_value(l.full.last()?.1, unit)))),
+                .filter_map(|l| Some(format!("{} {}", clip_name(l.name, MAX_READOUT_NAME), format_value(l.full.last()?.1, unit)))),
         )
         .collect::<Vec<_>>()
         .join(", ");
@@ -767,7 +788,7 @@ pub fn show(
                         .map(|(line, value)| {
                             (
                                 ui.painter()
-                                    .layout_no_wrap(line.name.to_string(), font.clone(), pal.muted),
+                                    .layout_no_wrap(clip_name(line.name, MAX_READOUT_NAME).into_owned(), font.clone(), pal.muted),
                                 ui.painter()
                                     .layout_no_wrap(format_value(*value, unit), font.clone(), pal.text),
                             )
@@ -789,7 +810,7 @@ pub fn show(
                         .chain(
                             shown
                                 .iter()
-                                .map(|(line, value)| format!("{} {}", line.name, format_value(*value, unit))),
+                                .map(|(line, value)| format!("{} {}", clip_name(line.name, MAX_READOUT_NAME), format_value(*value, unit))),
                         )
                         .collect::<Vec<_>>()
                         .join(" · ");
@@ -1005,6 +1026,20 @@ mod tests {
         // Without usage the references set the scale.
         assert_eq!(axis_max(&[series("limit", true, &[2.0])]), 2.0);
         assert_eq!(axis_max(&[]), 0.0);
+    }
+
+    #[test]
+    fn long_series_names_are_cut_in_the_middle() {
+        assert_eq!(clip_name("app", 32), "app");
+        assert_eq!(clip_name(&"a".repeat(32), 32), "a".repeat(32));
+        let long = format!("{}-tail", "x".repeat(500));
+        let short = clip_name(&long, 32);
+        assert_eq!(short.chars().count(), 32);
+        assert!(short.starts_with("xxx") && short.ends_with("x-tail") && short.contains('…'), "{short}");
+        // Not ASCII, and a limit too small to cut at.
+        let accents = "é".repeat(100);
+        assert_eq!(clip_name(&accents, 9), format!("{}…{}", "é".repeat(4), "é".repeat(4)));
+        assert_eq!(clip_name("abcdef", 0).chars().count(), 3);
     }
 
     #[test]

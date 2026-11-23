@@ -34,7 +34,7 @@ back after you edited it. There are no secrets in it.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `kubeconfigs` | list of paths | `$KUBECONFIG`, else `~/.kube/config` | Kubeconfig files to read. An entry is a file or a directory (every file in it); it may start with `~` and use `*` in its last part. When set, nothing else is read. |
+| `kubeconfigs` | list of paths | `$KUBECONFIG`, else `~/.kube/config` | Kubeconfig files to read. An entry is a file or a directory (every file in it); it may start with `~` and use `*` in its last part. The entry `"$KUBECONFIG"` stands for kubectl's own locations (the files `$KUBECONFIG` lists, else `~/.kube/config`), looked up each time the files are read. When set, nothing else is read. |
 | `updates.check` | true or false | `true` | Look for a new version of Skiff at startup. `SKIFF_NO_UPDATE_CHECK=1` also turns it off. |
 | `updates.channel` | `"stable"` or `"nightly"` | `"stable"` | Which releases to offer: stable releases only, or every build of the main branch. |
 | `terminal` | text | Skiff picks one | The terminal app for "open in terminal": a name such as `iTerm`, `Ghostty` or `kitty`, or on Linux a program path. `$SKIFF_TERMINAL` wins over it. |
@@ -57,7 +57,7 @@ A complete file using every key:
 
 ```json
 {
-  "kubeconfigs": ["~/.kube/config", "~/.kube/conf.d/*.yaml"],
+  "kubeconfigs": ["$KUBECONFIG", "~/.kube/conf.d/*.yaml"],
   "updates": { "check": true, "channel": "stable" },
   "terminal": "iTerm",
   "theme": "system",
@@ -96,10 +96,13 @@ data folder of your system and needs no editing.
 
 ## Which kubeconfig files are read
 
+![The welcome page of a computer without a kubeconfig: where Skiff looked, and how to add a file](img/welcome.png)
+
 The first of these that applies:
 
 1. `--kubeconfig <path>` on the command line (repeat it to merge several).
-2. `kubeconfigs` in `config.json`.
+2. `kubeconfigs` in `config.json`. Only what the list names is read; the
+   entry `"$KUBECONFIG"` in it names the two places below.
 3. The path list in `$KUBECONFIG`.
 4. `~/.kube/config` (Windows: `%USERPROFILE%\.kube\config`).
 
@@ -114,11 +117,19 @@ Rules:
   directly in it except hidden files and editor backups (`name~`), and
   may use `~` and `*` or `?` wildcards in its last part, for example
   `~/.kube/conf.d/*.yaml`.
+- The entry `"$KUBECONFIG"` (written exactly like that; it is not a
+  general way to use environment variables) stands for what `kubectl`
+  reads: the files listed in `$KUBECONFIG`, or `~/.kube/config` when that
+  is not set. It is looked up every time the files are read, so a list
+  that contains it keeps following your environment.
 - **Add kubeconfig file…** (welcome page, cluster menu, Settings →
   Clusters, the palette, or dropping a file on the window) writes
-  `kubeconfigs` for you: the files Skiff reads at that moment plus the new
-  one. From then on `$KUBECONFIG` is no longer followed; remove the key,
-  or choose "Use kubectl's locations" in Settings → Clusters, to go back.
+  `kubeconfigs` for you. If there was no list yet, it becomes
+  `["$KUBECONFIG", "<the new file>"]`: kubectl's locations, still
+  followed, and the new file. From then on only the list is read; take
+  the `"$KUBECONFIG"` entry off it (Settings → Clusters) to stop reading
+  kubectl's locations, or remove the key, or choose "Use kubectl's
+  locations" there, to go back to them alone.
 - The files are read again when the window gets the focus back and one of
   them has changed, and by **Reload kubeconfig** in the cluster menu or
   the palette. A cluster you added with `aws eks update-kubeconfig` shows

@@ -542,7 +542,7 @@ mod tests {
         assert!(!j.is_done());
         j.finish(Ok(7));
         assert!(j.is_done());
-        assert_eq!(j.peek(|r| r.map(|r| r.clone())), Some(Ok(7)));
+        assert_eq!(j.peek(|r| r.cloned()), Some(Ok(7)));
         assert_eq!(j.take(), Some(Ok(7)));
         assert!(j.take().is_none());
     }

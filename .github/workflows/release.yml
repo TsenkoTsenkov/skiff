@@ -256,6 +256,8 @@ jobs:
 
       - name: Check what was built
         id: verify
+        env:
+          WANT_VERSION: ${{ needs.meta.outputs.version }}
         run: |
           app=target/release/Skiff.app
           lipo -archs "$app/Contents/MacOS/Skiff"
@@ -270,6 +272,9 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = io.github.tsenkotsenkov.skiff
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$SKIFF_BUILD"
+          # The updater refuses a stable release whose plist version is
+          # not the version of its tag, which is the one in Cargo.toml.
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$WANT_VERSION"
           ls -l target/release/Skiff-macos-universal.dmg \
             "target/release/Skiff-macos-arm64-build-$SKIFF_BUILD.zip" \
             "target/release/Skiff-macos-x86_64-build-$SKIFF_BUILD.zip"

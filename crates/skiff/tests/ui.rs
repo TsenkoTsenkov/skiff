@@ -593,7 +593,9 @@ fn opening_details_keeps_the_clicked_row_in_view() {
     let (first, _) = h.state().row_at(0).unwrap();
     h.get_all_by_label(&first).next().expect("first row").click();
     settle(&mut h, "detail panel", |h| h.state().detail.is_some());
-    assert_eq!(h.state().table_stats().0, filtered, "still the filtered list");
+    // (The demo cluster's churn loop adds and removes pods while this runs.)
+    let shown = h.state().table_stats().0;
+    assert!(shown.abs_diff(filtered) <= 5 && shown < total, "still the filtered list: {shown} of {total}, was {filtered}");
     h.key_press(egui::Key::Escape); // closes the panel
     steps(&mut h, 3);
     assert!(h.state().detail.is_none());
@@ -1131,8 +1133,13 @@ fn is_disabled(h: &Harness<'static, SkiffApp>, label: &str) -> Option<bool> {
 fn welcome_page_when_there_is_no_kubeconfig() {
     let dir = scratch("welcome");
     let missing = dir.join("kube").join("config");
+    // For the pictures, the file a new user really lacks (shown as
+    // ~/.kube/config), where this computer lacks it too; a path in the
+    // build folder otherwise. Nothing is written to it.
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let shown = home.map(|h| h.join(".kube").join("config")).filter(|p| !p.exists()).unwrap_or_else(|| missing.clone());
     for light in [false, true] {
-        let opts = AppOptions { kubeconfigs: vec![missing.clone()], light, ..Default::default() };
+        let opts = AppOptions { kubeconfigs: vec![shown.clone()], light, ..Default::default() };
         let mut h = harness_opts(opts, [1280.0, 800.0]);
         steps(&mut h, 4);
         assert!(has_label(&h, "Welcome to Skiff"));
@@ -2046,15 +2053,22 @@ fn a_copied_secret_is_cleared_from_the_clipboard() {
         assert!(h.output().platform_output.commands.is_empty(), "another app's copy is not wiped");
     }
     assert!(!h.state().secret_on_clipboard(), "and the clearing is off");
-    // (A clipboard that cannot be read is left alone as well.)
+    // (So is a clipboard that holds no text: an image, say.)
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    step_until_copied(&mut h);
+    *clipboard.borrow_mut() = Some(String::new());
+    std::thread::sleep(Duration::from_millis(650));
+    for _ in 0..3 {
+        h.step();
+        assert!(h.output().platform_output.commands.is_empty(), "a clipboard without text is not wiped");
+    }
+    assert!(!h.state().secret_on_clipboard());
+    // A clipboard that cannot be read may still hold the secret: cleared.
     h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
     step_until_copied(&mut h);
     *clipboard.borrow_mut() = None;
     std::thread::sleep(Duration::from_millis(650));
-    for _ in 0..3 {
-        h.step();
-        assert!(h.output().platform_output.commands.is_empty(), "an unreadable clipboard is not wiped");
-    }
+    assert_eq!(step_until_copied(&mut h), "", "an unreadable clipboard is cleared");
     assert!(!h.state().secret_on_clipboard());
     // Still the secret: cleared.
     h.get_all_by_label("Copy decoded value").next().expect("copy button").click();

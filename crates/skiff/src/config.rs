@@ -161,7 +161,9 @@ pub const KEYS: &[KeyDoc] = &[
         kind: "list of paths",
         default: "$KUBECONFIG, else ~/.kube/config",
         doc: "Kubeconfig files to read. An entry is a file or a directory (every file in it); \
-              it may start with ~ and use * in its last part. When set, nothing else is read.",
+              it may start with ~ and use * in its last part. The entry \"$KUBECONFIG\" stands for \
+              kubectl's own locations (the files $KUBECONFIG lists, else ~/.kube/config), looked up \
+              each time the files are read. When set, nothing else is read.",
     },
     KeyDoc {
         key: "updates.check",
@@ -178,7 +180,7 @@ pub const KEYS: &[KeyDoc] = &[
     KeyDoc {
         key: "terminal",
         kind: "text",
-        default: "the built-in terminal's \"open in terminal app\" picks one",
+        default: "Skiff picks one",
         doc: "The terminal app for \"open in terminal\": a name such as iTerm, Ghostty or kitty, \
               or on Linux a program path. $SKIFF_TERMINAL wins over it.",
     },
@@ -251,7 +253,7 @@ pub const KEYS: &[KeyDoc] = &[
 /// A complete file using every key. It is valid JSON (JSON has no
 /// comments; the explanations are in [`KEYS`] / [`documentation`]).
 pub const EXAMPLE: &str = r#"{
-  "kubeconfigs": ["~/.kube/config", "~/.kube/conf.d/*.yaml"],
+  "kubeconfigs": ["$KUBECONFIG", "~/.kube/conf.d/*.yaml"],
   "updates": { "check": true, "channel": "stable" },
   "terminal": "iTerm",
   "theme": "system",
@@ -549,8 +551,9 @@ impl Config {
     /// Appends one entry to `kubeconfigs` unless it is already there. With
     /// no list yet the entry becomes the whole list, which stops
     /// `$KUBECONFIG` from being read: to keep what was shown, pass the
-    /// entries of `KubeconfigSources::with_entry` to
-    /// [`Config::set_kubeconfigs`] instead.
+    /// entries of `KubeconfigSources::with_entry` (which starts such a
+    /// list with the `"$KUBECONFIG"` entry) to [`Config::set_kubeconfigs`]
+    /// instead.
     pub fn add_kubeconfig(&mut self, entry: &str) {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -1184,7 +1187,7 @@ mod tests {
         assert_eq!(warnings, Vec::<String>::new());
         assert_eq!(
             config.kubeconfigs(),
-            Some(&["~/.kube/config".to_string(), "~/.kube/conf.d/*.yaml".to_string()][..])
+            Some(&["$KUBECONFIG".to_string(), "~/.kube/conf.d/*.yaml".to_string()][..])
         );
         assert_eq!(config.updates(), Updates { check: true, channel: Channel::Stable });
         assert_eq!(config.terminal(), Some("iTerm"));
@@ -1389,6 +1392,21 @@ mod tests {
         c.set_theme(Theme::System);
         assert_eq!(c.theme(), Some(Theme::System));
         assert_eq!(c.raw["theme"], json!("system"));
+    }
+
+    /// docs/configuration.md repeats [`KEYS`] and [`EXAMPLE`] for people
+    /// who read the documentation rather than the program: they must say
+    /// the same (the document adds `code` marks, nothing else).
+    #[test]
+    fn the_documentation_page_matches_the_keys() {
+        let page = include_str!("../../../docs/configuration.md").replace("\r\n", "\n");
+        for k in KEYS {
+            let start = format!("| `{}` |", k.key);
+            let row = page.lines().find(|l| l.starts_with(&start)).unwrap_or_else(|| panic!("{} is not in docs/configuration.md", k.key));
+            let cells: Vec<String> = row.trim_matches('|').split(" | ").map(|c| c.trim().replace('`', "")).collect();
+            assert_eq!(cells, [k.key, k.kind, k.default, k.doc], "docs/configuration.md, row of {}", k.key);
+        }
+        assert!(page.contains(&format!("```json\n{EXAMPLE}```")), "docs/configuration.md does not show EXAMPLE as it is");
     }
 
     #[test]

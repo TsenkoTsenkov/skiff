@@ -207,7 +207,10 @@ pub struct KubeFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Kube {
     pub files: Vec<KubeFile>,
-    /// Credential plugin command → where it was found on `PATH`.
+    /// Credential plugin command → where it is on Skiff's `PATH`, for the
+    /// hover text. Whether a cluster's plugin is missing is
+    /// [`ClusterRow::plugin_missing`], which also knows the `PATH` its
+    /// kubeconfig entry sets.
     pub plugins: BTreeMap<String, Option<PathBuf>>,
 }
 
@@ -240,7 +243,14 @@ pub fn kube_model(sources: &KubeconfigSources, report: &KubeconfigReport, contex
                         }
                     }
                 };
-                KubeFile { label: entry.clone(), state, remove: removable.then(|| entry.clone()) }
+                // (The entry that stands for kubectl's locations says what
+                // it means.)
+                let label = if entry.trim() == skiff_core::kubeconfig::DEFAULT_ENTRY {
+                    format!("{entry}, else ~/.kube/config")
+                } else {
+                    entry.clone()
+                };
+                KubeFile { label, state, remove: removable.then(|| entry.clone()) }
             })
             .collect(),
         None => sources
@@ -267,6 +277,9 @@ pub struct ClusterRow {
     pub confirm: bool,
     /// The credential plugin its kubeconfig entry runs (`aws`, `gke-gcloud-auth-plugin`).
     pub plugin: Option<String>,
+    /// That plugin is certain not to start: the check a connection makes
+    /// first (`ContextInfo::exec_missing`), so both say the same.
+    pub plugin_missing: bool,
 }
 
 /// Everything the window shows, as it is in effect now.
@@ -554,7 +567,7 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
     widgets::caption(ui, "Kubeconfig files", pal);
     let source = match model.kube_source {
         KubeSource::CommandLine => "Given with --kubeconfig, for this run only.",
-        KubeSource::ConfigFile => "The list in config.json. $KUBECONFIG is not read while there is one.",
+        KubeSource::ConfigFile => "The list in config.json. $KUBECONFIG is read only where the list names it.",
         KubeSource::Environment => "From $KUBECONFIG, as kubectl reads it.",
         KubeSource::Default => "The place kubectl looks in. $KUBECONFIG is not set.",
     };
@@ -598,7 +611,7 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
     });
     if model.kube_source != KubeSource::ConfigFile && model.kube_source != KubeSource::CommandLine {
         ui.add_space(2.0);
-        note(ui, pal, "Adding a file starts a list in config.json with these locations and the new one.");
+        note(ui, pal, "Adding a file starts a list in config.json: \"$KUBECONFIG\" (these locations, still followed) and the new file.");
     }
 
     ui.add_space(18.0);
@@ -647,7 +660,7 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
                         }
                     });
                     if let Some(plugin) = &row.plugin {
-                        plugin_line(ui, pal, plugin, model.kube.plugins.get(plugin).and_then(|p| p.as_deref()));
+                        plugin_line(ui, pal, plugin, row.plugin_missing, model.kube.plugins.get(plugin).and_then(|p| p.as_deref()));
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -680,26 +693,26 @@ fn toggle_cell(ui: &mut Ui, pal: &Palette, width: f32, on: bool, enabled: bool, 
     clicked
 }
 
-fn plugin_line(ui: &mut Ui, pal: &Palette, plugin: &str, found: Option<&Path>) {
+fn plugin_line(ui: &mut Ui, pal: &Palette, plugin: &str, missing: bool, found: Option<&Path>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        match found {
-            Some(path) => {
-                ui.label(widgets::icon(icons::ICON_KEY, 13.0).color(pal.faint));
-                ui.add(egui::Label::new(RichText::new(format!("Signs in with {plugin}")).color(pal.muted).size(12.0)).truncate())
-                    .on_hover_text(format!("The credential plugin this cluster's kubeconfig entry runs.\nFound at {}", path.display()));
+        if missing {
+            ui.label(widgets::icon(icons::ICON_WARNING, 13.0).color(pal.warn));
+            ui.add(
+                egui::Label::new(RichText::new(format!("Signs in with {plugin}, which was not found")).color(pal.warn).size(12.0)).truncate(),
+            )
+            .on_hover_text(format!(
+                "This cluster's kubeconfig entry runs {plugin} to sign in, and no program of that name is where it will be looked for \
+                 (your PATH, and the PATH its kubeconfig entry sets, if any). Install it, or start Skiff from a terminal where it works."
+            ));
+        } else {
+            let mut tip = "The credential plugin this cluster's kubeconfig entry runs.".to_string();
+            if let Some(path) = found {
+                tip.push_str(&format!("\nFound at {}", path.display()));
             }
-            None => {
-                ui.label(widgets::icon(icons::ICON_WARNING, 13.0).color(pal.warn));
-                ui.add(
-                    egui::Label::new(RichText::new(format!("Signs in with {plugin}, which was not found")).color(pal.warn).size(12.0))
-                        .truncate(),
-                )
-                .on_hover_text(format!(
-                    "This cluster's kubeconfig entry runs {plugin} to sign in, and no program of that name is on your PATH. \
-                     Install it, or start Skiff from a terminal where it works."
-                ));
-            }
+            ui.label(widgets::icon(icons::ICON_KEY, 13.0).color(pal.faint));
+            ui.add(egui::Label::new(RichText::new(format!("Signs in with {plugin}")).color(pal.muted).size(12.0)).truncate())
+                .on_hover_text(tip);
         }
     });
 }
@@ -1089,6 +1102,7 @@ mod tests {
                 insecure: false,
                 proxy: None,
                 exec_command: Some("skiff-test-no-such-plugin".into()),
+                exec_missing: true,
                 file: Some(good.clone()),
             });
         }
@@ -1100,6 +1114,13 @@ mod tests {
         );
         assert_eq!(kube.files[0].remove.as_deref(), Some(entries[0].as_str()));
         assert_eq!(kube.plugins.get("skiff-test-no-such-plugin"), Some(&None));
+        // The entry that stands for kubectl's locations says so, and is
+        // taken off the list by its own name.
+        let with_default = KubeconfigSources::from_env().with_entry(entries[0].clone());
+        let kube = kube_model(&with_default, &report, &contexts, true);
+        assert_eq!(kube.files[0].label, "$KUBECONFIG, else ~/.kube/config");
+        assert_eq!(kube.files[0].remove.as_deref(), Some("$KUBECONFIG"));
+        assert_eq!(kube.files[1].label, entries[0]);
         // The default locations cannot be taken off a list that is not there.
         let kube = kube_model(&sources, &report, &contexts, false);
         assert!(kube.files.iter().all(|f| f.remove.is_none()));

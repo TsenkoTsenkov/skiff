@@ -16,7 +16,7 @@ use skiff_core::session::is_critical;
 use skiff_core::util::enc;
 use skiff_core::{
     fmt_age, now_unix, Alert, AlertKind, AlertTarget, Alerts, Job, Prom, PromError, PromStatus, ResourceKey, Session,
-    TimeRange,
+    TimeRange, UsageHistory,
 };
 
 use crate::chart;
@@ -107,11 +107,124 @@ struct Loaded {
     at: Instant,
 }
 
+/// Charts of one subject are not asked for again sooner than this after
+/// the last request, whatever changed: a workload whose pods come and go
+/// (a rollout, a crash loop) would otherwise start a new set of queries
+/// with every change.
+const RELOAD_GAP: Duration = Duration::from_secs(15);
+
+/// The metrics-server history of a subject, as it was at one generation
+/// of the metrics (a new one arrives every 15 seconds; a frame is drawn
+/// far more often).
+struct UsageCache {
+    generation: u64,
+    target: ChartTarget,
+    at: Instant,
+    /// When the oldest sample was taken.
+    first: Option<i64>,
+    cpu: [PlotSeries; 1],
+    memory: [PlotSeries; 1],
+}
+
+/// The history is read again at least this often, which also tells the
+/// session that it is still wanted when no new samples arrive.
+const USAGE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
+
+impl UsageCache {
+    fn new(generation: u64, target: &ChartTarget, history: UsageHistory) -> Self {
+        let series = |points| [PlotSeries { name: "used".into(), reference: false, points }];
+        UsageCache {
+            generation,
+            target: target.clone(),
+            at: Instant::now(),
+            first: history.cpu.first().map(|p| p.0 as i64),
+            cpu: series(history.cpu),
+            memory: series(history.memory),
+        }
+    }
+
+    fn is_for(&self, generation: u64, target: &ChartTarget) -> bool {
+        self.generation == generation && self.target == *target && self.at.elapsed() < USAGE_CACHE_MAX_AGE
+    }
+}
+
 /// State of the Metrics tab of one object.
 pub struct MetricsView {
     span: Span,
     job: Option<(Key, TimeRange, Job<Vec<Chart>>)>,
     loaded: Option<Loaded>,
+    /// What the last request was for, and when it was made.
+    started: Option<(Key, Instant)>,
+    usage: Option<UsageCache>,
+}
+
+/// What [`should_load`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Load {
+    /// Ask for the charts now.
+    Now,
+    /// What is on screen is current, or its replacement is on the way.
+    No,
+    /// Something changed, but the last request is too recent: look again
+    /// after this long.
+    Later(Duration),
+}
+
+/// Whether the charts for `key` are to be requested now.
+///
+/// `loaded` is the key of the charts on screen and their age, `in_flight`
+/// the key of a request that has not answered yet, `started` the key of
+/// the last request and how long ago it was made. Another object or
+/// range is loaded at once. For the same one (a workload stays the same
+/// when only its pods changed) nothing starts while a request is in
+/// flight, nor within [`RELOAD_GAP`] of the last one.
+fn should_load(
+    key: &Key,
+    loaded: Option<(&Key, Duration)>,
+    in_flight: Option<&Key>,
+    started: Option<(&Key, Duration)>,
+    refresh: Duration,
+) -> Load {
+    if loaded.is_some_and(|(k, age)| k == key && age < refresh) {
+        return Load::No;
+    }
+    if in_flight.is_some_and(|k| same_subject(k, key)) {
+        return Load::No;
+    }
+    match started {
+        Some((k, ago)) if same_subject(k, key) && ago < RELOAD_GAP => Load::Later(RELOAD_GAP - ago),
+        _ => Load::Now,
+    }
+}
+
+/// Bytes of pod names that go into a link to Grafana. The queries travel
+/// in the URL, twice (CPU and memory) and percent-encoded, and browsers,
+/// proxies and Grafana itself stop accepting URLs at a few kilobytes.
+const GRAFANA_POD_BYTES: usize = 1500;
+
+/// `target` as it goes into a Grafana link: a workload keeps as many of
+/// its first pods as fit [`GRAFANA_POD_BYTES`] (always at least one).
+fn grafana_target(target: &ChartTarget) -> ChartTarget {
+    match target {
+        ChartTarget::Workload { namespace, pods } => {
+            ChartTarget::Workload { namespace: namespace.clone(), pods: pods[..grafana_pods(pods)].to_vec() }
+        }
+        other => other.clone(),
+    }
+}
+
+/// How many of a workload's pods fit into a Grafana link.
+fn grafana_pods(pods: &[String]) -> usize {
+    let mut bytes = 0;
+    let fitting = pods
+        .iter()
+        .take(skiff_core::prom::MAX_WORKLOAD_PODS)
+        .take_while(|p| {
+            bytes += p.len() + 1;
+            bytes <= GRAFANA_POD_BYTES
+        })
+        .count();
+    fitting.max(1).min(pods.len())
 }
 
 /// The time range last chosen, so the next object opens with it.
@@ -126,6 +239,8 @@ impl MetricsView {
             span: Span::Hour,
             job: None,
             loaded: None,
+            started: None,
+            usage: None,
         }
     }
 
@@ -155,12 +270,12 @@ impl MetricsView {
 
     fn header(&mut self, ui: &mut Ui, pal: &Palette, subject: &Subject<'_>, with_range: bool) {
         ui.add_space(4.0);
-        // (The queries are only put together when there is a link to put them in.)
-        let queries = match (subject.grafana_url, &subject.target) {
-            (Some(_), Some(target)) => target.usage_queries(),
-            _ => Vec::new(),
+        // (A workload without pods has no queries to hand over.)
+        let grafana = match (subject.grafana_url, &subject.target) {
+            (_, Some(ChartTarget::Workload { pods, .. })) if pods.is_empty() => None,
+            (Some(base), Some(target)) => Some((base, target)),
+            _ => None,
         };
-        let grafana = subject.grafana_url.filter(|_| !queries.is_empty());
         if !with_range && grafana.is_none() {
             // Nothing to choose and nowhere to go: no empty row.
             return;
@@ -178,22 +293,30 @@ impl MetricsView {
                     }
                 }
             }
-            if let Some(base) = grafana {
+            if let Some((base, target)) = grafana {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let button = egui::Button::new((
                         widgets::icon(icons::ICON_OPEN_IN_NEW, 14.0).color(pal.muted),
                         RichText::new("Open in Grafana").size(12.0),
                     ))
                     .min_size(egui::vec2(0.0, 24.0));
-                    let url = grafana_explore_url(base, &queries, self.span);
-                    if ui
-                        .add(button)
-                        .on_hover_text(
-                            "Opens Grafana's Explore in your browser with the CPU and memory queries of this object",
-                        )
-                        .clicked()
-                    {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                    let mut tip =
+                        "Opens Grafana's Explore in your browser with the CPU and memory queries of this object".to_string();
+                    if let ChartTarget::Workload { pods, .. } = target {
+                        let fitting = grafana_pods(pods);
+                        if fitting < pods.len() {
+                            // (A link only holds so much.)
+                            tip.push_str(&format!(", for the first {} of its {} pods", fitting, widgets::thousands(pods.len())));
+                        }
+                    }
+                    if ui.add(button).on_hover_text(tip).clicked() {
+                        // The queries and the link are only put together
+                        // when they are asked for, not on every frame.
+                        let queries = grafana_target(target).usage_queries();
+                        if !queries.is_empty() {
+                            let url = grafana_explore_url(base, &queries, self.span);
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
                     }
                 });
             }
@@ -247,14 +370,21 @@ impl MetricsView {
                 self.job = None;
             }
         }
-        let fresh = self
-            .loaded
-            .as_ref()
-            .is_some_and(|l| l.key == key && l.at.elapsed() < self.span.refresh());
-        let loading_this = self.job.as_ref().is_some_and(|(k, ..)| *k == key);
-        if !fresh && !loading_this {
-            let range = TimeRange::last(self.span.secs(), now_unix());
-            self.job = Some((key.clone(), range, session.charts(prom, target.clone(), range)));
+        let decision = should_load(
+            &key,
+            self.loaded.as_ref().map(|l| (&l.key, l.at.elapsed())),
+            self.job.as_ref().map(|(k, ..)| k),
+            self.started.as_ref().map(|(k, at)| (k, at.elapsed())),
+            self.span.refresh(),
+        );
+        match decision {
+            Load::Now => {
+                let range = TimeRange::last(self.span.secs(), now_unix());
+                self.job = Some((key.clone(), range, session.charts(prom, target.clone(), range)));
+                self.started = Some((key.clone(), Instant::now()));
+            }
+            Load::Later(wait) => ui.ctx().request_repaint_after(wait),
+            Load::No => {}
         }
         ui.ctx().request_repaint_after(self.span.refresh());
 
@@ -342,26 +472,33 @@ impl MetricsView {
         error: &PromError,
     ) {
         self.header(ui, pal, subject, false);
-        let history = match &subject.target {
-            Some(ChartTarget::Pod { namespace, name }) => Some(session.pod_usage_history(namespace, &[name.as_str()])),
-            Some(ChartTarget::Workload { namespace, pods }) => {
-                let pods: Vec<&str> = pods.iter().map(String::as_str).collect();
-                Some(session.pod_usage_history(namespace, &pods))
+        // The history is put together once per sample of the metrics (and
+        // per object), not once per frame.
+        let metrics = session.metrics();
+        let has_metrics = metrics.available;
+        match &subject.target {
+            Some(target) => {
+                if !self.usage.as_ref().is_some_and(|u| u.is_for(metrics.generation, target)) {
+                    let history = match target {
+                        ChartTarget::Pod { namespace, name } => session.pod_usage_history(namespace, &[name.as_str()]),
+                        ChartTarget::Workload { namespace, pods } => {
+                            let pods: Vec<&str> = pods.iter().map(String::as_str).collect();
+                            session.pod_usage_history(namespace, &pods)
+                        }
+                        ChartTarget::Node { name } => session.node_usage_history(name),
+                    };
+                    self.usage = Some(UsageCache::new(metrics.generation, target, history));
+                }
             }
-            Some(ChartTarget::Node { name }) => Some(session.node_usage_history(name)),
-            None => None,
-        };
-        let has_metrics = session.metrics().available;
-        let empty = history.as_ref().is_none_or(|h| h.cpu.is_empty() && h.memory.is_empty());
+            None => self.usage = None,
+        }
+        let usage = self.usage.as_ref();
+        let empty = usage.is_none_or(|u| u.cpu[0].points.is_empty() && u.memory[0].points.is_empty());
         if has_metrics || !empty {
             source_line(ui, pal, "metrics-server · collected since you opened this view");
             ui.add_space(6.0);
             let now = now_unix();
-            let first = history
-                .as_ref()
-                .and_then(|h| h.cpu.first())
-                .map(|p| p.0 as i64)
-                .unwrap_or(now);
+            let first = usage.and_then(|u| u.first).unwrap_or(now);
             // At least five minutes wide, so the first samples do not
             // stretch across the whole chart.
             let window = (first.min(now - 300), now);
@@ -371,27 +508,12 @@ impl MetricsView {
                 Some(ChartTarget::Pod { .. }) => "metrics-server reports no usage for this pod (it may not be running)",
                 Some(ChartTarget::Workload { .. }) => "metrics-server reports no usage for these pods",
             };
-            for (title, unit, points) in [
-                (
-                    "CPU",
-                    Unit::Cores,
-                    history.as_ref().map(|h| h.cpu.clone()).unwrap_or_default(),
-                ),
-                (
-                    "Memory",
-                    Unit::Bytes,
-                    history.as_ref().map(|h| h.memory.clone()).unwrap_or_default(),
-                ),
-            ] {
-                if points.is_empty() {
-                    chart_card(ui, pal, title, unit, window, chart::State::Empty(nothing));
-                } else {
-                    let series = [PlotSeries {
-                        name: "used".into(),
-                        reference: false,
-                        points,
-                    }];
-                    chart_card(ui, pal, title, unit, window, chart::State::Data(&series));
+            for (title, unit, series) in
+                [("CPU", Unit::Cores, usage.map(|u| &u.cpu)), ("Memory", Unit::Bytes, usage.map(|u| &u.memory))]
+            {
+                match series.filter(|s| !s[0].points.is_empty()) {
+                    Some(series) => chart_card(ui, pal, title, unit, window, chart::State::Data(series)),
+                    None => chart_card(ui, pal, title, unit, window, chart::State::Empty(nothing)),
                 }
             }
             // New samples arrive every 15 seconds.
@@ -595,6 +717,12 @@ pub fn alerts_for<'a>(
         .collect()
 }
 
+/// Characters of an alert's name shown in a detail panel (the rest on
+/// hover).
+const MAX_ALERT_NAME: usize = 64;
+/// Characters of an alert's description shown in a detail panel.
+const MAX_ALERT_TEXT: usize = 400;
+
 /// The alerts of one object, at the top of its detail panel.
 pub fn object_alerts(ui: &mut Ui, pal: &Palette, alerts: &[&Alert]) {
     if alerts.is_empty() {
@@ -616,8 +744,12 @@ pub fn object_alerts(ui: &mut Ui, pal: &Palette, alerts: &[&Alert]) {
                 let color = severity_color(&alert.severity, pal);
                 ui.horizontal(|ui| {
                     ui.label(widgets::icon(icons::ICON_NOTIFICATIONS_ACTIVE, 14.0).color(color));
-                    ui.label(widgets::semibold(&alert.name, 13.0).color(pal.text));
-                    ui.label(RichText::new(severity_text(&alert.severity)).color(color).size(12.0));
+                    let name = widgets::clipped(&alert.name, MAX_ALERT_NAME);
+                    let label = ui.label(widgets::semibold(&*name, 13.0).color(pal.text));
+                    if *name != alert.name {
+                        label.on_hover_text(&alert.name);
+                    }
+                    ui.label(RichText::new(widgets::clipped(severity_text(&alert.severity), 24)).color(color).size(12.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let age = alert_age(alert, now);
                         if !age.is_empty() {
@@ -631,11 +763,16 @@ pub fn object_alerts(ui: &mut Ui, pal: &Palette, alerts: &[&Alert]) {
                     &alert.description
                 };
                 if !text.is_empty() {
-                    ui.add(
-                        egui::Label::new(RichText::new(text).color(pal.muted).size(12.0))
+                    // A few lines of it; all of it on hover.
+                    let short = widgets::clipped(text, MAX_ALERT_TEXT);
+                    let label = ui.add(
+                        egui::Label::new(RichText::new(&*short).color(pal.muted).size(12.0))
                             .wrap()
                             .selectable(true),
                     );
+                    if *short != **text {
+                        label.on_hover_text(text.as_str());
+                    }
                 }
             }
         });
@@ -755,6 +892,64 @@ mod tests {
     }
 
     #[test]
+    fn charts_are_not_asked_for_again_with_every_change_of_pods() {
+        let workload = |pods: &[&str]| -> Key {
+            let pods = pods.iter().map(|p| p.to_string()).collect();
+            (ChartTarget::Workload { namespace: "shop".into(), pods }, Span::Hour, "monitoring/prom:9090".to_string())
+        };
+        let secs = Duration::from_secs;
+        let refresh = Span::Hour.refresh();
+        let (ab, ac, ad) = (workload(&["a", "b"]), workload(&["a", "c"]), workload(&["a", "d"]));
+
+        // Nothing yet: now. Then nothing more while that is in flight,
+        // whatever the pods do.
+        assert_eq!(should_load(&ab, None, None, None, refresh), Load::Now);
+        assert_eq!(should_load(&ab, None, Some(&ab), Some((&ab, secs(1))), refresh), Load::No);
+        assert_eq!(should_load(&ac, None, Some(&ab), Some((&ab, secs(1))), refresh), Load::No);
+        // It answered, for pods that have changed since: not before the
+        // gap is over, and then once.
+        assert_eq!(should_load(&ac, Some((&ab, secs(0))), None, Some((&ab, secs(2))), refresh), Load::Later(secs(13)));
+        assert_eq!(should_load(&ad, Some((&ab, secs(12))), None, Some((&ab, secs(14))), refresh), Load::Later(secs(1)));
+        assert_eq!(should_load(&ad, Some((&ab, secs(13))), None, Some((&ab, secs(15))), refresh), Load::Now);
+        // Unchanged and fresh: nothing. Stale: the usual refresh.
+        assert_eq!(should_load(&ab, Some((&ab, secs(20))), None, Some((&ab, secs(21))), refresh), Load::No);
+        assert_eq!(should_load(&ab, Some((&ab, secs(30))), None, Some((&ab, secs(31))), refresh), Load::Now);
+        // A request that failed leaves nothing loaded: it is not repeated
+        // on the next frame either.
+        assert_eq!(should_load(&ab, None, None, Some((&ab, secs(3))), refresh), Load::Later(secs(12)));
+
+        // Another range or object is not held back by any of it, not
+        // even by a request in flight.
+        let day: Key = (ab.0.clone(), Span::Day, ab.2.clone());
+        assert_eq!(should_load(&day, Some((&ab, secs(1))), Some(&ab), Some((&ab, secs(1))), Span::Day.refresh()), Load::Now);
+        let pod: Key = (ChartTarget::Pod { namespace: "shop".into(), name: "a".into() }, Span::Hour, ab.2.clone());
+        assert_eq!(should_load(&pod, Some((&ab, secs(1))), Some(&ab), Some((&ab, secs(1))), refresh), Load::Now);
+    }
+
+    #[test]
+    fn a_grafana_link_holds_only_as_many_pods_as_fit() {
+        let names = |n: usize, len: usize| -> Vec<String> { (0..n).map(|i| format!("{i:0len$}")).collect() };
+        // Ordinary names: all of them (up to what the charts cover).
+        assert_eq!(grafana_pods(&names(20, 40)), 20);
+        assert_eq!(grafana_pods(&names(500, 5)), skiff_core::prom::MAX_WORKLOAD_PODS);
+        // Long ones: what fits the budget, and never none.
+        assert_eq!(grafana_pods(&names(100, 253)), GRAFANA_POD_BYTES / 254);
+        assert_eq!(grafana_pods(&names(3, 5000)), 1);
+        assert_eq!(grafana_pods(&[]), 0);
+
+        let long = ChartTarget::Workload { namespace: "shop".into(), pods: names(100, 253) };
+        let ChartTarget::Workload { pods, .. } = grafana_target(&long) else { panic!("a workload") };
+        assert_eq!(pods, names(100, 253)[..5]);
+        let url = grafana_explore_url("https://grafana.example.com", &grafana_target(&long).usage_queries(), Span::Hour);
+        assert!(url.len() < 8000, "{} bytes", url.len());
+        let whole = grafana_explore_url("https://grafana.example.com", &long.usage_queries(), Span::Hour);
+        assert!(whole.len() > 50_000, "the test's names are long enough to matter: {}", whole.len());
+        // Other targets are handed over as they are.
+        let pod = ChartTarget::Pod { namespace: "shop".into(), name: "web-1".into() };
+        assert_eq!(grafana_target(&pod), pod);
+    }
+
+    #[test]
     fn the_config_hint_names_the_context_when_it_is_readable() {
         assert_eq!(config_key("prod-eu"), "clusters.prod-eu.prometheus");
         assert_eq!(
@@ -796,6 +991,7 @@ mod tests {
                     ("namespace", "shop"),
                 ]),
             ],
+            omitted: 0,
             error: None,
         };
         let names = |found: Vec<&Alert>| found.iter().map(|a| a.name.clone()).collect::<Vec<_>>();

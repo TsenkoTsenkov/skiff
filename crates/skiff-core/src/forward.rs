@@ -123,8 +123,18 @@ pub(crate) async fn start(
     let h = handle.clone();
     let task = handle.spawn(async move {
         loop {
-            let Ok((conn, _)) = listener.accept().await else { break };
+            let accepted = listener.accept().await;
             let Some(fwd) = weak.upgrade() else { break };
+            // A failed accept (out of file descriptors, a connection reset
+            // before it was taken) must not end the forward for good.
+            let Ok((conn, _)) = accepted else {
+                if fwd.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                drop(fwd);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
             {
                 let mut conns = fwd.conns.lock();
                 conns.retain(|c| !c.is_finished());

@@ -28,6 +28,12 @@
   <url type="homepage">https://github.com/TsenkoTsenkov/skiff</url>
   <url type="bugtracker">https://github.com/TsenkoTsenkov/skiff/issues</url>
   <url type="vcs-browser">https://github.com/TsenkoTsenkov/skiff</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The overview of a cluster, with its firing alerts</caption>
+      <image type="source" width="1440" height="900">https://tsenkotsenkov.github.io/skiff/img/overview.png</image>
+    </screenshot>
+  </screenshots>
   <categories>
     <category>Development</category>
   </categories>

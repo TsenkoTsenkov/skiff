@@ -59,6 +59,9 @@ pub struct ContextInfo {
     /// Name of the exec credential plugin the user signs in with (`aws`,
     /// `gke-gcloud-auth-plugin`, ...), without its directory.
     pub exec_command: Option<String>,
+    /// The plugin is certain not to start: its command was not found where
+    /// the OS will look for it (the same check a connection makes first).
+    pub exec_missing: bool,
     /// The kubeconfig file that defined this context.
     pub file: Option<std::path::PathBuf>,
 }
@@ -155,6 +158,9 @@ pub struct Alerts {
     pub loaded: bool,
     /// Most severe first.
     pub items: Vec<Alert>,
+    /// How many more alerts are firing than `items` holds: the list is
+    /// capped (`prom::MAX_ALERTS`), and the least severe are left out.
+    pub omitted: usize,
     /// Why the last fetch failed; `items` is empty then.
     pub error: Option<PromError>,
 }
@@ -1269,8 +1275,8 @@ impl Session {
                     let fetched = prom.firing_alerts().await;
                     last = Some((generation, now_unix()));
                     let alerts = match fetched {
-                        Ok(items) => Alerts { loaded: true, items, error: None },
-                        Err(e) => Alerts { loaded: true, items: Vec::new(), error: Some(e) },
+                        Ok((items, omitted)) => Alerts { loaded: true, items, omitted, error: None },
+                        Err(e) => Alerts { loaded: true, items: Vec::new(), omitted: 0, error: Some(e) },
                     };
                     let _publishing = obs.lock.lock();
                     if obs.generation.load(Ordering::SeqCst) == generation && **obs.alerts.load() != alerts {
@@ -1959,6 +1965,7 @@ mod tests {
         let alerts = Alerts {
             loaded: true,
             items: ["critical", "page", "warning", "info", ""].iter().map(|s| alert(s)).collect(),
+            omitted: 0,
             error: None,
         };
         assert_eq!(alerts.counts(), (2, 1));
@@ -2023,7 +2030,9 @@ mod tests {
         );
         let core = Core::new(Notifier::noop()).expect("runtime");
         core.set_kubeconfig_sources(KubeconfigSources::explicit([path.to_string_lossy().into_owned()]));
-        assert_eq!(core.load_kubeconfig().contexts.items[0].exec_command.as_deref(), Some("skiff-test-no-such-plugin"));
+        let listed = core.load_kubeconfig().contexts.items[0].clone();
+        assert_eq!(listed.exec_command.as_deref(), Some("skiff-test-no-such-plugin"));
+        assert!(listed.exec_missing, "the list says what the connection will find");
         let s = core.connect("ctx");
         wait_until("connection to fail", || matches!(&*s.status(), ConnStatus::Failed(_)));
         let info = s.failure().expect("failure details");

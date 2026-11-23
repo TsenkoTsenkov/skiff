@@ -143,14 +143,15 @@ The executable links dynamically only to `libc`, `libm` and `libgcc_s`
 (`ldd`); at run time it loads the system's X11/Wayland, xkbcommon and
 Vulkan or OpenGL libraries, which are not in any package.
 
-### In-process numbers (the README's table)
+### In-process numbers (the earlier README's table)
 
-The table at the top of the README comes from a test harness that runs the
-app inside the test process without a window
+Earlier versions of the README had a performance table of their own. (The
+README now shows numbers from this page instead.) That table came from a
+test harness that runs the app inside the test process without a window
 (`cargo test --release -p skiff --test perf -- --ignored --nocapture`),
 not from the launched binary. Re-run on this commit, 3 runs:
 
-| | README says | In-process, this commit | Launched binary, this page |
+| | The earlier README said | In-process, this commit | Launched binary, this page |
 | --- | --- | --- | --- |
 | First frame after launch | 60 - 120 ms | app constructed 53 - 55 ms; first rows 73 - 76 ms | 118 ms (96 - 127); 86 ms from a terminal |
 | All 5,415 pods listed and live | 0.4 - 0.5 s | 0.48 - 0.51 s | 0.58 s (0.51 - 0.97) |
@@ -163,17 +164,20 @@ not from the launched binary. Re-run on this commit, 3 runs:
 | Binary | 35 MB | | 39.2 MB |
 | Process memory (software rasterizer) | about 165 MB | 131 - 133 MiB peak RSS of the test process | 162 MiB PSS, 165 MiB RSS |
 
-Differences from the README worth knowing:
+Differences from the earlier README worth knowing:
 
-- The binary is 4 MB larger than the README says (39.2 MB, not 35 MB).
-- The launched binary lists the pods in a median of 0.58 s; the README's
-  0.4 - 0.5 s is the in-process figure and is at the fast end of what the
-  real app does.
-- The first frame of the launched app is inside the README's range only
-  when started from a terminal; from a launcher it is at its upper edge.
+- The binary is 4 MB larger than the earlier README said (39.2 MB, not
+  35 MB).
+- The launched binary lists the pods in a median of 0.58 s; the earlier
+  README's 0.4 - 0.5 s is the in-process figure and is at the fast end of
+  what the real app does.
+- The first frame of the launched app is inside the earlier README's
+  range only when started from a terminal; from a launcher it is at its
+  upper edge.
 - "Re-sort 1 - 5 ms" is the recompute alone; the frames a click takes are
   8 - 12 ms.
-- Nothing measured here is slower than the README by more than that. We
+- Nothing measured here is slower than the earlier README by more than
+  that. We
   have no earlier run of this page's method to compare with, so this is
   not evidence for or against a regression in the launched binary.
 

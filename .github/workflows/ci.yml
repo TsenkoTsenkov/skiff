@@ -1,7 +1,6 @@
 # Checks every pull request and every push to main:
 #
-#   lint       clippy; warnings in the program fail it, warnings in the test
-#              code are only reported for now (see the job)
+#   lint       clippy on the program and its tests; any warning fails it
 #   test       the whole test suite on Linux, with a software Vulkan driver for
 #              the UI snapshot tests; tests that need a cluster skip themselves
 #   portable   the code compiles and the unit tests pass on Windows and macOS
@@ -59,16 +58,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libx11-dev
-      # The program itself (libraries and binary) must be free of warnings.
+      # The program and its tests must be free of warnings.
       - name: Clippy
-        run: cargo clippy --workspace --locked -- -D warnings
-      # The test code still has clippy remarks (31 when this was written,
-      # nearly all in tests/qa_flows.rs), so it is reported but does not
-      # fail the job. Once they are fixed, add --all-targets to the step
-      # above and delete this one.
-      - name: Clippy on the tests (report only)
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Tests (Linux)

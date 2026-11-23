@@ -677,8 +677,9 @@ impl Prom {
         parse_query_response(&body)
     }
 
-    /// The alerts that are firing right now, most severe first.
-    pub async fn firing_alerts(&self) -> Result<Vec<Alert>, PromError> {
+    /// The alerts that are firing right now, most severe first, and how
+    /// many more are firing than were kept (see [`MAX_ALERTS`]).
+    pub async fn firing_alerts(&self) -> Result<(Vec<Alert>, usize), PromError> {
         let body = get(
             &self.client,
             &self.endpoint.api_path("alerts", &[]),
@@ -686,7 +687,7 @@ impl Prom {
             QUERY_TIMEOUT,
         )
         .await?;
-        parse_alerts(&body)
+        parse_alerts_counted(&body)
     }
 
     /// Runs every query of a panel (concurrently) and names the series.
@@ -1373,6 +1374,12 @@ fn severity_order(severity: &str) -> u8 {
 /// returned (the least severe are the ones left out), and names and texts
 /// are cut to a length that can be drawn.
 pub fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, PromError> {
+    parse_alerts_counted(body).map(|(alerts, _)| alerts)
+}
+
+/// [`parse_alerts`], and how many alerts worth showing were left out
+/// because there were more than [`MAX_ALERTS`].
+pub fn parse_alerts_counted(body: &[u8]) -> Result<(Vec<Alert>, usize), PromError> {
     let env = envelope(body)?;
     let raw: RawAlerts = serde_json::from_value(env.data)
         .map_err(|e| PromError::Other(format!("unexpected Prometheus alerts response: {e}")))?;
@@ -1416,8 +1423,9 @@ pub fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, PromError> {
             &b.labels,
         ))
     });
+    let omitted = alerts.len().saturating_sub(MAX_ALERTS);
     alerts.truncate(MAX_ALERTS);
-    Ok(alerts)
+    Ok((alerts, omitted))
 }
 
 /// The kind of object an alert is about.
@@ -2467,6 +2475,10 @@ mod tests {
         let parsed = parse_alerts(body.as_bytes()).unwrap();
         // The cap drops the least severe.
         assert_eq!(parsed.len(), MAX_ALERTS);
+        // ... and says how many.
+        let (kept, omitted) = parse_alerts_counted(body.as_bytes()).unwrap();
+        assert_eq!((kept.len(), omitted), (MAX_ALERTS, 51));
+        assert_eq!(parse_alerts_counted(ALERTS.as_bytes()).unwrap().1, 0);
         let first = &parsed[0];
         assert!(first.name.starts_with("éé") && first.name.chars().count() == MAX_ALERT_NAME + 1, "{}", first.name);
         assert!(first.name.ends_with('…'));

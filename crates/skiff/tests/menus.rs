@@ -42,7 +42,7 @@ fn row_width(h: &Harness<'static, SkiffApp>, name: &str) -> f32 {
         .get_all_by_role(Role::Button)
         .find(|n| n.accesskit_node().label().as_deref() == Some(name) && n.rect().width() > 100.0)
         .unwrap_or_else(|| panic!("no menu row for {name}"));
-    node.rect().width() as f32
+    node.rect().width()
 }
 
 fn open_switcher(h: &Harness<'static, SkiffApp>, current: &str) {

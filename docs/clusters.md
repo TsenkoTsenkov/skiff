@@ -103,7 +103,7 @@ Two switches per cluster, in the cluster menu (top left) under
 
 - **Read-only.** Skiff refuses every change to that cluster before any
   request is sent: no edit, apply, create, delete, scale, restart, cordon,
-  suspend, no shell, and no port-forward. The actions are disabled and say
+  suspend, no new shell, and no new port-forward. The actions are disabled and say
   why, and a lock badge shows in the top bar. Looking, logs, metrics and
   YAML viewing work as usual. The palette has "Make <cluster> read-only"
   and "Allow changes to <cluster>".

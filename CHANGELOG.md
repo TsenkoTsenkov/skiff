@@ -46,7 +46,9 @@ released as 0.1.0.
 - **Several kubeconfig files**: a list of files, folders and wildcards in
   the config file, `--kubeconfig` on the command line, "Add kubeconfig
   file…" and "Reload kubeconfig" in the cluster menu and the palette.
-  Changed files are picked up when you switch back to Skiff.
+  Changed files are picked up when you switch back to Skiff. In the list,
+  `"$KUBECONFIG"` stands for kubectl's own locations, so adding a file
+  keeps them, and keeps following your environment.
 - **A connection page** when a cluster cannot be reached: what went
   wrong, what to do, Retry, and details to copy. A missing credential
   plugin is named, with the kubeconfig's install hint; an expired login
@@ -85,7 +87,8 @@ released as 0.1.0.
   state is kept.
 - On a machine where the default renderer cannot start, Skiff falls back
   to OpenGL instead of failing. `SKIFF_RENDERER` forces one.
-- A copied Secret value is cleared from the clipboard after 60 seconds.
+- A copied Secret value is cleared from the clipboard after 60 seconds,
+  unless something else has been copied by then, in Skiff or elsewhere.
 
 ### Security
 

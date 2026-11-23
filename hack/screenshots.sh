@@ -31,6 +31,10 @@ picks=(
   "28_shell:shell"
   "06_palette:palette"
   "50_settings_appearance:settings"
+  # (Shows ~/.kube/config as "not found" only on a computer that has no
+  # such file; where there is one, the test uses a path in target/ and
+  # this picture is not for publishing. Look before committing it.)
+  "30_welcome:welcome"
 )
 
 # The site also shows details of some screenshots, so that the text in

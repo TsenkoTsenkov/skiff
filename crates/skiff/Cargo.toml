@@ -31,6 +31,9 @@ base64 = "0.22"
 # Native "open file" dialog. Pure Rust: on Linux it talks to the XDG desktop
 # portal over D-Bus (no GTK), on macOS and Windows to the system dialog.
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+# Reads the clipboard back before a copied secret is cleared from it (egui
+# only writes). The version and backends egui-winit already builds.
+arboard = { version = "3.7", default-features = false }
 
 [build-dependencies]
 # Embeds the icon and version info into skiff.exe (build.rs; Windows targets only).

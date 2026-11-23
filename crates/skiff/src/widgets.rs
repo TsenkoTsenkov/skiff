@@ -264,6 +264,16 @@ pub fn usage_bar(ui: &mut Ui, fraction: f32, width: f32, pal: &Palette) {
     ui.painter().rect_filled(fill, CornerRadius::same(3), color);
 }
 
+/// `text` cut to `max` characters, with `…` where it was cut: for names
+/// and messages that come from a cluster and share a row with other
+/// things. (Show the whole text on hover where it matters.)
+pub fn clipped(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", text[..end].trim_end()).into(),
+        None => text.into(),
+    }
+}
+
 /// "1 mount", "3 mounts".
 pub fn plural(n: usize, noun: &str) -> String {
     if n == 1 {

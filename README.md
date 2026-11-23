@@ -130,7 +130,8 @@ and on Windows have not been measured.
 - **No telemetry**, no crash reporting and no analytics.
 - **Lists do not fetch secret values.** Tables ask the server for rows,
   not objects; a Secret is fetched in full only when you open it, and a
-  copied value is cleared from the clipboard after 60 seconds.
+  copied value is cleared from the clipboard after 60 seconds, unless
+  you have copied something else by then.
 - **What a cluster sends is not trusted.** Log lines, object sizes and
   terminal output are bounded; escape sequences in logs are removed; a
   program in a container cannot write to your clipboard.

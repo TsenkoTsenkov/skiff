@@ -31,13 +31,17 @@ node, and choose **Metrics**.
   the data comes from and how far apart the points are (30 seconds for an
   hour, 2 hours for a week).
 - Charts refresh on their own while the tab is open, every 30 seconds for
-  the 1-hour range and less often for longer ones. Nothing is queried
-  while no Metrics tab or overview is open.
+  the 1-hour range and less often for longer ones. When the pods of a
+  workload change (a rollout, a crash loop), its charts are loaded again
+  for the new set, but not while a load is under way and not more than
+  once in 15 seconds; the charts on screen stay until the new ones
+  arrive. Nothing is queried while no Metrics tab or overview is open.
 - Hover a chart for the values at that moment. The legend shows the
   latest value of each line.
 - A limit more than three times the usage is left off the scale so that
   the usage stays readable; it is still in the legend.
-- At most 200 series are drawn per chart.
+- At most 200 series are drawn per chart, the 12 busiest as lines. Long
+  series names are shortened in the legend and under the crosshair.
 
 The charts are built from the usual metric names: cAdvisor's
 `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`
@@ -67,9 +71,18 @@ An alert is tied to an object by its labels: `namespace` with
 `deployment`, `statefulset`, `daemonset`, `job_name`,
 `persistentvolumeclaim` or `pod`, or `node` (or the `instance` of a node
 scrape job). The always-firing `Watchdog` alert and alerts with
-`severity="none"` are left out, and at most 2,000 alerts are kept, the
-most severe first. The list refreshes every 45 seconds while a view that
-shows it is open.
+`severity="none"` are left out. The list refreshes every 45 seconds
+while a view that shows it is open.
+
+What a broken cluster can send is bounded:
+
+- At most 2,000 alerts are kept, the most severe first. When there were
+  more, the count on the overview ends in `+` and the line under the list
+  says how many were left out.
+- The overview lists the first 12 and then says "… and N more".
+- An alert's name and severity are cut to 120 characters, its summary and
+  description to 2,000. Lists show less of a long name or text, with the
+  rest on hover.
 
 Skiff only shows alerts. It does not acknowledge, silence or route them,
 and it does not read Alertmanager, so an alert you silenced there still
@@ -217,7 +230,10 @@ Set the address of your Grafana for a cluster:
 
 The Metrics tab then has **Open in Grafana**, which opens Grafana's
 Explore page in your browser with the CPU and memory queries of that
-object and the same time range. Skiff does not talk to Grafana itself and
+object and the same time range. For a workload the link names its pods,
+and a link only holds so much: when the pod names together are longer
+than about 1,500 bytes, the first ones that fit are used, and the
+button's hover text says how many. Skiff does not talk to Grafana itself and
 stores no login for it: you are signed in to Grafana in your browser or
 you are not, and Grafana uses its default data source. The link format
 (`/explore?schemaVersion=1&panes=…`) is the one of current Grafana
