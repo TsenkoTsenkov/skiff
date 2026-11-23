@@ -155,7 +155,7 @@ pub(crate) fn read_merged(sources: &KubeconfigSources) -> Merged {
         }
         // `read_from` also resolves relative certificate, key, token-file
         // and exec paths against the file's directory.
-        let kc = match Kubeconfig::read_from(&path) {
+        let mut kc = match Kubeconfig::read_from(&path) {
             Ok(kc) => kc,
             Err(e) => {
                 merged.problems.push(KubeconfigProblem { path, message: problem_message(&e) });
@@ -163,6 +163,12 @@ pub(crate) fn read_merged(sources: &KubeconfigSources) -> Merged {
             }
         };
         let names: Vec<String> = kc.contexts.iter().map(|c| c.name.clone()).collect();
+        // `current-context: ""` (what `kubectl config unset
+        // current-context` leaves behind) sets nothing: kubectl takes the
+        // value of a later file then.
+        if kc.current_context.as_deref().is_some_and(|c| c.trim().is_empty()) {
+            kc.current_context = None;
+        }
         // First definition of a cluster, user or context name wins, and
         // current-context comes from the first file that sets one.
         match merged.config.clone().merge(kc) {
@@ -212,9 +218,9 @@ pub(crate) fn auth_of<'a>(kc: &'a Kubeconfig, user: &str) -> Option<&'a AuthInfo
 }
 
 /// The exec credential plugin a context's user is configured with.
-pub(crate) fn exec_of<'a>(kc: &'a Kubeconfig, context: &str) -> Option<&'a ExecConfig> {
-    let ctx = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref()?;
-    auth_of(kc, ctx.user.as_deref()?)?.exec.as_ref()
+pub(crate) fn exec_of_mut<'a>(kc: &'a mut Kubeconfig, context: &str) -> Option<&'a mut ExecConfig> {
+    let user = kc.contexts.iter().find(|c| c.name == context)?.context.as_ref()?.user.clone()?;
+    kc.auth_infos.iter_mut().find(|n| n.name == user)?.auth_info.as_mut()?.exec.as_mut()
 }
 
 /// The name to show for a plugin command: `aws`, not `/usr/local/bin/aws`.
@@ -373,6 +379,33 @@ pub fn find_executable(command: &str) -> Option<PathBuf> {
     find_executable_in(command, std::env::var_os("PATH"))
 }
 
+/// Whether the command of an exec credential plugin is certain not to
+/// start. It is looked for where the OS will look: a `PATH` among the
+/// plugin's own `env` entries is what a bare name is resolved against, so
+/// that is searched as well as Skiff's `PATH`. Without any `PATH` the OS
+/// falls back to a default of its own, and nothing is certain.
+pub(crate) fn plugin_is_missing(exec: &ExecConfig) -> bool {
+    let Some(command) = exec.command.as_deref() else { return false };
+    let own = exec.env.iter().flatten().find_map(|entry| match (entry.get("name"), entry.get("value")) {
+        (Some(name), Some(value)) if name == "PATH" => Some(OsString::from(value)),
+        _ => None,
+    });
+    plugin_is_missing_in(command, own, std::env::var_os("PATH"))
+}
+
+fn plugin_is_missing_in(command: &str, own_path: Option<OsString>, process_path: Option<OsString>) -> bool {
+    if find_executable_in(command, None).is_some() {
+        // Given with its directory, and there.
+        return false;
+    }
+    let with_directory = command.contains('/') || (cfg!(windows) && command.contains('\\')) || Path::new(command).is_absolute();
+    if !with_directory && process_path.is_none() {
+        // The OS searches a default path of its own.
+        return false;
+    }
+    [own_path, process_path].into_iter().flatten().all(|path| find_executable_in(command, Some(path)).is_none())
+}
+
 fn find_executable_in(command: &str, path: Option<OsString>) -> Option<PathBuf> {
     if command.is_empty() {
         return None;
@@ -520,9 +553,10 @@ mod tests {
         assert!(!safe.insecure);
         assert_eq!((safe.proxy, safe.exec_command), (None, None));
 
-        let exec = exec_of(&merged.config, "skip").expect("exec config");
+        let mut config = merged.config;
+        let exec = exec_of_mut(&mut config, "skip").expect("exec config");
         assert_eq!(exec.install_hint.as_deref(), Some("brew install awscli"));
-        assert!(exec_of(&merged.config, "safe").is_none());
+        assert!(exec_of_mut(&mut config, "safe").is_none());
     }
 
     #[test]
@@ -603,6 +637,58 @@ mod tests {
         assert_eq!(s.resolve(), [PathBuf::from("/x/a"), PathBuf::from("/x/b"), PathBuf::from("/x/c")]);
         // An explicit empty list reads nothing at all.
         assert!(load(&KubeconfigSources::explicit(Vec::<String>::new())).searched.is_empty());
+    }
+
+    #[test]
+    fn an_empty_current_context_does_not_hide_a_later_one() {
+        let t = TempDir::new("emptycurrent");
+        // What `kubectl config unset current-context` leaves behind.
+        let first = config("alpha", "c1", "https://one.example", "", "    token: x\n")
+            .replace("current-context: alpha", "current-context: \"\"");
+        assert!(first.contains("current-context: \"\""), "{first}");
+        t.write("a.yaml", &first);
+        t.write("b.yaml", &config("beta", "c2", "https://two.example", "", "    token: y\n"));
+        let loaded = load(&KubeconfigSources::explicit([t.entry("a.yaml"), t.entry("b.yaml")]));
+        assert_eq!(loaded.contexts.items.len(), 2);
+        assert_eq!(loaded.contexts.current.as_deref(), Some("beta"));
+        // Only empty values everywhere: none.
+        let loaded = load(&KubeconfigSources::explicit([t.entry("a.yaml")]));
+        assert_eq!(loaded.contexts.current, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plugin_is_looked_for_where_it_will_be_started_from() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new("pluginpath");
+        let tool = t.write("corp/my-auth", "#!/bin/sh\n");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let corp = Some(t.0.join("corp").into_os_string());
+        let elsewhere = || Some(OsString::from("/nonexistent-dir"));
+
+        // On neither PATH: certain.
+        assert!(plugin_is_missing_in("my-auth", None, elsewhere()));
+        assert!(plugin_is_missing_in("my-auth", elsewhere(), elsewhere()));
+        // On the PATH the kubeconfig gives the plugin, or on Skiff's own.
+        assert!(!plugin_is_missing_in("my-auth", corp.clone(), elsewhere()));
+        assert!(!plugin_is_missing_in("my-auth", None, corp.clone()));
+        // No PATH at all: the OS searches its default, so nothing is certain.
+        assert!(!plugin_is_missing_in("my-auth", None, None));
+        // A path is checked as given.
+        assert!(!plugin_is_missing_in(&tool.to_string_lossy(), None, None));
+        assert!(plugin_is_missing_in("/nonexistent-dir/my-auth", corp.clone(), corp.clone()));
+
+        // The PATH is read from the exec entry's `env`.
+        let exec = |path: &std::ffi::OsStr| -> ExecConfig {
+            let yaml = format!(
+                "apiVersion: client.authentication.k8s.io/v1\ncommand: my-auth\nenv:\n- name: OTHER\n  value: x\n- name: PATH\n  value: {}\n",
+                path.to_string_lossy()
+            );
+            serde_yaml::from_str(&yaml).expect("exec config")
+        };
+        assert!(!plugin_is_missing(&exec(corp.as_deref().expect("path"))));
+        // (Skiff's own PATH is searched too: this name is on neither.)
+        assert!(plugin_is_missing(&exec(std::ffi::OsStr::new("/nonexistent-dir"))));
     }
 
     #[cfg(unix)]

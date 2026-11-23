@@ -196,10 +196,22 @@ impl ShellTab {
                     reconnect = ui.small_button("Retry").clicked();
                 }
             }
-            if widgets::action_button(ui, icons::ICON_OPEN_IN_NEW, "Open in terminal app")
-                .on_hover_text("Open this shell in your own terminal (iTerm, Terminal, ...) with kubectl exec")
-                .clicked()
-            {
+            // A new shell, and one that does not go through the session:
+            // on a read-only cluster it has to be refused here. (This tab's
+            // own shell, opened before, keeps running until closed.)
+            let locked = self.session.is_read_only();
+            let open = ui
+                .add_enabled_ui(!locked, |ui| widgets::action_button(ui, icons::ICON_OPEN_IN_NEW, "Open in terminal app"))
+                .inner;
+            let open = if locked {
+                open.on_disabled_hover_text(format!(
+                    "{} is read-only in Skiff. Turn that off in the cluster menu to open new shells.",
+                    self.session.context
+                ))
+            } else {
+                open.on_hover_text("Open this shell in your own terminal (iTerm, Terminal, ...) with kubectl exec")
+            };
+            if open.clicked() && !locked {
                 let inv =
                     crate::external::exec_invocation(&self.session.context, &self.ns, &self.pod, self.container.as_deref());
                 match crate::external::open_invocation(&inv) {

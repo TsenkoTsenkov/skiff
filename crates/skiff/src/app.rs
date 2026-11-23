@@ -208,6 +208,36 @@ fn config_sources(config: &Config) -> KubeconfigSources {
     }
 }
 
+/// The `kubeconfigs` list to save when `entry` is added from the UI.
+///
+/// The first entry starts the list, and from then on only the list is
+/// read. So that the clusters shown until now stay, it starts with what
+/// was read until now: the files of `$KUBECONFIG` (`kubeconfig_env`) when
+/// that lists any, else `~/.kube/config`, written like that rather than
+/// as this user's home directory, so that the file also means the right
+/// thing for another user or on another computer.
+fn kubeconfigs_with_added(listed: Option<&[String]>, kubeconfig_env: Option<std::ffi::OsString>, entry: &str) -> KubeconfigSources {
+    let current: Vec<String> = match listed {
+        Some(entries) => entries.to_vec(),
+        None => {
+            let from_env: Vec<String> = kubeconfig_env
+                .map(|v| {
+                    std::env::split_paths(&v)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if from_env.is_empty() {
+                vec!["~/.kube/config".to_string()]
+            } else {
+                from_env
+            }
+        }
+    };
+    KubeconfigSources::explicit(current).with_entry(entry)
+}
+
 /// Whether a native "open file" dialog can be expected to appear. On
 /// Linux it comes from the desktop portal (over D-Bus) or `zenity`; with
 /// neither, asking for one does nothing at all.
@@ -375,6 +405,17 @@ pub struct SkiffApp {
     settings_stamps: [FileStamp; 2],
     /// A secret Skiff put on the clipboard is to be cleared at this time.
     secret_clear_at: Option<Instant>,
+    /// A keyed hash of that secret (never its text), to tell at that time
+    /// whether the clipboard still holds it.
+    secret_hash: u64,
+    secret_hasher: std::collections::hash_map::RandomState,
+    /// Reads the system clipboard's text (`None`: it has none, or it
+    /// could not be read). With it, a copied secret is only cleared while
+    /// the clipboard still holds it, so that something copied in another
+    /// app in the meantime is left alone. Without it nothing can be
+    /// checked, and the clipboard is cleared whenever nothing else was
+    /// copied in Skiff.
+    pub clipboard_reader: Option<Box<dyn Fn() -> Option<String>>>,
     /// A secret was copied during this frame.
     secret_copied: bool,
     /// How long a copied secret stays on the clipboard.
@@ -668,6 +709,9 @@ impl SkiffApp {
             kube_generation: 0,
             settings_stamps: [None, None],
             secret_clear_at: None,
+            secret_hash: 0,
+            secret_hasher: Default::default(),
+            clipboard_reader: None,
             secret_copied: false,
             secret_clipboard_time: SECRET_CLIPBOARD_TIME,
             open_files: false,
@@ -741,6 +785,17 @@ impl SkiffApp {
     /// Says which settings of the config file were not understood (and
     /// takes that back when there are none any more).
     fn report_config_warnings(&mut self, warnings: &[String]) {
+        if let Some(why) = self.config.unusable() {
+            // Only at startup is an unusable file taken as the config
+            // (there is no earlier one to keep): the defaults then, but
+            // not their "nothing is read-only".
+            let lines = vec![
+                "Default settings are in use, and every cluster is read-only until the file is fixed.".to_string(),
+                "Fix the file and come back to Skiff; it is read again then.".to_string(),
+            ];
+            self.report_unusable_config(why.to_string(), lines);
+            return;
+        }
         if warnings.is_empty() {
             self.notices.retain(|n| n.key != "config");
             return;
@@ -758,6 +813,21 @@ impl SkiffApp {
             lines,
             action: None,
         });
+    }
+
+    /// Says that the config file cannot be used at all (`why` follows its
+    /// name: "is not valid JSON (...)") and what that means for now.
+    fn report_unusable_config(&mut self, why: String, lines: Vec<String>) {
+        let file = self.config.path().map(pages::short_path).unwrap_or_else(|| "The config file".to_string());
+        self.notify(Notice { key: "config".into(), tone: Tone::Err, title: format!("{file} {why}"), lines, action: None });
+    }
+
+    /// Whether Skiff refuses changes to the cluster behind `context`: the
+    /// config file says so, or it could not be used when Skiff started,
+    /// in which case what it says about protection is not known and
+    /// every cluster is held read-only until it can be read.
+    fn cluster_read_only(&self, context: &str) -> bool {
+        self.config.unusable().is_some() || self.config.cluster(context).read_only
     }
 
     /// Where the key bindings file is.
@@ -781,19 +851,56 @@ impl SkiffApp {
         let now = self.read_settings_stamps();
         let before = std::mem::replace(&mut self.settings_stamps, now);
         let mut reloaded = false;
-        if now[0] != before[0] && !self.config.is_dirty() {
-            if let Some(path) = self.config.path().map(Path::to_path_buf) {
+        if let Some(path) = self.config.path().map(Path::to_path_buf).filter(|_| now[0] != before[0]) {
+            let listed = self.config.kubeconfigs().map(<[String]>::to_vec);
+            // What the file says now, with its warnings; `Err` when it
+            // says nothing usable.
+            let read: Result<Vec<String>, Option<String>> = if self.config.is_dirty() {
+                // A change made here could not be saved earlier (the file
+                // was broken or could not be written). Saving reads the
+                // file as it is now and puts that change on top.
+                self.config.save().map(|_| self.config.warnings()).map_err(Some)
+            } else {
                 let (config, warnings) = Config::load_from(&path);
-                let sources_changed = config.kubeconfigs() != self.config.kubeconfigs();
-                self.config = config;
-                self.report_config_warnings(&warnings);
-                if sources_changed && !self.cli_kubeconfigs {
-                    self.core.set_kubeconfig_sources(config_sources(&self.config));
-                    self.reload_kubeconfig_saying(Announce::Changes);
+                match config.unusable() {
+                    // A file that cannot be read says nothing, and above
+                    // all not "this cluster is no longer read-only": the
+                    // settings in use stay, kubeconfig list included.
+                    Some(why) => {
+                        let why = why.to_string();
+                        let lines = if self.config.unusable().is_some() {
+                            // (Still as broken as when Skiff started.)
+                            vec!["Default settings are in use, and every cluster is read-only until the file is fixed."
+                                .to_string()]
+                        } else {
+                            vec!["The settings in use are unchanged. Fix the file and come back to Skiff.".to_string()]
+                        };
+                        self.report_unusable_config(why, lines);
+                        Err(None)
+                    }
+                    None => {
+                        self.config = config;
+                        Ok(warnings)
+                    }
                 }
-                self.apply_config();
-                self.toast("Settings reloaded from config.json", Tone::Normal);
-                reloaded = true;
+            };
+            match read {
+                Ok(warnings) => {
+                    self.report_config_warnings(&warnings);
+                    if self.config.kubeconfigs() != listed.as_deref() && !self.cli_kubeconfigs {
+                        self.core.set_kubeconfig_sources(config_sources(&self.config));
+                        self.reload_kubeconfig_saying(Announce::Changes);
+                    }
+                    self.apply_config();
+                    // (Saving may have written the file.)
+                    self.settings_stamps[0] = self.read_settings_stamps()[0];
+                    self.toast("Settings reloaded from config.json", Tone::Normal);
+                    reloaded = true;
+                }
+                // Said once: the stamp is replaced, so the next try is at
+                // the file's next change, not at every return to the window.
+                Err(Some(e)) => self.toast(e, Tone::Err),
+                Err(None) => {}
             }
         }
         if now[1] != before[1] && !self.headless {
@@ -819,7 +926,7 @@ impl SkiffApp {
         self.updater.configure(updates.check, channel);
         crate::external::set_preferred_terminal(self.config.terminal());
         for (name, session) in &self.sessions {
-            session.set_read_only(self.config.cluster(name).read_only);
+            session.set_read_only(self.cluster_read_only(name));
             session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
         }
         self.ctx.set_zoom_factor(self.zoom());
@@ -908,14 +1015,29 @@ impl SkiffApp {
     /// [`SkiffApp::secret_clipboard_time`] unless something else is
     /// copied in Skiff first. `what` names it in the notification.
     ///
-    /// (egui cannot read the clipboard back, so whether it still holds
-    /// the secret is not known: it is cleared whenever nothing else was
-    /// copied from Skiff in the meantime, and the notification says so.)
+    /// (egui cannot read the clipboard back. Where there is a
+    /// [`SkiffApp::clipboard_reader`], the clipboard is cleared only if it
+    /// still holds the secret; otherwise that is not known, and it is
+    /// cleared whenever nothing else was copied from Skiff in the
+    /// meantime. The notification says which.)
     pub fn copy_secret(&mut self, ctx: &egui::Context, text: String, what: &str) {
+        use std::hash::BuildHasher;
+        self.secret_hash = self.secret_hasher.hash_one(&text);
         ctx.copy_text(text);
         self.secret_copied = true;
         let secs = self.secret_clipboard_time.as_secs().max(1);
-        self.toast(format!("Copied {what}. The clipboard will be cleared in {secs} s."), Tone::Normal);
+        let unless = if self.clipboard_reader.is_some() { " if it still holds it" } else { "" };
+        self.toast(format!("Copied {what}. The clipboard will be cleared in {secs} s{unless}."), Tone::Normal);
+    }
+
+    /// Whether the secret copied last is still what the clipboard holds,
+    /// as far as that can be known: `None` without a reader.
+    fn clipboard_holds_secret(&self) -> Option<bool> {
+        use std::hash::BuildHasher;
+        let read = self.clipboard_reader.as_ref()?;
+        // (A clipboard that cannot be read, or holds no text, is not
+        // known to hold the secret: left alone rather than wiped.)
+        Some(read().is_some_and(|text| self.secret_hasher.hash_one(&text) == self.secret_hash))
     }
 
     /// Whether a copied secret is waiting to be cleared from the clipboard.
@@ -939,8 +1061,12 @@ impl SkiffApp {
             let left = at.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 self.secret_clear_at = None;
-                ctx.copy_text(String::new());
-                self.toast("Clipboard cleared", Tone::Normal);
+                // Read once, now, not every frame. Something copied in
+                // another app since is not ours to clear (nor to announce).
+                if self.clipboard_holds_secret().unwrap_or(true) {
+                    ctx.copy_text(String::new());
+                    self.toast("Clipboard cleared", Tone::Normal);
+                }
             } else {
                 // Wake up for it even if nothing else happens.
                 self.tick = self.tick.min(left);
@@ -1041,7 +1167,7 @@ impl SkiffApp {
                 settings::ClusterRow {
                     name: c.name.clone(),
                     active: self.active.as_deref() == Some(c.name.as_str()),
-                    read_only: cluster.read_only,
+                    read_only: self.cluster_read_only(&c.name),
                     confirm: cluster.confirm,
                     plugin: c.exec_command.clone(),
                 }
@@ -1177,6 +1303,13 @@ impl SkiffApp {
     /// Makes a cluster read-only in Skiff (or writable again) and saves
     /// that in the config file.
     pub fn set_read_only(&mut self, context: &str, read_only: bool) {
+        if let (false, Some(why)) = (read_only, self.config.unusable()) {
+            // Not this switch's to lift: nothing is known about the
+            // file's settings, and nothing can be saved into it.
+            let file = self.config.path().map(pages::short_path).unwrap_or_else(|| "The config file".to_string());
+            self.toast(format!("{file} {why}. Every cluster is read-only until the file is fixed."), Tone::Err);
+            return;
+        }
         self.edit_config(|c| c.set_read_only(context, read_only));
         if read_only && self.active.as_deref() == Some(context) {
             // Whatever was about to change the cluster is off.
@@ -1318,13 +1451,21 @@ impl SkiffApp {
         }
         // Added to what is read today, so that the clusters from
         // $KUBECONFIG / ~/.kube/config stay.
-        let saved = config_sources(&self.config).with_entry(entry.clone());
+        let starts_list = self.config.kubeconfigs().is_none();
+        let saved = kubeconfigs_with_added(self.config.kubeconfigs(), std::env::var_os("KUBECONFIG"), &entry);
         let in_effect = if self.cli_kubeconfigs { self.core.kubeconfig_sources().with_entry(entry.clone()) } else { saved.clone() };
         self.edit_config(|c| c.set_kubeconfigs(saved.entries()));
         self.core.set_kubeconfig_sources(in_effect);
         self.reload_kubeconfig_saying(Announce::Never);
         let n = alone.contexts.items.len();
-        self.toast(format!("Added {} from {}", widgets::plural(n, "cluster"), pages::short_path(Path::new(&entry))), Tone::Ok);
+        let mut text = format!("Added {} from {}", widgets::plural(n, "cluster"), pages::short_path(Path::new(&entry)));
+        if starts_list && self.config.kubeconfigs().is_some() {
+            // From now on the list decides, which is easy to miss.
+            text.push_str(
+                ". Skiff now reads the kubeconfig list in config.json and no longer follows $KUBECONFIG; see Settings > Clusters.",
+            );
+        }
+        self.toast(text, Tone::Ok);
         Ok(())
     }
 
@@ -1436,7 +1577,7 @@ impl SkiffApp {
         self.remember_namespaces();
         if !self.sessions.contains_key(name) {
             let session = self.core.connect(name);
-            session.set_read_only(self.config.cluster(name).read_only);
+            session.set_read_only(self.cluster_read_only(name));
             session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
             self.sessions.insert(name.to_string(), session);
         }
@@ -2625,7 +2766,7 @@ impl SkiffApp {
                             },
                             None => "Not connected".to_string(),
                         };
-                        let locked = self.config.cluster(&c.name).read_only;
+                        let locked = self.cluster_read_only(&c.name);
                         let mut marks = Vec::new();
                         let mut tip = format!("{}\n{}", c.server, status);
                         if c.insecure {
@@ -2664,18 +2805,20 @@ impl SkiffApp {
                 // Protection of the cluster that is open.
                 if let Some(active) = &self.active {
                     let cluster = self.config.cluster(active);
+                    let locked = self.cluster_read_only(active);
                     ui.separator();
                     widgets::caption(ui, "Protection", &pal);
-                    if menu_toggle(ui, &pal, cluster.read_only, "Read-only", true)
+                    if menu_toggle(ui, &pal, locked, "Read-only", true)
                         .on_hover_text(format!(
-                            "Skiff will not change anything in {active}: no edits, deletes, scaling, shells or port forwards. Saved in the config file."
+                            "Skiff will not change anything in {active}: no edits, deletes or scaling, and no new shells or port forwards. \
+                             Shells and port forwards that are already open keep running until you close them. Saved in the config file."
                         ))
                         .clicked()
                     {
-                        read_only = Some(!cluster.read_only);
+                        read_only = Some(!locked);
                     }
                     // (Nothing to ask about while nothing can be changed.)
-                    if menu_toggle(ui, &pal, cluster.confirm, "Ask before changes", !cluster.read_only)
+                    if menu_toggle(ui, &pal, cluster.confirm, "Ask before changes", !locked)
                         .on_hover_text(format!(
                             "Restart, scale, cordon, suspend and applying YAML in {active} ask for confirmation first. Deleting always asks."
                         ))
@@ -2727,7 +2870,8 @@ impl SkiffApp {
         let Some(active) = self.active.clone() else { return };
         if self.read_only() {
             widgets::badge(ui, icons::ICON_LOCK, "Read-only", pal.info, &pal).on_hover_text(format!(
-                "Skiff will not change anything in {active}: editing, deleting, scaling, shells and port forwards are off. \
+                "Skiff will not change anything in {active}: editing, deleting, scaling, new shells and new port forwards are off. \
+                 Shells and port forwards that are already open keep running until you close them. \
                  Turn this off in the cluster menu."
             ));
         }
@@ -3608,7 +3752,9 @@ impl SkiffApp {
                         ui.label(RichText::new(format!("on {context}")).color(pal.muted));
                     });
                     ui.label(
-                        RichText::new("Multiple documents separated by --- are applied in order. Existing objects are replaced.")
+                        // (One line in the smallest window: a second
+                        // one pushes the buttons out of it.)
+                        RichText::new("Documents separated by --- are applied in order. Existing objects are updated, not replaced.")
                             .color(pal.muted)
                             .size(12.0),
                     );
@@ -4096,6 +4242,27 @@ mod tests {
         let (config, _) = Config::from_json(r#"{"kubeconfigs": ["~/a", "/b/*.yaml"]}"#);
         assert_eq!(config_sources(&config).entries(), Some(&["~/a".to_string(), "/b/*.yaml".to_string()][..]));
         assert!(config_sources(&Config::default()).is_default());
+    }
+
+    #[test]
+    fn the_first_added_kubeconfig_keeps_what_was_read_before() {
+        let entries = |s: KubeconfigSources| s.entries().map(<[String]>::to_vec).unwrap_or_default();
+        // No list and no $KUBECONFIG: the default file, not this user's
+        // expanded home directory.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(entries(kubeconfigs_with_added(None, env, "/x/staging.yaml")), ["~/.kube/config", "/x/staging.yaml"]);
+        }
+        // $KUBECONFIG's files, in order.
+        let env = std::env::join_paths(["/tmp/kind.yaml", "/tmp/other.yaml"]).unwrap();
+        assert_eq!(
+            entries(kubeconfigs_with_added(None, Some(env.clone()), "/x/staging.yaml")),
+            ["/tmp/kind.yaml", "/tmp/other.yaml", "/x/staging.yaml"]
+        );
+        // A list that exists is added to, whatever the environment says,
+        // and not twice.
+        let listed = ["~/a".to_string()];
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), Some(env.clone()), "/b")), ["~/a", "/b"]);
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), Some(env), "~/a")), ["~/a"]);
     }
 
     #[test]

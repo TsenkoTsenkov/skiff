@@ -1324,6 +1324,136 @@ fn a_read_only_cluster_offers_no_changes() {
     assert_eq!(config_json(&dir)["clusters"][&ctx]["read_only"], serde_json::json!(true));
 }
 
+/// The standing notice about the config file, if there is one.
+fn config_notice(h: &Harness<'static, SkiffApp>) -> Option<skiff::app::Notice> {
+    h.state().notices().iter().find(|n| n.key == "config").cloned()
+}
+
+#[test]
+fn a_config_file_that_is_not_json_does_not_lift_protection() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("brokenconfig");
+    let json = format!(r#"{{"zoom": 1.25, "clusters": {{"{ctx}": {{"read_only": true, "confirm": true}}}}}}"#);
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("deployments.apps".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    assert!(h.state().read_only() && config_notice(&h).is_none());
+
+    // An edit in an editor that leaves a trailing comma behind.
+    let broken = format!(r#"{{"zoom": 1.25, "grafana": "x", "clusters": {{"{ctx}": {{"read_only": true,}}}}}}"#);
+    std::fs::write(dir.join("config.json"), &broken).unwrap();
+    assert!(!h.state_mut().reload_settings_if_changed(), "an unusable file is not taken as the settings");
+    steps(&mut h, 3);
+    assert!(h.state().read_only(), "the cluster stays read-only");
+    assert!(h.state().session().unwrap().is_read_only());
+    assert!(h.state().config().cluster(&ctx).confirm, "and still asks first");
+    assert_eq!(h.state().zoom(), 1.25, "the other settings stay too");
+    let notice = config_notice(&h).expect("the broken file is reported");
+    assert_eq!(notice.tone, skiff_core::Tone::Err);
+    assert!(notice.title.contains("config.json is not valid JSON"), "{}", notice.title);
+    assert!(notice.lines.iter().any(|l| l.contains("settings in use are unchanged")), "{:?}", notice.lines);
+    assert!(!has_label(&h, "Settings reloaded from config.json"));
+    assert_eq!(is_disabled(&h, "Create resource from YAML"), Some(true));
+
+    // Fixed (and changed): read again, and the notice goes.
+    std::fs::write(dir.join("config.json"), format!(r#"{{"clusters": {{"{ctx}": {{"read_only": false}}}}}}"#)).unwrap();
+    assert!(h.state_mut().reload_settings_if_changed());
+    steps(&mut h, 3);
+    assert!(!h.state().read_only() && config_notice(&h).is_none());
+}
+
+#[test]
+fn a_broken_config_file_at_startup_holds_every_cluster_read_only() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("brokenstart");
+    // What the file meant to say is unknown, "prod is read-only" included.
+    let broken = format!(r#"{{"clusters": {{"{ctx}": {{"read_only": true}}}},"#);
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("deployments.apps".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &broken, [1440.0, 900.0]);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    assert!(h.state().read_only(), "nothing may be changed while the file cannot be read");
+    assert!(has_label(&h, "Read-only"));
+    let notice = config_notice(&h).expect("the broken file is reported");
+    assert_eq!(notice.tone, skiff_core::Tone::Err);
+    assert!(notice.title.contains("not valid JSON"), "{}", notice.title);
+    assert!(notice.lines.iter().any(|l| l.contains("every cluster is read-only until the file is fixed")), "{:?}", notice.lines);
+
+    // The switch cannot lift it, and the broken file is not overwritten.
+    h.state_mut().set_read_only(&ctx, false);
+    steps(&mut h, 3);
+    assert!(h.state().read_only());
+    assert_eq!(std::fs::read_to_string(dir.join("config.json")).unwrap(), broken);
+
+    // Fixing the file does.
+    std::fs::write(dir.join("config.json"), "{}").unwrap();
+    assert!(h.state_mut().reload_settings_if_changed());
+    steps(&mut h, 3);
+    assert!(!h.state().read_only() && config_notice(&h).is_none());
+}
+
+#[test]
+fn a_file_fixed_after_a_failed_save_is_read_again() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("failedsave");
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("deployments.apps".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, "{}", [1440.0, 900.0]);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+
+    // The file is broken when a setting is changed in Skiff: not saved.
+    std::fs::write(dir.join("config.json"), "{ oops").unwrap();
+    h.state_mut().set_zoom(1.1);
+    steps(&mut h, 3);
+    assert!(h.state().config().is_dirty());
+    assert!(has_label_containing(&h, "Settings not saved"));
+
+    // Fixed as the message asks, with a change of the user's own (and a
+    // mistake in one key): both are picked up, and the zoom is saved now.
+    let fixed = format!(r#"{{"terminal": 5, "clusters": {{"{ctx}": {{"read_only": true}}}}}}"#);
+    std::fs::write(dir.join("config.json"), fixed).unwrap();
+    assert!(h.state_mut().reload_settings_if_changed());
+    steps(&mut h, 3);
+    assert!(h.state().read_only(), "what was written by hand is in effect");
+    assert!(!h.state().config().is_dirty());
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(1.1));
+    assert_eq!(config_json(&dir)["clusters"][&ctx]["read_only"], serde_json::json!(true));
+    let notice = config_notice(&h).expect("the mistake in one key is reported");
+    assert!(notice.tone == skiff_core::Tone::Warn && notice.lines.iter().any(|l| l.starts_with("terminal")), "{notice:?}");
+    assert!(!h.state_mut().reload_settings_if_changed(), "its own save is not taken for an edit");
+
+    // While the file stays broken, the failure is said once per change of
+    // the file, and nothing is lost.
+    std::fs::write(dir.join("config.json"), "{ oops again").unwrap();
+    h.state_mut().set_zoom(1.25);
+    assert!(!h.state_mut().reload_settings_if_changed());
+    assert!(h.state().read_only() && h.state().config().is_dirty());
+}
+
+#[cfg(feature = "terminal")]
+#[test]
+fn an_open_shell_tab_starts_no_new_shell_on_a_read_only_cluster() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("shellreadonly");
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("pods".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, "{}", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    h.get_by_label("alertmanager-0").click();
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    h.get_by_label("Shell").click();
+    settle(&mut h, "shell to connect", |h| has_label(h, "connected"));
+    // (The button's name starts with its icon.)
+    let external = |h: &Harness<'static, SkiffApp>| {
+        h.query_all_by_label_contains("Open in terminal app").next().map(|n| n.accesskit_node().is_disabled())
+    };
+    assert_eq!(external(&h), Some(false));
+
+    // Read-only is switched on while the tab is open: the shell that runs
+    // stays, a new one in the terminal app is not offered.
+    h.state_mut().set_read_only(&ctx, true);
+    steps(&mut h, 3);
+    assert!(has_label(&h, "connected"), "the open shell keeps running");
+    assert_eq!(external(&h), Some(true));
+}
+
 #[test]
 fn changes_are_confirmed_on_a_cluster_that_asks_first() {
     let Some(ctx) = test_context() else { return };
@@ -1899,6 +2029,40 @@ fn a_copied_secret_is_cleared_from_the_clipboard() {
     assert_eq!(step_until_copied(&mut h), "", "the clipboard is cleared");
     assert!(!h.state().secret_on_clipboard());
     settle(&mut h, "cleared notice", |h| has_label(h, "Clipboard cleared"));
+
+    // Where the clipboard can be read, it is cleared only while it still
+    // holds the secret: something copied in another app is left alone.
+    let clipboard = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    let reader = clipboard.clone();
+    h.state_mut().clipboard_reader = Some(Box::new(move || reader.borrow().clone()));
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    let secret = step_until_copied(&mut h);
+    steps(&mut h, 2);
+    assert!(has_label_containing(&h, "if it still holds it"), "the notification says when");
+    *clipboard.borrow_mut() = Some("https://copied.elsewhere.example".to_string());
+    std::thread::sleep(Duration::from_millis(650));
+    for _ in 0..3 {
+        h.step();
+        assert!(h.output().platform_output.commands.is_empty(), "another app's copy is not wiped");
+    }
+    assert!(!h.state().secret_on_clipboard(), "and the clearing is off");
+    // (A clipboard that cannot be read is left alone as well.)
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    step_until_copied(&mut h);
+    *clipboard.borrow_mut() = None;
+    std::thread::sleep(Duration::from_millis(650));
+    for _ in 0..3 {
+        h.step();
+        assert!(h.output().platform_output.commands.is_empty(), "an unreadable clipboard is not wiped");
+    }
+    assert!(!h.state().secret_on_clipboard());
+    // Still the secret: cleared.
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    step_until_copied(&mut h);
+    *clipboard.borrow_mut() = Some(secret);
+    std::thread::sleep(Duration::from_millis(650));
+    assert_eq!(step_until_copied(&mut h), "", "the secret is cleared");
+    h.state_mut().clipboard_reader = None;
 
     // Copying something else from Skiff in the meantime calls it off:
     // that is not ours to clear.

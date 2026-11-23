@@ -191,7 +191,8 @@ impl Invocation {
     /// The arguments for Windows Terminal (`wt.exe`), which starts each
     /// command itself, one tab each: no shell reads the names. `None` when
     /// this cannot be given to it: `;` separates its own commands, the
-    /// arguments [`win_quote`] refuses are refused here as well, and a tab
+    /// arguments [`win_quote`] refuses are refused here as well, so is one
+    /// that Windows Terminal would quote wrongly, and a tab
     /// closes as soon as its command ends well, which would hide the output
     /// of a command that just prints and ends.
     pub fn wt_args(&self) -> Option<Vec<String>> {
@@ -200,7 +201,14 @@ impl Invocation {
         }
         let mut args: Vec<String> = Vec::new();
         for argv in &self.commands {
-            if argv.is_empty() || argv.iter().any(|a| a.is_empty() || a.contains(';') || win_quote(a).is_err()) {
+            // Windows Terminal joins the arguments into one command line
+            // again: it puts quotes around one with a space and escapes
+            // nothing, so a backslash at the end of such an argument would
+            // swallow the closing quote and what follows.
+            let breaks_out = |a: &str| a.contains(' ') && a.ends_with('\\');
+            if argv.is_empty()
+                || argv.iter().any(|a| a.is_empty() || a.contains(';') || breaks_out(a) || win_quote(a).is_err())
+            {
                 return None;
             }
             if !args.is_empty() {
@@ -858,6 +866,23 @@ mod tests {
         assert!(exec_invocation("a;b", "ns", "p", None).wt_args().is_none());
         assert!(exec_invocation("ctx", "ns", "p ; new-tab calc", None).wt_args().is_none());
         assert!(exec_invocation("ctx", "", "p", None).wt_args().is_none());
+        // A space and a backslash at the end: Windows Terminal's own
+        // quoting would let the rest of the line out of the quotes. Such a
+        // name goes through cmd, where it is quoted properly.
+        let odd = "a b\\";
+        let evil = "c --kubeconfig=\\\\evil\\share\\cfg exec x d\\";
+        for inv in [
+            exec_invocation(odd, "ns", "p", Some("c")),
+            exec_invocation("ctx", odd, "p", Some("c")),
+            exec_invocation("ctx", "ns", "p", Some(odd)),
+            exec_invocation("ctx", odd, "p", Some(evil)),
+            logs_invocation("ctx", &[("ns".to_string(), "p".to_string(), odd.to_string())], None, false, false),
+        ] {
+            assert!(inv.wt_args().is_none());
+            assert!(inv.windows_command().unwrap().contains("\"a b\\\\\""));
+        }
+        // Without a space nothing is quoted, and the backslash is plain.
+        assert!(exec_invocation("ctx\\", "ns", "p", None).wt_args().is_some());
         // Finished logs must stay readable: a cmd window, not a tab.
         assert!(logs_invocation("c", &targets[..1], None, true, false).wt_args().is_none());
         assert!(Invocation::default().wt_args().is_none());

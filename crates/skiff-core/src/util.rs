@@ -46,6 +46,11 @@ impl<T> Job<T> {
         *self.slot.lock() = Some(value);
     }
 
+    /// Nobody but the task that fills it holds this job any more.
+    pub(crate) fn is_abandoned(&self) -> bool {
+        Arc::strong_count(&self.slot) == 1
+    }
+
     pub fn is_done(&self) -> bool {
         self.slot.lock().is_some()
     }
@@ -217,6 +222,13 @@ pub fn friendly(e: &kube::Error) -> String {
 /// Sorts a client error into a kind, a short summary and a next step.
 pub fn classify(e: &kube::Error) -> ErrorInfo {
     classify_kube(e, None)
+}
+
+/// The request never left: the kubeconfig's credential plugin, which is
+/// run again once its token has expired, is missing or failed. Asking
+/// again only runs the plugin again; the user has to sign in first.
+pub(crate) fn is_credential_failure(e: &kube::Error) -> bool {
+    matches!(classify(e).kind, ErrorKind::ExecFailed | ErrorKind::ExecMissing)
 }
 
 /// Like [`classify`], naming the credential plugin the context uses (the

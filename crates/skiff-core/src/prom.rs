@@ -381,10 +381,23 @@ fn pick_port(ports: &[Value], expected: u16) -> Option<(u16, &'static str)> {
     }
 }
 
-/// Orders the Services that look like Prometheus, best first. `services`
+/// Whether [`candidates`] could do anything with this Service.
+fn could_be_prometheus(svc: &Value) -> bool {
+    svc["spec"]["type"].as_str() != Some("ExternalName") && flavour(svc).is_some()
+}
+
+/// Orders the Services that look like Prometheus, best first: the ones in
+/// the namespaces monitoring is usually installed in before all others,
+/// then by how specific the match is.
+///
+/// A label or a name is all it takes to look like Prometheus, and anyone
+/// who may create a Service in some namespace can set them; a per-team
+/// Prometheus in `apps-team` also carries the operator's label. Neither
+/// should win over the one in `monitoring` because of its namespace's
+/// place in the alphabet. `services`
 /// are Service objects as the API returns them (`items` of a list).
 pub fn candidates(services: &[Value]) -> Vec<PromEndpoint> {
-    let mut found: Vec<(u8, PromEndpoint)> = Vec::new();
+    let mut found: Vec<((bool, u8), PromEndpoint)> = Vec::new();
     for svc in services {
         let (Some(ns), Some(name)) = (svc["metadata"]["namespace"].as_str(), svc["metadata"]["name"].as_str()) else {
             continue;
@@ -401,7 +414,7 @@ pub fn candidates(services: &[Value]) -> Vec<PromEndpoint> {
             continue;
         };
         found.push((
-            rank,
+            (!WELL_KNOWN_NAMESPACES.contains(&ns), rank),
             PromEndpoint {
                 namespace: ns.into(),
                 service: name.into(),
@@ -418,29 +431,70 @@ pub fn candidates(services: &[Value]) -> Vec<PromEndpoint> {
 }
 
 async fn get(client: &Client, path: &str, limit: usize, timeout: Duration) -> Result<Vec<u8>, PromError> {
-    let req = get_request(path, Some(JSON)).map_err(PromError::Other)?;
+    get_with_status(client, path, limit, timeout).await.map_err(|(e, _)| e)
+}
+
+/// Like [`get`]; a failure comes with the HTTP status when there was an
+/// answer at all.
+async fn get_with_status(
+    client: &Client,
+    path: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, (PromError, Option<u16>)> {
+    let req = get_request(path, Some(JSON)).map_err(|e| (PromError::Other(e), None))?;
     let exchange = async {
         let res = client
             .send(req.map(kube::client::Body::from))
             .await
-            .map_err(|e| transport_error(&e))?;
+            .map_err(|e| (transport_error(&e), None))?;
         let status = res.status();
         let body = collect_capped(res.into_body(), limit).await.map_err(|e| match e {
-            BodyError::TooLarge { .. } => PromError::TooLarge,
-            BodyError::Read(e) => transport_error(&e),
+            BodyError::TooLarge { .. } => (PromError::TooLarge, Some(status.as_u16())),
+            BodyError::Read(e) => (transport_error(&e), None),
         })?;
         if status.is_success() {
             Ok(body)
         } else {
-            Err(classify_response(status.as_u16(), &body))
+            Err((classify_response(status.as_u16(), &body), Some(status.as_u16())))
         }
     };
     match tokio::time::timeout(timeout, exchange).await {
         Ok(result) => result,
-        Err(_) => Err(PromError::Unreachable(format!(
-            "no answer within {} s",
-            timeout.as_secs()
-        ))),
+        Err(_) => Err((
+            PromError::Unreachable(format!("no answer within {} s", timeout.as_secs())),
+            None,
+        )),
+    }
+}
+
+/// What a detected Service said when it was asked a Prometheus question.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Prometheus,
+    Forbidden(String),
+    /// No answer from behind the Service (no endpoints, timeout, network):
+    /// it may be a Prometheus that is down.
+    Silent(String),
+    /// Something answered, and it is not the Prometheus API.
+    NotPrometheus,
+}
+
+/// Sorts the outcome of a probe. `status` is the HTTP status, when the
+/// request got as far as an answer.
+fn probe_outcome(result: Result<(), (PromError, Option<u16>)>) -> Probe {
+    match result {
+        Ok(()) => Probe::Prometheus,
+        Err((PromError::Forbidden(msg), _)) => Probe::Forbidden(msg),
+        // The proxy's own "nothing there": the Service has no ready pod,
+        // or the pod did not answer.
+        Err((PromError::Unreachable(msg), Some(502..=504) | None)) => Probe::Silent(msg),
+        // A problem on the way to the API server says nothing about the
+        // Service either way.
+        Err((PromError::Other(msg), None)) => Probe::Silent(msg),
+        // 404 and other statuses from the backend, or a 200 that is not
+        // Prometheus' format: the Service only looks like Prometheus.
+        Err(_) => Probe::NotPrometheus,
     }
 }
 
@@ -464,7 +518,10 @@ async fn list_services(client: &Client, ns: Option<&str>) -> Result<Vec<Value>, 
         let mut page: Value =
             serde_json::from_slice(&body).map_err(|e| PromError::Other(format!("unexpected Service list: {e}")))?;
         if let Some(Value::Array(page_items)) = page.get_mut("items").map(Value::take) {
-            items.extend(page_items);
+            // Only what detection can use is kept: a large cluster has
+            // thousands of Services, each with its managed fields and
+            // annotations.
+            items.extend(page_items.into_iter().filter(could_be_prometheus));
         }
         token = page["metadata"]["continue"].as_str().unwrap_or("").to_string();
         if token.is_empty() {
@@ -479,13 +536,33 @@ async fn list_services(client: &Client, ns: Option<&str>) -> Result<Vec<Value>, 
 /// `extra_namespaces` are tried (after the well-known ones) when the
 /// account may not list Services cluster-wide; pass the namespaces the user
 /// works in. Errors: [`PromError::NotFound`] when nothing looks like
-/// Prometheus, [`PromError::Forbidden`] when RBAC stopped the search or the
-/// proxy call, [`PromError::Unreachable`] when a Service was found but did
-/// not answer.
+/// Prometheus or what does turned out to be something else,
+/// [`PromError::Forbidden`] when RBAC stopped the search or the proxy
+/// call, [`PromError::Unreachable`] when a Service was found and nothing
+/// answered behind it.
 ///
 /// Call once per session and cache the outcome; a config override should
 /// skip this and go to [`Prom::ping`].
 pub async fn detect(client: &Client, extra_namespaces: &[&str]) -> Result<Prom, PromError> {
+    search(client, extra_namespaces).await.map_err(|e| e.error)
+}
+
+/// Why [`search`] found no Prometheus.
+pub(crate) struct Undetected {
+    pub error: PromError,
+    /// The Service that looks like Prometheus and did not answer: the one
+    /// to ask again later, instead of searching the cluster again.
+    pub silent: Option<PromEndpoint>,
+}
+
+impl From<PromError> for Undetected {
+    fn from(error: PromError) -> Self {
+        Undetected { error, silent: None }
+    }
+}
+
+/// [`detect`], also saying which Service did not answer.
+pub(crate) async fn search(client: &Client, extra_namespaces: &[&str]) -> Result<Prom, Undetected> {
     let services = match list_services(client, None).await {
         Ok(items) => items,
         Err(PromError::Forbidden(cluster_wide)) => {
@@ -505,37 +582,38 @@ pub async fn detect(client: &Client, extra_namespaces: &[&str]) -> Result<Prom, 
                 }
             }
             if !any_allowed {
-                return Err(PromError::Forbidden(cluster_wide));
+                return Err(PromError::Forbidden(cluster_wide).into());
             }
             items
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
 
     let mut forbidden = None;
-    let mut unreachable = None;
+    let mut silent: Option<(String, PromEndpoint)> = None;
     for endpoint in candidates(&services).into_iter().take(MAX_PROBES) {
         let prom = Prom::new(client.clone(), endpoint);
-        match prom.ping().await {
-            Ok(()) => return Ok(prom),
-            Err(PromError::Forbidden(msg)) => {
+        match probe_outcome(prom.ping_with_status().await) {
+            Probe::Prometheus => return Ok(prom),
+            Probe::Forbidden(msg) => {
                 forbidden.get_or_insert(msg);
             }
-            Err(e) => {
-                let reason = match e {
-                    PromError::Unreachable(msg) | PromError::Query(msg) | PromError::Other(msg) => msg,
-                    other => other.to_string(),
-                };
-                unreachable.get_or_insert(format!("{} ({reason})", prom.endpoint.display()));
+            Probe::Silent(reason) => {
+                if silent.is_none() {
+                    silent = Some((format!("{} ({reason})", prom.endpoint.display()), prom.endpoint));
+                }
             }
+            // A lookalike. Saying "not answering" about it would be
+            // wrong, and would have it asked again and again.
+            Probe::NotPrometheus => {}
         }
     }
     // "Not allowed" is the more useful thing to say when both happened: it
     // is the one the user can get fixed.
-    Err(match (forbidden, unreachable) {
-        (Some(msg), _) => PromError::Forbidden(msg),
-        (None, Some(msg)) => PromError::Unreachable(msg),
-        (None, None) => PromError::NotFound,
+    Err(match (forbidden, silent) {
+        (Some(msg), _) => Undetected { error: PromError::Forbidden(msg), silent: None },
+        (None, Some((msg, endpoint))) => Undetected { error: PromError::Unreachable(msg), silent: Some(endpoint) },
+        (None, None) => PromError::NotFound.into(),
     })
 }
 
@@ -561,9 +639,13 @@ impl Prom {
     /// Confirms that the endpoint speaks the Prometheus API, with a query
     /// that costs the server nothing.
     pub async fn ping(&self) -> Result<(), PromError> {
+        self.ping_with_status().await.map_err(|(e, _)| e)
+    }
+
+    async fn ping_with_status(&self) -> Result<(), (PromError, Option<u16>)> {
         let path = self.endpoint.api_path("query", &[("query", "vector(1)")]);
-        let body = get(&self.client, &path, MAX_BODY_BYTES, PROBE_TIMEOUT).await?;
-        parse_query_response(&body).map(|_| ())
+        let body = get_with_status(&self.client, &path, MAX_BODY_BYTES, PROBE_TIMEOUT).await?;
+        parse_query_response(&body).map(|_| ()).map_err(|e| (e, Some(200)))
     }
 
     /// Evaluates `expr` over a time range.
@@ -779,8 +861,16 @@ impl TimeRange {
 
     /// The last `span_secs` seconds at roughly `target_points` points. The
     /// step is rounded up to a round number (never below 15 s, a common
-    /// scrape interval) and the end is aligned to it, so that refreshing a
-    /// chart moves it by whole steps instead of re-sampling every series.
+    /// scrape interval).
+    ///
+    /// The end is rounded down to the step, but by no more than a minute:
+    /// Prometheus evaluates at `start + k * step`, and every span the app
+    /// offers is a whole number of steps, so the newest point is at `end`.
+    /// Rounding to a two-hour step would leave a week's chart, and the
+    /// "latest" value in its legend, up to two hours behind, and show
+    /// nothing at all for a pod younger than that. Up to a minute's step a
+    /// refresh still moves the chart by whole steps; coarser charts are
+    /// sampled anew at each refresh, minutes apart.
     pub fn with_points(span_secs: u64, now_unix: i64, target_points: u32) -> Self {
         // A minute to 90 days; outside that a chart is meaningless.
         let span = span_secs.clamp(60, 90 * 86_400);
@@ -794,7 +884,7 @@ impl TimeRange {
             // above, so this fits easily.)
             .unwrap_or_else(|| (raw.div_ceil(86_400) * 86_400) as u32);
         let now = now_unix.max(0);
-        let end = now - now % i64::from(step);
+        let end = now - now % i64::from(step.min(60));
         TimeRange {
             start: end - span as i64,
             end,
@@ -1248,6 +1338,24 @@ struct RawAlerts {
     alerts: Vec<RawAlert>,
 }
 
+/// Firing alerts kept, most severe first. A cluster that is badly broken
+/// can have one per pod; the views walk the list on every frame.
+pub const MAX_ALERTS: usize = 2000;
+/// Characters kept of an alert's name and of its severity.
+const MAX_ALERT_NAME: usize = 120;
+/// Characters kept of a summary or description: rule templates can expand
+/// to anything, and the text is laid out in one piece.
+const MAX_ALERT_TEXT: usize = 2000;
+
+/// `s` without surrounding space, cut to `max` characters.
+fn clip_to(s: &str, max: usize) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_string(),
+    }
+}
+
 fn severity_order(severity: &str) -> u8 {
     match severity {
         "critical" | "page" => 0,
@@ -1261,7 +1369,9 @@ fn severity_order(severity: &str) -> u8 {
 /// Parses the body of `/api/v1/alerts` and keeps what is worth showing:
 /// firing alerts, without the always-firing `Watchdog` and without
 /// `severity="none"` (inhibitor helpers such as `InfoInhibitor`). Sorted
-/// most severe first, then by name and age.
+/// most severe first, then by name and age. At most [`MAX_ALERTS`] are
+/// returned (the least severe are the ones left out), and names and texts
+/// are cut to a length that can be drawn.
 pub fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, PromError> {
     let env = envelope(body)?;
     let raw: RawAlerts = serde_json::from_value(env.data)
@@ -1271,15 +1381,16 @@ pub fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, PromError> {
         .into_iter()
         .filter(|a| a.state == "firing")
         .map(|mut a| {
-            let mut annotation = |key: &str| a.annotations.remove(key).unwrap_or_default().trim().to_string();
+            let mut annotation =
+                |key: &str| a.annotations.remove(key).map(|text| clip_to(&text, MAX_ALERT_TEXT)).unwrap_or_default();
             let (summary, description, message) =
                 (annotation("summary"), annotation("description"), annotation("message"));
             Alert {
-                name: a.labels.get("alertname").cloned().unwrap_or_default(),
+                name: a.labels.get("alertname").map(|n| clip_to(n, MAX_ALERT_NAME)).unwrap_or_default(),
                 severity: a
                     .labels
                     .get("severity")
-                    .map(|s| s.to_ascii_lowercase())
+                    .map(|s| clip_to(s, MAX_ALERT_NAME).to_ascii_lowercase())
                     .unwrap_or_default(),
                 state: a.state,
                 summary,
@@ -1305,6 +1416,7 @@ pub fn parse_alerts(body: &[u8]) -> Result<Vec<Alert>, PromError> {
             &b.labels,
         ))
     });
+    alerts.truncate(MAX_ALERTS);
     Ok(alerts)
 }
 
@@ -1691,15 +1803,17 @@ mod tests {
         assert_eq!(
             names,
             [
+                // The usual monitoring namespaces first, ...
                 "monitoring/prometheus-operated:9090",
+                "default/prometheus:9090",
+                "monitoring/kps-prometheus:9090",
+                // ... then the rest, by how specific the match is.
                 "prom/prometheus-server:80",
                 "vm/vmsingle-main:8428",
                 "vm/vmselect-main:8481",
-                "default/prometheus:9090",
-                "monitoring/kps-prometheus:9090",
             ]
         );
-        assert_eq!(found[3].path_prefix, "/select/0/prometheus");
+        assert_eq!(found[5].path_prefix, "/select/0/prometheus");
         assert!(found
             .iter()
             .filter(|e| e.service != "vmselect-main")
@@ -1708,6 +1822,74 @@ mod tests {
         let mut reversed = services.clone();
         reversed.reverse();
         assert_eq!(candidates(&reversed), found);
+    }
+
+    #[test]
+    fn the_monitoring_namespaces_win_over_lookalikes_elsewhere() {
+        let operated = |ns: &str| {
+            svc(ns, "prometheus-operated", json!({"operated-prometheus": "true"}), json!([{"name": "web", "port": 9090}]))
+        };
+        let order = |services: &[Value]| candidates(services).iter().map(|e| e.display()).collect::<Vec<_>>();
+        // A team's own Prometheus next to the cluster's.
+        assert_eq!(
+            order(&[operated("apps-team"), operated("monitoring")]),
+            ["monitoring/prometheus-operated:9090", "apps-team/prometheus-operated:9090"]
+        );
+        // One label in a tenant's namespace does not beat a weaker match
+        // where Prometheus is expected.
+        let chart = svc(
+            "monitoring",
+            "prometheus-server",
+            json!({"app.kubernetes.io/name": "prometheus", "app.kubernetes.io/component": "server"}),
+            json!([{"name": "http", "port": 80}]),
+        );
+        assert_eq!(
+            order(&[operated("aaa"), chart]),
+            ["monitoring/prometheus-server:80", "aaa/prometheus-operated:9090"]
+        );
+        // More lookalikes than are probed: the expected place is still first.
+        let mut many: Vec<Value> = (0..MAX_PROBES + 2).map(|i| operated(&format!("a-team-{i}"))).collect();
+        many.push(operated("monitoring"));
+        assert_eq!(order(&many)[0], "monitoring/prometheus-operated:9090");
+    }
+
+    #[test]
+    fn only_services_that_could_be_prometheus_are_kept_from_a_list() {
+        let plain = svc("shop", "web", json!({"app": "shop"}), json!([{"name": "http", "port": 80}]));
+        let prometheus = svc("monitoring", "prometheus", json!({}), json!([{"port": 9090}]));
+        let mut external = prometheus.clone();
+        external["spec"]["type"] = json!("ExternalName");
+        assert!(!could_be_prometheus(&plain));
+        assert!(!could_be_prometheus(&external));
+        assert!(could_be_prometheus(&prometheus));
+        // Filtering first changes nothing about what is found.
+        let all = vec![plain, external, prometheus];
+        let kept: Vec<Value> = all.iter().filter(|s| could_be_prometheus(s)).cloned().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(candidates(&kept), candidates(&all));
+    }
+
+    #[test]
+    fn a_lookalike_is_told_apart_from_a_prometheus_that_is_down() {
+        let silent = |r| matches!(probe_outcome(r), Probe::Silent(_));
+        assert_eq!(probe_outcome(Ok(())), Probe::Prometheus);
+        // Nothing behind the Service, or no answer at all.
+        assert!(silent(Err((classify_response(503, b"no endpoints available"), Some(503)))));
+        assert!(silent(Err((classify_response(502, b""), Some(502)))));
+        assert!(silent(Err((classify_response(504, b""), Some(504)))));
+        assert!(silent(Err((PromError::Unreachable("no answer within 8 s".into()), None))));
+        assert!(silent(Err((PromError::Other("connection closed".into()), None))));
+        // Something answered, and it is not Prometheus.
+        let not = |r| assert_eq!(probe_outcome(r), Probe::NotPrometheus);
+        not(Err((classify_response(404, b"404 page not found"), Some(404))));
+        not(Err((classify_response(500, b"boom"), Some(500))));
+        not(Err((classify_response(400, br#"{"status":"error","errorType":"bad_data","error":"x"}"#), Some(400))));
+        not(Err((parse_query_response(b"<html>hello</html>").unwrap_err(), Some(200))));
+        not(Err((PromError::TooLarge, Some(200))));
+        assert_eq!(
+            probe_outcome(Err((classify_response(403, b"no"), Some(403)))),
+            Probe::Forbidden("no".into())
+        );
     }
 
     #[test]
@@ -2008,9 +2190,13 @@ mod tests {
             assert_eq!(r.step, step, "span {span}");
             assert_eq!(r.rate_window(), window, "span {span}");
             assert_eq!(r.end - r.start, span as i64);
-            // Aligned, never in the future, less than a step behind.
-            assert_eq!(r.end % i64::from(step), 0);
-            assert!(r.end <= now && now - r.end < i64::from(step));
+            // Never in the future and at most a minute behind, however
+            // coarse the step; aligned to the step up to a minute.
+            assert_eq!(r.end % i64::from(step.min(60)), 0);
+            assert!(r.end <= now && now - r.end < 60, "span {span}");
+            // Prometheus evaluates at start + k * step: the newest point
+            // is the end itself.
+            assert_eq!((r.end - r.start) % i64::from(step), 0, "span {span}");
             let points = (r.end - r.start) / i64::from(step) + 1;
             // (Short spans have fewer points: the step does not go below 15 s.)
             let fewest = if span >= 3600 { 60 } else { 20 };
@@ -2264,6 +2450,32 @@ mod tests {
             ("", "only a message")
         );
         assert_eq!(custom.active_since, None);
+    }
+
+    #[test]
+    fn alerts_are_bounded_in_number_and_length() {
+        let long = "é".repeat(5000);
+        let mut alerts: Vec<Value> = (0..MAX_ALERTS + 50)
+            .map(|i| json!({"labels": {"alertname": format!("Info{i:05}"), "severity": "info"}, "state": "firing"}))
+            .collect();
+        alerts.push(json!({
+            "labels": {"alertname": long, "severity": format!("CRITICAL{long}")},
+            "annotations": {"summary": long, "description": long},
+            "state": "firing"
+        }));
+        let body = json!({"status": "success", "data": {"alerts": alerts}}).to_string();
+        let parsed = parse_alerts(body.as_bytes()).unwrap();
+        // The cap drops the least severe.
+        assert_eq!(parsed.len(), MAX_ALERTS);
+        let first = &parsed[0];
+        assert!(first.name.starts_with("éé") && first.name.chars().count() == MAX_ALERT_NAME + 1, "{}", first.name);
+        assert!(first.name.ends_with('…'));
+        assert!(first.severity.starts_with("critical") && first.severity.chars().count() == MAX_ALERT_NAME + 1);
+        assert_eq!(first.summary.chars().count(), MAX_ALERT_TEXT + 1);
+        assert_eq!(first.description.chars().count(), MAX_ALERT_TEXT + 1);
+        assert_eq!(parsed[1].name, "Info00000");
+        // Ordinary text is left alone.
+        assert_eq!(clip_to("  KubePodCrashLooping ", MAX_ALERT_NAME), "KubePodCrashLooping");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::FutureExt;
-use kube::config::KubeConfigOptions;
+use kube::config::{ExecInteractiveMode, KubeConfigOptions};
 use kube::discovery::{verbs, Discovery, Scope};
 use kube::{Client, Config};
 use parking_lot::Mutex;
@@ -39,6 +39,9 @@ const JOB_TIMEOUT: Duration = ops::REQUEST_TIMEOUT;
 /// How long building a client may take. Almost all of it is the kubeconfig's
 /// exec credential plugin, which may open a browser and wait for a sign-in.
 const CLIENT_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the metrics poll waits after the credential plugin failed.
+const CREDENTIAL_RETRY_SECS: i64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextInfo {
@@ -184,14 +187,20 @@ const HISTORY_KEEP_SECS: i64 = 900;
 /// Objects with history at any one time. With two rings each this bounds
 /// the history at about two megabytes.
 const HISTORY_MAX_OBJECTS: usize = 256;
-/// A Prometheus that did not answer is looked for again after this long.
+/// A Prometheus that did not answer is asked again after this long, and
+/// then after twice as long each time it still does not answer.
 const PROM_RETRY_SECS: i64 = 120;
+const PROM_RETRY_MAX_SECS: i64 = 1800;
 const ALERTS_INTERVAL_SECS: i64 = 45;
 /// Alerts are refreshed while something asked for them this recently.
 const ALERTS_WANTED_SECS: i64 = 90;
 
 struct Tracked {
     wanted: i64,
+    /// The object already had usage when it was first asked about: it ran
+    /// before its ring starts, so the ring does not cover its whole life.
+    /// (A pod that is new has no metrics-server sample yet.)
+    older_than_ring: bool,
     cpu: SampleRing,
     memory: SampleRing,
 }
@@ -220,8 +229,12 @@ impl History {
                 let oldest = map.iter().min_by_key(|(_, t)| t.wanted).map(|(k, _)| k.clone())?;
                 map.remove(&oldest);
             }
-            let mut tracked =
-                Tracked { wanted: now, cpu: SampleRing::new(HISTORY_SAMPLES), memory: SampleRing::new(HISTORY_SAMPLES) };
+            let mut tracked = Tracked {
+                wanted: now,
+                older_than_ring: current.is_some(),
+                cpu: SampleRing::new(HISTORY_SAMPLES),
+                memory: SampleRing::new(HISTORY_SAMPLES),
+            };
             if let Some(u) = current {
                 tracked.cpu.push(now as f64, u.cpu);
                 tracked.memory.push(now as f64, u.memory);
@@ -248,15 +261,45 @@ impl History {
     }
 }
 
-/// Adds up the rings of several objects, sample time by sample time.
-fn sum_rings<'a>(rings: impl Iterator<Item = &'a SampleRing>) -> Vec<(f64, f64)> {
-    let mut total: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
-    for ring in rings {
-        for (at, value) in ring.iter() {
-            *total.entry(at as i64).or_default() += value;
+/// Adds up the rings of several objects over time.
+///
+/// Rings do not share all their sample times (each starts with a sample
+/// from the moment it was first asked about, and metrics-server can leave
+/// an object out of a poll), so a ring counts with its latest value at
+/// every time between its first and its last sample. Before its first
+/// sample a ring counts as nothing, which is right for a pod that did not
+/// exist yet. For a ring marked `true` (the object is older than its ring)
+/// it would be wrong: the total would step up when the ring starts. The
+/// sum therefore begins where the last such ring begins.
+fn sum_rings<'a>(rings: impl Iterator<Item = (&'a SampleRing, bool)>) -> Vec<(f64, f64)> {
+    let rings: Vec<(&SampleRing, bool)> = rings.filter(|(ring, _)| !ring.is_empty()).collect();
+    let start = rings
+        .iter()
+        .filter(|(_, older)| *older)
+        .filter_map(|(ring, _)| ring.iter().next())
+        .map(|(at, _)| at)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut times: Vec<f64> = rings.iter().flat_map(|(ring, _)| ring.iter().map(|(at, _)| at)).filter(|at| *at >= start).collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup();
+    let mut total = vec![0.0; times.len()];
+    for (ring, _) in &rings {
+        let last = ring.last().map_or(f64::NEG_INFINITY, |(at, _)| at);
+        let mut samples = ring.iter().peekable();
+        let mut value = None;
+        for (at, sum) in times.iter().zip(total.iter_mut()) {
+            if *at > last {
+                break;
+            }
+            while let Some((_, v)) = samples.next_if(|(sample_at, _)| sample_at <= at) {
+                value = Some(v);
+            }
+            if let Some(v) = value {
+                *sum += v;
+            }
         }
     }
-    total.into_iter().map(|(at, value)| (at as f64, value)).collect()
+    times.into_iter().zip(total).collect()
 }
 
 /// Prometheus, alerts and usage history of one session. Shared with the
@@ -272,12 +315,29 @@ struct Observability {
     decided_at: AtomicI64,
     /// Serialises publishing an outcome with starting over.
     lock: Mutex<()>,
+    /// How an unreachable Prometheus is asked again.
+    retry: Mutex<PromRetry>,
     /// `clusters.<context>.prometheus` from the config file.
     endpoint: Mutex<Option<PromEndpoint>>,
     alerts: ArcSwap<Alerts>,
     alerts_wanted: AtomicI64,
     alerts_started: AtomicBool,
     history: Mutex<History>,
+}
+
+struct PromRetry {
+    /// Seconds to wait after the last outcome.
+    after: i64,
+    /// The Service that did not answer. Only this is asked again: looking
+    /// through the whole cluster every time would list every Service of a
+    /// cluster whose Prometheus is simply switched off.
+    endpoint: Option<PromEndpoint>,
+}
+
+impl Default for PromRetry {
+    fn default() -> Self {
+        PromRetry { after: PROM_RETRY_SECS, endpoint: None }
+    }
 }
 
 impl Observability {
@@ -288,6 +348,7 @@ impl Observability {
             started: AtomicBool::new(false),
             decided_at: AtomicI64::new(0),
             lock: Mutex::new(()),
+            retry: Mutex::new(PromRetry::default()),
             endpoint: Mutex::new(None),
             alerts: ArcSwap::from_pointee(Alerts::default()),
             alerts_wanted: AtomicI64::new(0),
@@ -302,49 +363,89 @@ impl Observability {
         let _publishing = self.lock.lock();
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
+        *self.retry.lock() = PromRetry::default();
         self.status.store(Arc::new(PromStatus::Detecting));
         if self.alerts.load().loaded {
             self.alerts.store(Arc::new(Alerts::default()));
         }
     }
 
-    fn publish(&self, generation: u64, status: PromStatus) -> bool {
+    /// `silent` is the Service to ask again when the status is "not
+    /// answering".
+    fn publish(&self, generation: u64, status: PromStatus, silent: Option<PromEndpoint>) -> bool {
         let _publishing = self.lock.lock();
         if self.generation.load(Ordering::SeqCst) != generation {
             return false;
         }
         self.decided_at.store(now_unix(), Ordering::SeqCst);
+        self.retry.lock().endpoint = silent;
         self.status.store(Arc::new(status));
         true
+    }
+
+    /// When a Prometheus that did not answer is due to be asked again:
+    /// claims that retry and returns its generation and the Service to
+    /// ask (`None`: look through the cluster). Unlike [`Self::reset`] the
+    /// status stays as it is until the retry has its answer, so views keep
+    /// showing what they show instead of flipping to "looking for
+    /// Prometheus" every few minutes.
+    fn claim_retry(&self, now: i64) -> Option<(u64, Option<PromEndpoint>)> {
+        let _publishing = self.lock.lock();
+        if !matches!(&**self.status.load(), PromStatus::Unavailable(PromError::Unreachable(_))) {
+            return None;
+        }
+        let mut retry = self.retry.lock();
+        if now - self.decided_at.load(Ordering::SeqCst) <= retry.after {
+            return None;
+        }
+        // The next one is due this long after now, unless the retry (or
+        // anything else) publishes first.
+        self.decided_at.store(now, Ordering::SeqCst);
+        retry.after = (retry.after * 2).min(PROM_RETRY_MAX_SECS);
+        // An answer still on its way from an earlier try is out of date.
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Some((generation, retry.endpoint.clone()))
+    }
+}
+
+/// Asks one Service whether it is Prometheus. Also returns the Service
+/// when it did not answer, as the one to ask again later.
+async fn ask_prometheus(client: Client, endpoint: PromEndpoint) -> (PromStatus, Option<PromEndpoint>) {
+    let prom = Prom::new(client, endpoint);
+    match prom.ping().await {
+        Ok(()) => (PromStatus::Ready(prom), None),
+        // Say which Service it was: the user may know it by name.
+        Err(PromError::Unreachable(msg)) => {
+            let error = PromError::Unreachable(format!("{} ({msg})", prom.endpoint().display()));
+            (PromStatus::Unavailable(error), Some(prom.endpoint().clone()))
+        }
+        Err(e) => (PromStatus::Unavailable(e), None),
     }
 }
 
 /// Finds Prometheus for a session: the configured endpoint when there is
 /// one (it only has to answer), otherwise by looking through the cluster.
-async fn find_prometheus(client: Client, endpoint: Option<PromEndpoint>, namespaces: &[String]) -> PromStatus {
-    let found = match endpoint {
+/// Also returns the Service to ask again when none answered.
+async fn find_prometheus(
+    client: Client,
+    endpoint: Option<PromEndpoint>,
+    namespaces: &[String],
+) -> (PromStatus, Option<PromEndpoint>) {
+    match endpoint {
         Some(endpoint) => match endpoint.validate() {
-            Err(problem) => Err(PromError::Other(format!("The Prometheus set in Skiff's config can't be used: {problem}"))),
-            Ok(()) => {
-                let prom = Prom::new(client, endpoint);
-                match prom.ping().await {
-                    Ok(()) => Ok(prom),
-                    // Say which Service it was: the name is the user's own.
-                    Err(PromError::Unreachable(msg)) => {
-                        Err(PromError::Unreachable(format!("{} ({msg})", prom.endpoint().display())))
-                    }
-                    Err(e) => Err(e),
-                }
+            Err(problem) => {
+                let error = PromError::Other(format!("The Prometheus set in Skiff's config can't be used: {problem}"));
+                (PromStatus::Unavailable(error), None)
             }
+            Ok(()) => ask_prometheus(client, endpoint).await,
         },
         None => {
             let extra: Vec<&str> = namespaces.iter().map(String::as_str).collect();
-            prom::detect(&client, &extra).await
+            match prom::search(&client, &extra).await {
+                Ok(prom) => (PromStatus::Ready(prom), None),
+                Err(e) => (PromStatus::Unavailable(e.error), e.silent),
+            }
         }
-    };
-    match found {
-        Ok(prom) => PromStatus::Ready(prom),
-        Err(e) => PromStatus::Unavailable(e),
     }
 }
 
@@ -377,14 +478,28 @@ pub struct Session {
     sources: Arc<ArcSwap<KubeconfigSources>>,
     /// Why the newest connection attempt failed, in structured form.
     failure: ArcSwap<Option<ErrorInfo>>,
-    /// What a connection attempt is waiting for, tagged with its number
-    /// so a superseded attempt's text is never shown.
+    /// What a connection attempt is waiting for, tagged with its number:
+    /// a superseded attempt's text is never shown, and never replaces a
+    /// newer attempt's.
     waiting: Mutex<(u64, Option<String>)>,
     /// Refuse everything that changes the cluster, opens a shell or
     /// forwards a port.
-    read_only: AtomicBool,
+    read_only: Arc<AtomicBool>,
     /// Prometheus, firing alerts and usage history.
     obs: Arc<Observability>,
+}
+
+/// Records what connection attempt number `attempt` is waiting for.
+/// Attempt numbers only grow, and an attempt that was superseded keeps
+/// running until its plugin ends: it must not wipe what the newer attempt
+/// said. Returns whether anything was recorded.
+fn set_waiting(slot: &Mutex<(u64, Option<String>)>, attempt: u64, text: Option<String>) -> bool {
+    let mut waiting = slot.lock();
+    if attempt < waiting.0 {
+        return false;
+    }
+    *waiting = (attempt, text);
+    true
 }
 
 fn kubeconfig_error(summary: String, hint: &str) -> ErrorInfo {
@@ -427,16 +542,28 @@ async fn build_client(
         }
         // A missing plugin is the most common first-run failure: name the
         // command rather than report "No such file or directory".
-        let plugin = match kubeconfig::exec_of(&merged.config, &ctx).and_then(|e| Some((e.command.clone()?, e))) {
-            Some((command, exec)) => {
-                if kubeconfig::find_executable(&command).is_none() {
-                    return Err(util::exec_missing(Some(&command), exec.install_hint.as_deref()));
+        let mut config = merged.config;
+        let plugin = match kubeconfig::exec_of_mut(&mut config, &ctx) {
+            Some(exec) => {
+                // Skiff has no terminal for a plugin to talk to. Without
+                // this the plugin inherits Skiff's stdin and stderr: it
+                // can sit waiting for input nobody will type, and what it
+                // says when it fails goes nowhere instead of into the
+                // error shown. (kubectl does the same without a terminal.)
+                exec.interactive_mode = Some(ExecInteractiveMode::Never);
+                match exec.command.clone() {
+                    Some(command) => {
+                        if kubeconfig::plugin_is_missing(exec) {
+                            return Err(util::exec_missing(Some(&command), exec.install_hint.as_deref()));
+                        }
+                        Some(kubeconfig::command_name(&command))
+                    }
+                    None => None,
                 }
-                Some(kubeconfig::command_name(&command))
             }
             None => None,
         };
-        Ok((merged.config, plugin))
+        Ok((config, plugin))
     })
     .await;
     let (kc, plugin) = match prepared {
@@ -468,7 +595,8 @@ async fn build_client(
         Ok(Ok(Err(e))) => Err(classify_kube(&e, plugin.as_deref())),
         Ok(Err(_)) => Err(ErrorInfo::other("Skiff hit an internal error setting up the connection")),
         // The plugin process cannot be cancelled from here; it is left to
-        // finish on its own and its result is dropped.
+        // finish on its own and its result is dropped. (`Core` does not
+        // wait for it when the app quits.)
         Err(_) => Err(util::exec_timeout(plugin.as_deref(), CLIENT_BUILD_TIMEOUT.as_secs())),
     }
 }
@@ -660,7 +788,7 @@ impl Session {
             sources,
             failure: ArcSwap::from_pointee(None),
             waiting: Mutex::new((0, None)),
-            read_only: AtomicBool::new(false),
+            read_only: Arc::new(AtomicBool::new(false)),
             obs: Arc::new(Observability::new()),
         });
         session.start_connect();
@@ -703,8 +831,9 @@ impl Session {
                 let weak = weak.clone();
                 move |text: Option<String>| {
                     if let Some(s) = weak.upgrade() {
-                        *s.waiting.lock() = (attempt, text);
-                        s.notify.ping();
+                        if set_waiting(&s.waiting, attempt, text) {
+                            s.notify.ping();
+                        }
                     }
                 }
             };
@@ -868,6 +997,10 @@ impl Session {
                                 if no_api {
                                     // No metrics-server here: check back rarely.
                                     missing_until = now_unix() + 120;
+                                } else if matches!(&other, Ok(Err(e)) if util::is_credential_failure(e)) {
+                                    // Every try runs the credential plugin
+                                    // again; it fails until the user signs in.
+                                    missing_until = now_unix() + CREDENTIAL_RETRY_SECS;
                                 }
                                 // Never present old numbers as current.
                                 if (no_api || failures >= 2) && s.metrics.load().available {
@@ -936,8 +1069,11 @@ impl Session {
     /// Makes this cluster read-only (or writable again) from now on:
     /// while set, everything that changes the cluster, opens a shell or
     /// forwards a port is refused before any request is made. Reading,
-    /// logs and tables are unaffected. Shells and forwards that are
-    /// already open keep running.
+    /// logs and tables are unaffected. This also stops operations that
+    /// were asked for earlier and are still waiting for the connection.
+    /// What is already under way is finished: shells and forwards that
+    /// are open keep running, and a manifest that is being applied is
+    /// applied to the end.
     pub fn set_read_only(&self, read_only: bool) {
         self.read_only.store(read_only, Ordering::SeqCst);
         self.notify.ping();
@@ -953,7 +1089,10 @@ impl Session {
     }
 
     /// A job for something that changes the cluster: refused outright on a
-    /// read-only session, otherwise like [`Self::job_within`].
+    /// read-only session, otherwise like [`Self::job_within`]. The flag is
+    /// looked at again once there is a client: waiting for a connection
+    /// (a sign-in) can take a minute, and the user may have protected the
+    /// cluster meanwhile.
     fn mutating_job<T, F>(&self, limit: Option<Duration>, f: impl FnOnce(Client) -> F + Send + 'static) -> Job<T>
     where
         T: Send + 'static,
@@ -961,7 +1100,15 @@ impl Session {
     {
         match self.refused() {
             Some(msg) => Job::done(Err(msg)),
-            None => self.job_within(limit, f),
+            None => {
+                let (read_only, context) = (self.read_only.clone(), self.context.clone());
+                self.job_within(limit, move |c| async move {
+                    if read_only.load(Ordering::SeqCst) {
+                        return Err(util::read_only_error(&context).summary);
+                    }
+                    f(c).await
+                })
+            }
         }
     }
 
@@ -1005,28 +1152,45 @@ impl Session {
     /// cluster is not searched for nothing.
     pub fn prometheus(&self, namespaces: &[&str]) -> Arc<PromStatus> {
         let obs = &self.obs;
-        // A Prometheus that did not answer may be back by now.
-        if let PromStatus::Unavailable(PromError::Unreachable(_)) = &**obs.status.load() {
-            if now_unix() - obs.decided_at.load(Ordering::SeqCst) > PROM_RETRY_SECS {
-                obs.reset();
-            }
-        }
+        let namespaces = || namespaces.iter().map(|ns| ns.to_string()).collect::<Vec<String>>();
         if !obs.started.swap(true, Ordering::SeqCst) {
             let generation = obs.generation.load(Ordering::SeqCst);
-            let (obs, notify, client) = (obs.clone(), self.notify.clone(), self.client());
             let endpoint = obs.endpoint.lock().clone();
-            let namespaces: Vec<String> = namespaces.iter().map(|ns| ns.to_string()).collect();
-            self.spawn_tracked(async move {
-                let status = match client.await {
-                    Ok(client) => find_prometheus(client, endpoint, &namespaces).await,
-                    Err(e) => PromStatus::Unavailable(PromError::Unreachable(e)),
-                };
-                if obs.publish(generation, status) {
-                    notify.ping();
+            self.look_for_prometheus(generation, namespaces(), move |client, namespaces| async move {
+                find_prometheus(client, endpoint, &namespaces).await
+            });
+        } else if let Some((generation, silent)) = obs.claim_retry(now_unix()) {
+            // A Prometheus that did not answer may be back by now.
+            let configured = obs.endpoint.lock().clone();
+            self.look_for_prometheus(generation, namespaces(), move |client, namespaces| async move {
+                match silent {
+                    Some(endpoint) => ask_prometheus(client, endpoint).await,
+                    None => find_prometheus(client, configured, &namespaces).await,
                 }
             });
         }
         obs.status.load_full()
+    }
+
+    /// Runs `look` on the session's client in the background and publishes
+    /// its outcome as the answer of detection number `generation`.
+    fn look_for_prometheus<F, Fut>(&self, generation: u64, namespaces: Vec<String>, look: F)
+    where
+        F: FnOnce(Client, Vec<String>) -> Fut + Send + 'static,
+        Fut: Future<Output = (PromStatus, Option<PromEndpoint>)> + Send,
+    {
+        let (obs, notify, client) = (self.obs.clone(), self.notify.clone(), self.client());
+        self.spawn_tracked(async move {
+            let (status, silent) = match client.await {
+                Ok(client) => look(client, namespaces).await,
+                // Without a connection there is nothing to ask again: a
+                // reconnect starts over.
+                Err(e) => (PromStatus::Unavailable(PromError::Unreachable(e)), None),
+            };
+            if obs.publish(generation, status, silent) {
+                notify.ping();
+            }
+        });
     }
 
     /// What is known about Prometheus right now, without starting to look.
@@ -1060,8 +1224,20 @@ impl Session {
         let (j, notify, prom) = (job.clone(), self.notify.clone(), prom.clone());
         // Each query has its own time limit.
         self.handle.spawn(async move {
-            j.finish(Ok(prom.charts(&target, &range).await));
-            notify.ping();
+            // A view that moved on (other pods, another time range) drops
+            // its job; the queries still in flight are then for nobody.
+            let dropped = async {
+                while !j.is_abandoned() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            };
+            tokio::select! {
+                charts = prom.charts(&target, &range) => {
+                    j.finish(Ok(charts));
+                    notify.ping();
+                }
+                _ = dropped => {}
+            }
         });
         job
     }
@@ -1124,8 +1300,8 @@ impl Session {
         }
         let tracked: Vec<&Tracked> = keys.iter().filter_map(|k| history.pods.get(k.as_str())).collect();
         UsageHistory {
-            cpu: sum_rings(tracked.iter().map(|t| &t.cpu)),
-            memory: sum_rings(tracked.iter().map(|t| &t.memory)),
+            cpu: sum_rings(tracked.iter().map(|t| (&t.cpu, t.older_than_ring))),
+            memory: sum_rings(tracked.iter().map(|t| (&t.memory, t.older_than_ring))),
         }
     }
 
@@ -1345,14 +1521,21 @@ impl Session {
     /// instead of a terminal (its input and output pass through unchanged).
     pub fn exec_with(&self, ns: &str, pod: &str, container: &str, command: Vec<String>, tty: bool) -> Arc<ExecSession> {
         // A shell can change anything: on a read-only cluster the session
-        // is handed back already failed, and no request is made.
+        // is handed back already failed, and no request is made. The
+        // flag is read again after waiting for the connection, in case
+        // the cluster was made read-only meanwhile.
         let refused = self.refused();
+        let (read_only, context) = (self.read_only.clone(), self.context.clone());
         let client = self.client();
         let client = async move {
-            match refused {
-                Some(msg) => Err(msg),
-                None => client.await,
+            if let Some(msg) = refused {
+                return Err(msg);
             }
+            let client = client.await?;
+            if read_only.load(Ordering::SeqCst) {
+                return Err(util::read_only_error(&context).summary);
+            }
+            Ok(client)
         };
         let session = exec::open(&self.handle, client, ns, pod, container, command, tty, self.notify.clone());
         let mut open = self.execs.lock();
@@ -1434,7 +1617,9 @@ impl Drop for Session {
 
 /// Owns the I/O runtime. Create one per process.
 pub struct Core {
-    rt: tokio::runtime::Runtime,
+    /// `None` only while being dropped.
+    rt: Option<tokio::runtime::Runtime>,
+    handle: Handle,
     notify: Notifier,
     /// Shared with every session, so replacing it reaches their next
     /// reconnect.
@@ -1450,7 +1635,8 @@ impl Core {
             .thread_name("skiff-io")
             .enable_all()
             .build()?;
-        Ok(Core { rt, notify, sources: Arc::new(ArcSwap::from_pointee(KubeconfigSources::from_env())) })
+        let handle = rt.handle().clone();
+        Ok(Core { rt: Some(rt), handle, notify, sources: Arc::new(ArcSwap::from_pointee(KubeconfigSources::from_env())) })
     }
 
     /// Replaces where kubeconfigs are read from. Takes effect for
@@ -1472,11 +1658,24 @@ impl Core {
     }
 
     pub fn connect(&self, context: &str) -> Arc<Session> {
-        Session::connect(self.rt.handle().clone(), self.notify.clone(), context, self.sources.clone())
+        Session::connect(self.handle.clone(), self.notify.clone(), context, self.sources.clone())
     }
 
     pub fn handle(&self) -> Handle {
-        self.rt.handle().clone()
+        self.handle.clone()
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        // Dropping a runtime waits for every blocking task that has
+        // started, and a credential plugin that is waiting for a sign-in
+        // (or one that outlived its time limit) is such a task: quitting
+        // would hang for as long as the plugin runs. Nothing here has to
+        // finish, so do not wait.
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
@@ -1614,8 +1813,136 @@ mod tests {
         for (at, v) in [(25.0, 0.5), (40.0, 0.25)] {
             b.push(at, v);
         }
-        assert_eq!(sum_rings([&a, &b].into_iter()), [(10.0, 1.0), (25.0, 2.5), (40.0, 0.25)]);
+        // Neither is known to be older than its ring: `b` is a pod that
+        // started at 25, `a` one that ended there.
+        assert_eq!(
+            sum_rings([(&a, false), (&b, false)].into_iter()),
+            [(10.0, 1.0), (25.0, 2.5), (40.0, 0.25)]
+        );
         assert!(sum_rings(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn a_workload_total_is_not_made_of_the_pods_that_happen_to_have_a_sample() {
+        let ring = |samples: &[(f64, f64)]| {
+            let mut r = SampleRing::new(16);
+            for (at, v) in samples {
+                r.push(*at, *v);
+            }
+            r
+        };
+        // web-1 was looked at on its own from 100 on; the Deployment's
+        // other pod only from 163 (between two polls). Both ran all along.
+        let web1 = ring(&[(100.0, 1.0), (115.0, 1.0), (130.0, 1.0), (145.0, 1.0), (160.0, 1.0), (175.0, 1.0)]);
+        let web2 = ring(&[(163.0, 2.0), (175.0, 2.0)]);
+        // No stretch where web-1 alone passes for the whole Deployment,
+        // and web-1 counts at 163 although it has no sample there.
+        assert_eq!(sum_rings([(&web1, true), (&web2, true)].into_iter()), [(163.0, 3.0), (175.0, 3.0)]);
+
+        // A pod created during a rollout has no usage when first seen: the
+        // history before it stays, and it adds to the total from then on.
+        let new = ring(&[(175.0, 0.5)]);
+        assert_eq!(
+            sum_rings([(&web1, true), (&new, false)].into_iter()),
+            [(100.0, 1.0), (115.0, 1.0), (130.0, 1.0), (145.0, 1.0), (160.0, 1.0), (175.0, 1.5)]
+        );
+
+        // metrics-server left one pod out of the poll at 130: no dip.
+        let steady = ring(&[(100.0, 1.0), (115.0, 1.0), (130.0, 1.0), (145.0, 1.0)]);
+        let gap = ring(&[(100.0, 2.0), (115.0, 2.5), (145.0, 2.0)]);
+        assert_eq!(
+            sum_rings([(&steady, true), (&gap, true)].into_iter()),
+            [(100.0, 3.0), (115.0, 3.5), (130.0, 3.5), (145.0, 3.0)]
+        );
+        // A pod that is gone stops counting after its last sample.
+        let gone = ring(&[(100.0, 2.0), (115.0, 2.0)]);
+        assert_eq!(
+            sum_rings([(&steady, true), (&gone, true)].into_iter()),
+            [(100.0, 3.0), (115.0, 3.0), (130.0, 1.0), (145.0, 1.0)]
+        );
+
+        // `touch` is what knows: usage at first sight means "older".
+        let mut map = HashMap::new();
+        assert!(History::touch(&mut map, "ns/old", 10, Some(usage(1.0, 1.0))).expect("tracked").older_than_ring);
+        assert!(!History::touch(&mut map, "ns/new", 10, None).expect("tracked").older_than_ring);
+    }
+
+    #[test]
+    fn a_superseded_attempt_does_not_erase_what_the_newer_one_waits_for() {
+        let slot = Mutex::new((0, None));
+        assert!(set_waiting(&slot, 1, Some("Waiting for aws…".into())));
+        // A reconnect: attempt 3 says what it waits for, then attempt 1
+        // (never cancelled) reaches its time limit and reports "done".
+        assert!(set_waiting(&slot, 3, Some("Waiting for aws…".into())));
+        assert!(!set_waiting(&slot, 1, None));
+        assert_eq!(*slot.lock(), (3, Some("Waiting for aws…".into())));
+        assert!(set_waiting(&slot, 3, None));
+        assert_eq!(*slot.lock(), (3, None));
+    }
+
+    #[test]
+    fn an_unreachable_prometheus_is_asked_again_quietly_and_less_and_less_often() {
+        let obs = Observability::new();
+        let endpoint = PromEndpoint::new("monitoring", "prometheus-operated", 9090);
+        let unreachable = || PromStatus::Unavailable(PromError::Unreachable("monitoring/prometheus-operated:9090".into()));
+        let is_unreachable =
+            |obs: &Observability| matches!(&**obs.status.load(), PromStatus::Unavailable(PromError::Unreachable(_)));
+
+        // Nothing to retry while looking, or when the answer is final.
+        assert!(obs.claim_retry(now_unix() + 10_000).is_none());
+        assert!(obs.publish(0, PromStatus::Unavailable(PromError::NotFound), None));
+        assert!(obs.claim_retry(now_unix() + 10_000).is_none());
+
+        assert!(obs.publish(0, unreachable(), Some(endpoint.clone())));
+        let decided = obs.decided_at.load(Ordering::SeqCst);
+        assert!(obs.claim_retry(decided + PROM_RETRY_SECS).is_none(), "not due yet");
+        // Due: only the Service that did not answer is asked, and what
+        // the views show does not change meanwhile.
+        let at = decided + PROM_RETRY_SECS + 1;
+        let (generation, ask) = obs.claim_retry(at).expect("due");
+        assert_eq!((generation, ask.as_ref()), (1, Some(&endpoint)));
+        assert!(is_unreachable(&obs));
+        // Asked on every frame: one retry, not one per frame.
+        assert!(obs.claim_retry(at).is_none());
+        assert!(obs.claim_retry(at + PROM_RETRY_SECS + 1).is_none(), "the wait doubled");
+        // An answer from before the retry is out of date.
+        assert!(!obs.publish(0, PromStatus::Unavailable(PromError::NotFound), None));
+        assert!(obs.publish(generation, unreachable(), Some(endpoint.clone())));
+
+        // Still down: the waits grow up to the limit.
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let decided = obs.decided_at.load(Ordering::SeqCst);
+            let wait = obs.retry.lock().after;
+            waits.push(wait);
+            assert!(obs.claim_retry(decided + wait).is_none());
+            let (generation, _) = obs.claim_retry(decided + wait + 1).expect("due");
+            assert!(obs.publish(generation, unreachable(), Some(endpoint.clone())));
+        }
+        assert_eq!(waits, [240, 480, 960, 1800, 1800, 1800]);
+
+        // Starting over (reconnect, "Look for Prometheus again") is loud
+        // and forgets all of that.
+        obs.reset();
+        assert!(matches!(&**obs.status.load(), PromStatus::Detecting));
+        let retry = obs.retry.lock();
+        assert_eq!((retry.after, retry.endpoint.as_ref()), (PROM_RETRY_SECS, None));
+    }
+
+    #[test]
+    fn quitting_does_not_wait_for_a_credential_plugin() {
+        let core = Core::new(Notifier::noop()).expect("runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        // Stands in for a plugin that waits for a sign-in: a blocking
+        // task that outlives everything.
+        core.handle().spawn_blocking(move || {
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).expect("blocking task to start");
+        let start = std::time::Instant::now();
+        drop(core);
+        assert!(start.elapsed() < Duration::from_secs(5), "dropping the core waited for the blocking task");
     }
 
     #[test]
@@ -1707,23 +2034,32 @@ mod tests {
         assert!(hint.contains("PATH") && hint.ends_with("Install it from example.com/plugin"), "{hint}");
     }
 
+    #[cfg(unix)]
+    fn write_plugin(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("skiff-test-plugin-{tag}-{}", std::process::id()));
+        std::fs::write(&script, format!("#!/bin/sh\n{body}")).expect("write plugin");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+
     /// A slow plugin must not occupy an I/O worker, its name is shown while
-    /// it runs, and its failure shows stderr but never stdout.
+    /// it runs, and its failure shows stderr but never stdout. The
+    /// kubeconfig asks for an interactive plugin, as the ones written by
+    /// `aws eks update-kubeconfig` and gcloud do: Skiff has no terminal,
+    /// so the plugin must get neither its stdin (the `read` would wait
+    /// for the test's) nor its stderr (the message would go nowhere).
     #[cfg(unix)]
     #[test]
     fn exec_plugin_runs_off_the_io_workers() {
-        use std::os::unix::fs::PermissionsExt;
-        let script = std::env::temp_dir().join(format!("skiff-test-plugin-{}", std::process::id()));
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nsleep 1\necho 'TOKEN-ON-STDOUT'\necho 'session expired, run: aws sso login' >&2\nexit 3\n",
-        )
-        .expect("write plugin");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let script = write_plugin(
+            "slow",
+            "sleep 1\nread answer\necho 'TOKEN-ON-STDOUT'\necho 'session expired, run: aws sso login' >&2\nexit 3\n",
+        );
         let path = write_kubeconfig(
             "slowplugin",
             &format!(
-                "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      interactiveMode: Never\n",
+                "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      interactiveMode: IfAvailable\n",
                 script.display()
             ),
         );
@@ -1752,6 +2088,82 @@ mod tests {
             assert_eq!(info.hint.as_deref(), Some("Run `aws sso login` in a terminal, then reconnect."));
             assert_eq!(s.connecting_detail(), None);
         }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The kubeconfig can give the plugin its own PATH; the plugin is then
+    /// found there by the OS, wherever Skiff's PATH points.
+    #[cfg(unix)]
+    #[test]
+    fn a_plugin_on_its_own_path_is_run() {
+        let script = write_plugin("ownpath", "echo 'ran from my own PATH' >&2\nexit 1\n");
+        let (dir, name) = (script.parent().expect("dir"), script.file_name().expect("name").to_string_lossy());
+        assert!(crate::find_executable(&name).is_none(), "the test needs a name that is not on PATH");
+        let path = write_kubeconfig(
+            "ownpath",
+            &format!(
+                "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {name}\n      env:\n      - name: PATH\n        value: {}\n",
+                dir.display()
+            ),
+        );
+        let core = Core::new(Notifier::noop()).expect("runtime");
+        core.set_kubeconfig_sources(KubeconfigSources::explicit([path.to_string_lossy().into_owned()]));
+        let s = core.connect("ctx");
+        wait_until("connection to fail", || matches!(&*s.status(), ConnStatus::Failed(_)));
+        let info = s.failure().expect("failure details");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&script);
+        // Not "plugin not found": it ran, and said so.
+        assert_eq!(info.kind, ErrorKind::ExecFailed, "{info}");
+        assert!(info.summary.contains("ran from my own PATH"), "{}", info.summary);
+    }
+
+    /// Waiting for a sign-in can take a minute. What was asked for before
+    /// the cluster was made read-only must not run once the wait is over.
+    #[cfg(unix)]
+    #[test]
+    fn read_only_also_stops_what_was_waiting_for_the_connection() {
+        let script = write_plugin(
+            "signin",
+            "sleep 2\necho '{\"apiVersion\":\"client.authentication.k8s.io/v1\",\"kind\":\"ExecCredential\",\"status\":{\"token\":\"t\"}}'\n",
+        );
+        let path = write_kubeconfig(
+            "signin",
+            &format!("    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n", script.display()),
+        );
+        let core = Core::new(Notifier::noop()).expect("runtime");
+        core.set_kubeconfig_sources(KubeconfigSources::explicit([path.to_string_lossy().into_owned()]));
+        let s = core.connect("ctx");
+        wait_until("the plugin to run", || s.connecting_detail().is_some());
+
+        // Queued while the plugin runs, on a cluster that is still writable.
+        let deploy = ResourceKey::new("apps", "v1", "deployments", "Deployment", true);
+        let delete = s.delete_object(&deploy, "ns", "web", false);
+        let apply = s.apply_manifest("kind: ConfigMap".into());
+        let forward = s.forward_pod("ns", "web-0", 80, None);
+        let shell = s.exec("ns", "web-0", "app", vec!["sh".into()]);
+        let read = s.get_object(&deploy, "ns", "web");
+        assert!(!delete.is_done() && matches!(shell.state(), ExecState::Connecting));
+        s.set_read_only(true);
+
+        // The client arrives (nothing listens at the address, so anything
+        // that did go out would fail with a connection error instead).
+        wait_until("delete to finish", || delete.is_done());
+        assert_eq!(delete.take().expect("done").expect_err("refused"), "ctx is read-only in Skiff");
+        wait_until("apply to finish", || apply.is_done());
+        assert_eq!(apply.take().expect("done").expect_err("refused"), "ctx is read-only in Skiff");
+        wait_until("forward to finish", || forward.is_done());
+        assert_eq!(forward.take().expect("done").err().expect("refused"), "ctx is read-only in Skiff");
+        wait_until("the shell to be refused", || !matches!(shell.state(), ExecState::Connecting));
+        match shell.state() {
+            ExecState::Failed(e) => assert!(e.contains("ctx is read-only in Skiff"), "{e}"),
+            other => panic!("shell on a read-only session: {other:?}"),
+        }
+        // Reading is not affected: it got as far as the network.
+        wait_until("get to finish", || read.is_done());
+        let err = read.take().expect("done").expect_err("no cluster");
+        assert!(!err.contains("read-only"), "{err}");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&script);
     }

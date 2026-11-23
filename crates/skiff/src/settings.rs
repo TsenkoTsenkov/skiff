@@ -926,7 +926,11 @@ fn files(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>) {
 
     ui.add_space(16.0);
     widgets::caption(ui, "What config.json understands", pal);
-    note(ui, pal, "Every key is optional. A mistake only loses the key it is in, and Skiff says which.");
+    note(
+        ui,
+        pal,
+        "Every key is optional. A mistake in one key loses only that key, and Skiff says which. A file that is not valid JSON is not used at all.",
+    );
     ui.add_space(4.0);
     card(ui, pal, |ui| {
         for (i, key) in config::KEYS.iter().enumerate() {

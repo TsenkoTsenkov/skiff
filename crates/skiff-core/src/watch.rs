@@ -426,7 +426,18 @@ impl From<kube::Error> for Fail {
                 }
             }
             kube::Error::SerdeError(e) => Fail::Permanent { code: 0, msg: format!("unexpected response: {e}") },
-            other => Fail::Transient(crate::util::friendly(&other)),
+            other => {
+                let msg = crate::util::friendly(&other);
+                // The credential plugin has to be run again for every
+                // request once its token has expired. When it fails, a
+                // quick retry only starts it again (per table, forever):
+                // this waits for the user to sign in, so retry slowly.
+                if crate::util::is_credential_failure(&other) {
+                    Fail::Permanent { code: 0, msg }
+                } else {
+                    Fail::Transient(msg)
+                }
+            }
         }
     }
 }
@@ -1187,6 +1198,23 @@ async fn run_with(store: Arc<TableStore>, client: Client, notify: Notifier, quie
 mod tests {
     use super::*;
     use crate::kinds;
+
+    #[test]
+    fn a_failing_credential_plugin_is_not_retried_at_table_pace() {
+        use kube::client::AuthError;
+        // What a request fails with once the token has expired and the
+        // plugin cannot renew it.
+        let missing = kube::Error::Auth(AuthError::AuthExecStart(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        match Fail::from(missing) {
+            Fail::Permanent { code: 0, msg } => assert!(msg.contains("was not found"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        let no_credential = kube::Error::Auth(AuthError::ExecPluginFailed);
+        assert!(matches!(Fail::from(no_credential), Fail::Permanent { code: 0, .. }));
+        // Anything else that is not an API answer still retries quickly.
+        let other = kube::Error::Auth(AuthError::MissingCommand);
+        assert!(matches!(Fail::from(other), Fail::Transient(_)));
+    }
 
     const POD_TABLE: &str = r#"{
       "kind":"Table","apiVersion":"meta.k8s.io/v1",

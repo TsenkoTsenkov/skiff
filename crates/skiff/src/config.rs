@@ -7,9 +7,12 @@
 //! integrations. Window state (theme, pane sizes, last view) stays in
 //! eframe's own storage. There are no secrets in this file.
 //!
-//! Loading is lenient: a mistake costs the one key it is in, never the
+//! Loading is lenient: a mistake in one key costs that key, never the
 //! file. [`Config::load`] returns what could be understood plus a list of
-//! warnings that name the key and say what is wrong.
+//! warnings that name the key and say what is wrong. A file that cannot be
+//! used at all (not valid JSON, not an object, unreadable) is a different
+//! matter: its settings are unknown, protection included, so it is not
+//! read as "no settings" but reported by [`Config::unusable`].
 //!
 //! Saving keeps everything the user wrote that Skiff does not understand:
 //! changes are recorded as small edits and applied to the file as it is on
@@ -195,7 +198,8 @@ pub const KEYS: &[KeyDoc] = &[
         key: "clusters.<context>.read_only",
         kind: "true or false",
         default: "false",
-        doc: "Refuse every change in this cluster: no edit, delete, scale, restart, exec or port-forward.",
+        doc: "Refuse every change in this cluster: no edit, delete, scale or restart, and no new shell \
+              or port-forward. Shells and port-forwards that are already open keep running until closed.",
     },
     KeyDoc {
         key: "clusters.<context>.confirm",
@@ -275,7 +279,8 @@ pub fn documentation() -> String {
     let mut out = String::from(
         "Skiff reads config.json from $XDG_CONFIG_HOME/skiff or ~/.config/skiff \
          (Linux, macOS) or %APPDATA%\\skiff (Windows). $SKIFF_CONFIG names another file.\n\
-         Every key is optional. A mistake only loses the key it is in, and Skiff says which.\n\n",
+         Every key is optional. A mistake in one key loses only that key, and Skiff says which. \
+         A file that is not valid JSON is not used at all.\n\n",
     );
     for k in KEYS {
         out.push_str(&format!("{}\n    {}. Default: {}.\n    {}\n\n", k.key, k.kind, k.default, k.doc));
@@ -428,6 +433,8 @@ pub struct Config {
     raw: Map<String, Value>,
     settings: Settings,
     pending: Vec<Edit>,
+    /// Why the file could not be used, when it could not.
+    unusable: Option<String>,
 }
 
 impl Config {
@@ -445,7 +452,10 @@ impl Config {
         let (mut config, warnings) = match std::fs::read_to_string(path) {
             Ok(text) => Config::from_json(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), Vec::new()),
-            Err(e) => (Config::default(), vec![format!("could not be read ({e}); using the defaults")]),
+            Err(e) => {
+                let why = format!("could not be read ({e})");
+                (Config { unusable: Some(why.clone()), ..Config::default() }, vec![format!("{why}; using the defaults")])
+            }
         };
         config.path = Some(path.to_path_buf());
         (config, warnings)
@@ -458,10 +468,27 @@ impl Config {
             Ok(raw) => {
                 let mut warnings = Vec::new();
                 let settings = interpret(&raw, &mut warnings);
-                (Config { path: None, raw, settings, pending: Vec::new() }, warnings)
+                (Config { path: None, raw, settings, pending: Vec::new(), unusable: None }, warnings)
             }
-            Err(e) => (Config::default(), vec![format!("{e}; using the defaults")]),
+            Err(e) => (Config { unusable: Some(e.clone()), ..Config::default() }, vec![format!("{e}; using the defaults")]),
         }
+    }
+
+    /// Why the file could not be used, if it could not: it is not valid
+    /// JSON, not an object, or could not be read (a missing or empty file
+    /// is fine). The words follow the file's name: "is not valid JSON
+    /// (...)". This config then holds the defaults, which says nothing
+    /// about what the user wrote: whoever loaded it must not take
+    /// "read_only is off" from it. A successful [`Config::save`] ends it.
+    pub fn unusable(&self) -> Option<&str> {
+        self.unusable.as_deref()
+    }
+
+    /// What is wrong with single keys of the config as it is now.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        interpret(&self.raw, &mut warnings);
+        warnings
     }
 
     /// The file this config belongs to.
@@ -635,6 +662,8 @@ impl Config {
         self.settings = interpret(&doc, &mut Vec::new());
         self.raw = doc;
         self.pending.clear();
+        // The file was read (or is not there): its settings are known.
+        self.unusable = None;
         Ok(changed)
     }
 }
@@ -1252,6 +1281,38 @@ mod tests {
         let w = warnings_of("[1, 2]");
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("JSON object") && w[0].contains("a list"), "{w:?}");
+    }
+
+    #[test]
+    fn an_unusable_file_is_told_apart_from_one_with_mistakes() {
+        // Not JSON, or not an object: nothing is known about the settings.
+        for text in ["{ \"clusters\": { \"prod\": { \"read_only\": true } }, }", "[1, 2]", "{"] {
+            let (config, _) = Config::from_json(text);
+            assert!(config.unusable().is_some(), "{text}");
+        }
+        assert!(Config::from_json("{ \"zoom\": 1.5, ").0.unusable().unwrap().contains("not valid JSON"));
+        // A mistake in a key, an empty file and a missing file are usable.
+        for text in ["{ \"zoom\": \"big\", \"nope\": 1 }", "", "{}"] {
+            assert_eq!(Config::from_json(text).0.unusable(), None, "{text}");
+        }
+        let dir = temp_dir("unusable");
+        let path = dir.join("config.json");
+        assert_eq!(Config::load_from(&path).0.unusable(), None);
+        // A file that cannot be read (here: a directory) is unusable too.
+        assert!(Config::load_from(&dir).0.unusable().unwrap().contains("could not be read"));
+
+        // Saving ends it once the file is fixed, and the warnings about
+        // single keys can be asked for afterwards.
+        std::fs::write(&path, "{ oops").unwrap();
+        let (mut config, _) = Config::load_from(&path);
+        config.set_zoom(2.0);
+        assert!(config.save().is_err() && config.unusable().is_some());
+        std::fs::write(&path, "{ \"terminal\": 5 }").unwrap();
+        assert_eq!(config.save(), Ok(true));
+        assert_eq!(config.unusable(), None);
+        let warnings = config.warnings();
+        assert!(warnings.len() == 1 && warnings[0].starts_with("terminal"), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
