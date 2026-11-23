@@ -1,0 +1,588 @@
+# Builds Skiff for macOS, Windows and Linux and publishes it.
+#
+#   A tag vX.Y.Z      publishes the stable release X.Y.Z, marked "latest". The
+#                     tag must equal the version in Cargo.toml.
+#   A push to main    publishes the prerelease build-<N> (the nightly channel).
+#                     Only the newest 10 are kept; it is never "latest".
+#   Run by hand, or a push to a release/... branch
+#                     builds everything and offers it as artifacts of the run;
+#                     nothing is published.
+#
+# <N> is the build number: the number of commits on the built revision
+# (git rev-list --count HEAD). It only ever grows, is compiled into the
+# program (SKIFF_BUILD) and is what the in-app updater compares.
+#
+# Jobs: meta works out version, build number and channel; the build jobs make
+# the files (their token can only read); publish, the only job that may write
+# to the repository, gathers the files, writes SHA256SUMS, attests where they
+# were built and creates the release.
+#
+# Signing is optional: without the secrets every build still works and the
+# release notes say that it is unsigned. packaging/README.md lists every
+# secret and how to get it. Keep them as secrets of the "release"
+# environment, restricted to main and v* tags, so that no other branch can
+# sign anything.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["main", "release/**"]
+    # (Path filters do not apply to tags: a tag always builds.)
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "hack/macos-app.sh"
+      - "hack/linux-package.sh"
+      - "hack/windows-package.ps1"
+      - "packaging/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch replaces a build still in progress; a
+# tagged release is never interrupted.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+# bash with "-eo pipefail": a failing command in a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  meta:
+    name: Version, build number, channel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      build: ${{ steps.meta.outputs.build }}
+      channel: ${{ steps.meta.outputs.channel }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history: the build number is the number of commits.
+          fetch-depth: 0
+          persist-credentials: false
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          build=$(git rev-list --count HEAD)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version in Cargo.toml must be X.Y.Z, not '$version'."
+            exit 1
+          fi
+          # Only a push publishes; a run started by hand never does.
+          case "$EVENT:$GITHUB_REF" in
+            push:refs/tags/v*)
+              if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+                echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version). Tag v$version, or change the version first."
+                exit 1
+              fi
+              channel=stable
+              tag=$GITHUB_REF_NAME
+              ;;
+            push:refs/heads/main)
+              channel=nightly
+              tag="build-$build"
+              ;;
+            *)
+              channel=none
+              tag=""
+              ;;
+          esac
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "channel=$channel"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Skiff $version, build $build, channel: $channel ${tag:+(release $tag)}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  macos:
+    name: macOS (universal)
+    needs: meta
+    # Apple Silicon; the Intel half is cross-compiled and the two are joined.
+    runs-on: macos-15
+    timeout-minutes: 90
+    # Only a build that will be published may see the signing secrets.
+    environment: ${{ needs.meta.outputs.channel != 'none' && 'release' || '' }}
+    outputs:
+      signing: ${{ steps.verify.outputs.signing }}
+    env:
+      SKIFF_BUILD: ${{ needs.meta.outputs.build }}
+      SKIFF_UPDATE_REPO: ${{ github.repository }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # ("secrets" cannot be used in a step's "if", so the question whether
+      # they exist is answered here; the values themselves are only given
+      # to the steps that use them.)
+      HAVE_CERT: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+      HAVE_NOTARY_KEY: ${{ secrets.APPLE_API_KEY_P8_BASE64 != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: This is an Apple Silicon machine
+        run: sw_vers && test "$(uname -m)" = arm64
+      - name: Rust toolchain (rust-toolchain.toml) with both Mac targets
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Import the Developer ID certificate
+        if: env.HAVE_CERT == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          # A keychain of its own, with a password nobody needs to know,
+          # that exists only for this job.
+          keychain="$RUNNER_TEMP/skiff-signing.keychain-db"
+          password=$(uuidgen)
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 -D > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" >/dev/null
+          # codesign looks through the user's keychain list.
+          existing=()
+          while read -r k; do
+            if [ -n "$k" ]; then existing+=("$k"); fi
+          done < <(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$keychain" ${existing[@]+"${existing[@]}"}
+          identity="$MACOS_SIGN_IDENTITY"
+          if [ -z "$identity" ]; then
+            identity=$(security find-identity -v -p codesigning "$keychain" |
+              sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)
+          fi
+          if [ -z "$identity" ]; then
+            echo "::error::The certificate in MACOS_CERT_P12_BASE64 holds no 'Developer ID Application' identity."
+            security find-identity -v "$keychain"
+            exit 1
+          fi
+          {
+            echo "MACOS_KEYCHAIN=$keychain"
+            echo "MACOS_SIGN_IDENTITY=$identity"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare the App Store Connect API key for notarization
+        if: env.HAVE_CERT == 'true' && env.HAVE_NOTARY_KEY == 'true'
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 -D > "$key"
+          chmod 600 "$key"
+          {
+            echo "APPLE_API_KEY_PATH=$key"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER_ID=$APPLE_API_ISSUER_ID"
+          } >> "$GITHUB_ENV"
+
+      # Signs with the Developer ID and notarizes when the two steps above
+      # ran; makes an ad-hoc signed app otherwise.
+      - name: Build, sign and package
+        run: hack/macos-app.sh --universal --dmg --zip
+
+      - name: Remove the signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/cert.p12"
+          if [ -n "${MACOS_KEYCHAIN:-}" ]; then security delete-keychain "$MACOS_KEYCHAIN" || true; fi
+
+      - name: Check what was built
+        id: verify
+        run: |
+          app=target/release/Skiff.app
+          lipo -archs "$app/Contents/MacOS/Skiff"
+          test "$(lipo -archs "$app/Contents/MacOS/Skiff" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+          "$app/Contents/MacOS/Skiff" --version
+          # The Intel half, where this runner can run it (Rosetta).
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 "$app/Contents/MacOS/Skiff" --version
+          else
+            echo "::warning::No Rosetta on this runner: the Intel half was built but not started."
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = io.github.tsenkotsenkov.skiff
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" = "$SKIFF_BUILD"
+          ls -l target/release/Skiff-macos-universal.dmg \
+            "target/release/Skiff-macos-arm64-build-$SKIFF_BUILD.zip" \
+            "target/release/Skiff-macos-x86_64-build-$SKIFF_BUILD.zip"
+          # What the files really are, not what was intended.
+          signature=$(codesign -dv --verbose=4 "$app" 2>&1)
+          if xcrun stapler validate "$app" >/dev/null 2>&1 &&
+            xcrun stapler validate target/release/Skiff-macos-universal.dmg >/dev/null 2>&1; then
+            signing=notarized
+          elif grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<<"$signature"; then
+            signing=signed
+          else
+            signing=unsigned
+          fi
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
+          echo "macOS build: $signing" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: skiff-macos
+          path: |
+            target/release/Skiff-macos-universal.dmg
+            target/release/Skiff-macos-arm64-build-*.zip
+            target/release/Skiff-macos-x86_64-build-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      # After the upload, so that a failure here still leaves the image to
+      # look at. (It still stops the release: publish needs this job.)
+      - name: The app opens a window and draws a frame
+        run: |
+          SKIFF_TRACE_STARTUP=1 SKIFF_NO_UPDATE_CHECK=1 KUBECONFIG=/dev/null \
+            target/release/Skiff.app/Contents/MacOS/Skiff > smoke.log 2>&1 &
+          pid=$!
+          sleep 10
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "still running after 10 s"
+            kill "$pid" || true
+          else
+            echo "the app exited by itself:"
+          fi
+          cat smoke.log
+          grep -q "first frame built" smoke.log
+
+  windows:
+    name: Windows (x64)
+    needs: meta
+    runs-on: windows-2025
+    timeout-minutes: 60
+    environment: ${{ needs.meta.outputs.channel != 'none' && 'release' || '' }}
+    outputs:
+      signing: ${{ steps.verify.outputs.signing }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal \
+            --target x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: NSIS (for the installer)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe")) {
+            choco install nsis --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "could not install NSIS" }
+          }
+      # The script signs skiff.exe and the installer when the signing
+      # variables are set, and says UNSIGNED otherwise; an absent secret is
+      # an empty variable here.
+      - name: Build, sign and package
+        shell: pwsh
+        env:
+          SKIFF_BUILD: ${{ needs.meta.outputs.build }}
+          SKIFF_UPDATE_REPO: ${{ github.repository }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: hack\windows-package.ps1
+      - name: Check what was built
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem dist
+          $exe = 'target\x86_64-pc-windows-msvc\release\skiff.exe'
+          # (A windowed program: PowerShell does not wait for it by itself.)
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "skiff.exe --version exited with $($p.ExitCode)" }
+
+          # The installer installs and uninstalls without questions and
+          # without administrator rights.
+          $setup = (Resolve-Path 'dist\Skiff-windows-x64-setup.exe').Path
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Skiff'
+          $p = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installer exited with $($p.ExitCode)" }
+          foreach ($f in 'skiff.exe', 'uninstall.exe', 'LICENSE.txt') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "the installer did not install $f" }
+          }
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Skiff.lnk'
+          if (-not (Test-Path $shortcut)) { throw 'the installer made no Start menu shortcut' }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Skiff'
+          if ((Get-ItemProperty $key).DisplayName -ne 'Skiff') { throw 'no "Installed apps" entry' }
+          $p = Start-Process -FilePath (Join-Path $dir 'skiff.exe') -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the installed skiff.exe exited with $($p.ExitCode)" }
+          # (_?= makes the uninstaller run in place, so that it can be waited for.)
+          $p = Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S', "_?=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the uninstaller exited with $($p.ExitCode)" }
+          if (Test-Path (Join-Path $dir 'skiff.exe')) { throw 'the uninstaller left skiff.exe behind' }
+          if (Test-Path $shortcut) { throw 'the uninstaller left the shortcut behind' }
+          if (Test-Path $key) { throw 'the uninstaller left the "Installed apps" entry behind' }
+
+          # What the files really are, not what was intended.
+          $signing = 'signed'
+          Expand-Archive -Path 'dist\Skiff-windows-x64.zip' -DestinationPath "$env:RUNNER_TEMP\portable"
+          foreach ($f in $setup, "$env:RUNNER_TEMP\portable\skiff.exe") {
+            $s = Get-AuthenticodeSignature -FilePath $f
+            Write-Host "$f : $($s.Status)"
+            if ($s.Status -ne 'Valid') { $signing = 'unsigned' }
+          }
+          "signing=$signing" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "Windows build: $signing" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: skiff-windows
+          path: |
+            dist/Skiff-windows-x64-setup.exe
+            dist/Skiff-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest images there are: the binary then runs on every
+          # distribution with that glibc (2.35) or a newer one.
+          - arch: x86_64
+            os: ubuntu-22.04
+            deb: amd64
+          - arch: aarch64
+            os: ubuntu-22.04-arm
+            deb: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SKIFF_BUILD: ${{ needs.meta.outputs.build }}
+      SKIFF_UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev binutils dpkg-dev desktop-file-utils appstream \
+            xvfb libxkbcommon0 libxkbcommon-x11-0 libvulkan1 mesa-vulkan-drivers
+      # tar.gz, .deb and AppImage (appimagetool is downloaded by the script,
+      # pinned by version and SHA-256).
+      - name: Build and package
+        run: hack/linux-package.sh
+      - name: Check what was built
+        env:
+          ARCH: ${{ matrix.arch }}
+          DEB: ${{ matrix.deb }}
+        run: |
+          ls -l dist
+          test "$(uname -m)" = "$ARCH"
+          # The glibc the binary asks for must not be newer than this image's.
+          objdump -T target/release/skiff | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          dpkg-deb --info "dist/skiff_$DEB.deb"
+          dpkg-deb --contents "dist/skiff_$DEB.deb"
+          test "$(dpkg-deb --field "dist/skiff_$DEB.deb" Architecture)" = "$DEB"
+          # The package installs with its declared dependencies, and runs.
+          sudo apt-get install -y "./dist/skiff_$DEB.deb"
+          /usr/bin/skiff --version
+          tar -xzf "dist/skiff-linux-$ARCH.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/skiff-linux-$ARCH/bin/skiff" --version
+          "dist/Skiff-linux-$ARCH.AppImage" --appimage-extract-and-run --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: skiff-linux-${{ matrix.arch }}
+          path: |
+            dist/Skiff-linux-${{ matrix.arch }}.AppImage
+            dist/skiff-linux-${{ matrix.arch }}.tar.gz
+            dist/skiff_${{ matrix.deb }}.deb
+          if-no-files-found: error
+          retention-days: 14
+      # On a virtual display, drawn by Mesa's software Vulkan driver.
+      - name: The AppImage opens a window and draws a frame
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          status=0
+          SKIFF_TRACE_STARTUP=1 SKIFF_NO_UPDATE_CHECK=1 KUBECONFIG=/dev/null \
+            timeout 20 xvfb-run -a -s "-screen 0 1280x800x24" \
+            "dist/Skiff-linux-$ARCH.AppImage" --appimage-extract-and-run > smoke.log 2>&1 || status=$?
+          # (124: still running when the time was up, as it should be.)
+          echo "exit status $status"
+          cat smoke.log
+          grep -q "first frame built" smoke.log
+
+  publish:
+    name: Publish the release
+    needs: [meta, macos, windows, linux]
+    if: needs.meta.outputs.channel != 'none'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write # create the release and its tag
+      id-token: write # sign the build provenance attestation
+      attestations: write # store it
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.meta.outputs.version }}
+      BUILD: ${{ needs.meta.outputs.build }}
+      CHANNEL: ${{ needs.meta.outputs.channel }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      MACOS_SIGNING: ${{ needs.macos.outputs.signing }}
+      WINDOWS_SIGNING: ${{ needs.windows.outputs.signing }}
+      PRIVATE_REPO: ${{ github.event.repository.private }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: skiff-*
+          merge-multiple: true
+
+      - name: Every file is there; SHA256SUMS
+        working-directory: dist
+        run: |
+          expected="Skiff-macos-universal.dmg
+          Skiff-macos-arm64-build-$BUILD.zip
+          Skiff-macos-x86_64-build-$BUILD.zip
+          Skiff-windows-x64-setup.exe
+          Skiff-windows-x64.zip
+          Skiff-linux-x86_64.AppImage
+          Skiff-linux-aarch64.AppImage
+          skiff-linux-x86_64.tar.gz
+          skiff-linux-aarch64.tar.gz
+          skiff_amd64.deb
+          skiff_arm64.deb"
+          printf '%s\n' "$expected" | sed 's/^ *//' | LC_ALL=C sort > "$RUNNER_TEMP/expected"
+          find . -type f | sed 's|^\./||' | LC_ALL=C sort > "$RUNNER_TEMP/found"
+          if ! diff -u "$RUNNER_TEMP/expected" "$RUNNER_TEMP/found"; then
+            echo "::error::The built files are not exactly the release's files (see the diff above)."
+            exit 1
+          fi
+          xargs sha256sum -- < "$RUNNER_TEMP/expected" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Records, signed by GitHub, that these exact files were built by this
+      # workflow from this commit (gh attestation verify <file> -R <repo>).
+      # GitHub offers this for public repositories only.
+      - name: Attest build provenance
+        if: env.PRIVATE_REPO != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          case "$MACOS_SIGNING" in
+            notarized) macos="Signed with an Apple Developer ID and notarized by Apple. It opens like any other downloaded app." ;;
+            signed) macos="Signed with an Apple Developer ID but **not notarized**. On first start macOS refuses it: allow it once under System Settings > Privacy & Security > Open Anyway." ;;
+            *) macos="**Not signed** (ad-hoc signature only) and not notarized. On first start macOS refuses it: allow it once under System Settings > Privacy & Security > Open Anyway, or run \`xattr -dr com.apple.quarantine /Applications/Skiff.app\`." ;;
+          esac
+          case "$WINDOWS_SIGNING" in
+            signed) windows="Signed. (SmartScreen may still ask until enough people have installed this release.)" ;;
+            *) windows="**Not signed.** Windows shows \"Windows protected your PC\": choose More info > Run anyway." ;;
+          esac
+          if [ "$PRIVATE_REPO" = true ]; then
+            attest="Build provenance is not attested (GitHub offers that for public repositories only)."
+          else
+            attest="Each file also has a build provenance attestation: \`gh attestation verify <file> -R $GH_REPO\` shows that it was built by this repository's release workflow."
+          fi
+          {
+            if [ "$CHANNEL" = nightly ]; then
+              echo "Nightly build $BUILD of Skiff $VERSION, made from commit $GITHUB_SHA. It is the newest code on main and has seen less testing than a release; the stable version is the one marked \"Latest\"."
+              echo
+            fi
+            echo "## Downloads"
+            echo
+            echo "| System | File |"
+            echo "|---|---|"
+            echo "| macOS 11 or newer, Apple Silicon and Intel | \`Skiff-macos-universal.dmg\` |"
+            echo "| Windows 10 or 11, 64-bit | \`Skiff-windows-x64-setup.exe\` (installer, no administrator rights needed) or \`Skiff-windows-x64.zip\` (portable) |"
+            echo "| Linux x86_64 | \`Skiff-linux-x86_64.AppImage\`, \`skiff_amd64.deb\` or \`skiff-linux-x86_64.tar.gz\` |"
+            echo "| Linux arm64 | \`Skiff-linux-aarch64.AppImage\`, \`skiff_arm64.deb\` or \`skiff-linux-aarch64.tar.gz\` |"
+            echo
+            echo "The \`Skiff-macos-…-build-$BUILD.zip\` files are what the app's own updater downloads; nobody needs to pick them by hand."
+            echo
+            echo "## Is it signed?"
+            echo
+            echo "- **macOS:** $macos"
+            echo "- **Windows:** $windows"
+            echo "- **Linux:** Linux packages carry no signature. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later)."
+            echo
+            echo "\`SHA256SUMS\` lists the SHA-256 of every file: \`sha256sum -c SHA256SUMS --ignore-missing\`. $attest"
+            echo
+          } > notes.md
+          if [ "$CHANNEL" = nightly ]; then
+            {
+              echo "## Last change"
+              echo
+              gh api "repos/$GH_REPO/commits/$GITHUB_SHA" --jq '.commit.message'
+            } >> notes.md
+          fi
+          cat notes.md
+
+      - name: Create the release
+        run: |
+          if [ "$CHANNEL" = stable ]; then
+            # (The tag exists: it started this run. GitHub's generated list
+            # of changes follows the notes above.)
+            gh release create "$TAG" dist/* --verify-tag --title "Skiff $VERSION" \
+              --notes-file notes.md --generate-notes --latest
+          else
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "Skiff $VERSION (build $BUILD)" \
+              --notes-file notes.md --prerelease --latest=false
+          fi
+
+      - name: Keep the newest 10 nightly builds
+        if: env.CHANNEL == 'nightly'
+        run: |
+          gh release list --limit 300 --json tagName,isPrerelease > "$RUNNER_TEMP/releases.json"
+          # build-N releases made before there were channels were published
+          # as normal releases; they are nightlies too.
+          jq -r '.[] | select((.isPrerelease | not) and (.tagName | test("^build-[0-9]+$"))) | .tagName' \
+            "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/not-marked"
+          while read -r old; do
+            gh release edit "$old" --prerelease --latest=false
+          done < "$RUNNER_TEMP/not-marked"
+          jq -r '[.[] | select(.tagName | test("^build-[0-9]+$"))]
+            | sort_by(.tagName | ltrimstr("build-") | tonumber) | reverse | .[10:] | .[].tagName' \
+            "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/old"
+          while read -r old; do
+            gh release delete "$old" --yes --cleanup-tag
+          done < "$RUNNER_TEMP/old"

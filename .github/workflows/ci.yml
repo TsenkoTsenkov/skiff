@@ -1,0 +1,186 @@
+# Checks every pull request and every push to main:
+#
+#   lint       clippy; warnings in the program fail it, warnings in the test
+#              code are only reported for now (see the job)
+#   test       the whole test suite on Linux, with a software Vulkan driver for
+#              the UI snapshot tests; tests that need a cluster skip themselves
+#   portable   the code compiles and the unit tests pass on Windows and macOS
+#   deny       cargo-deny: security advisories, licences, crate sources.
+#              Also runs every Monday, so that a newly published advisory is
+#              noticed without a push.
+#   packaging  the packaging scripts and metadata files are well-formed
+#
+# Nothing here can write to the repository or read a secret.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request replaces a run still in progress.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+# bash with "-eo pipefail", also on Windows.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Clippy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libx11-dev
+      # The program itself (libraries and binary) must be free of warnings.
+      - name: Clippy
+        run: cargo clippy --workspace --locked -- -D warnings
+      # The test code still has clippy remarks (31 when this was written,
+      # nearly all in tests/qa_flows.rs), so it is reported but does not
+      # fail the job. Once they are fixed, add --all-targets to the step
+      # above and delete this one.
+      - name: Clippy on the tests (report only)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: Tests (Linux)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The UI tests render with wgpu; a hosted runner has no GPU, so Mesa's
+      # software Vulkan driver (lavapipe) draws for them.
+      - name: Build dependencies and a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxkbcommon0 libxkbcommon-x11-0 libvulkan1 mesa-vulkan-drivers
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+      # (The tests that need a cluster find none here and skip themselves.)
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  portable:
+    name: Check and unit tests (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+      # Unit tests only: the UI snapshot tests need a GPU or a software
+      # renderer, which these runners do not reliably have.
+      - name: Unit tests
+        run: cargo test --workspace --lib --locked
+
+  deny:
+    name: cargo-deny (advisories, licences, sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+      # The released binary, pinned by version and checksum (Dependabot does
+      # not see this: raise both by hand).
+      - name: Install cargo-deny
+        env:
+          DENY_VERSION: "0.22.0"
+          DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+        run: |
+          name="cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/$name.tar.gz"
+          echo "$DENY_SHA256  $RUNNER_TEMP/deny.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/deny.tar.gz" -C "$RUNNER_TEMP"
+          install -m755 "$RUNNER_TEMP/$name/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+      - name: cargo deny check
+        run: cargo deny --locked check
+
+  packaging:
+    name: Packaging files
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream nsis
+      - name: Shell scripts
+        run: shellcheck hack/macos-app.sh hack/linux-package.sh
+      - name: Desktop entry
+        run: desktop-file-validate packaging/linux/io.github.tsenkotsenkov.skiff.desktop
+      - name: AppStream metadata
+        run: |
+          sed 's|^@RELEASES@$|    <release version="0.0.0" date="2026-01-01"/>|' \
+            packaging/linux/io.github.tsenkotsenkov.skiff.metainfo.xml > "$RUNNER_TEMP/io.github.tsenkotsenkov.skiff.metainfo.xml"
+          appstreamcli validate --no-net "$RUNNER_TEMP/io.github.tsenkotsenkov.skiff.metainfo.xml"
+      - name: Property lists
+        run: |
+          python3 - <<'EOF'
+          import plistlib
+          for path in ["packaging/macos/Info.plist.in", "packaging/macos/Skiff.entitlements"]:
+              with open(path, "rb") as f:
+                  plistlib.load(f)
+              print("ok", path)
+          EOF
+      # Compiles the installer script around a stand-in for skiff.exe: a
+      # mistake in it is found here rather than on release day.
+      - name: Installer script
+        run: |
+          printf 'MZ' > "$RUNNER_TEMP/skiff.exe"
+          makensis -V2 -DVERSION=0.0.0 -DBUILD=1 -DEXE="$RUNNER_TEMP/skiff.exe" -DLICENSE="$PWD/LICENSE" \
+            -DICON="$PWD/crates/skiff/assets/icons/skiff.ico" \
+            -DOUTFILE="$RUNNER_TEMP/Skiff-windows-x64-setup.exe" packaging/windows/skiff.nsi

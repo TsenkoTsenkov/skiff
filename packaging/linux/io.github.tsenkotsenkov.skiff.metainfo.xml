@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: what software centres show for Skiff. The release
+     list is filled in by hack/linux-package.sh (@RELEASES@). -->
+<component type="desktop-application">
+  <id>io.github.tsenkotsenkov.skiff</id>
+  <name>Skiff</name>
+  <summary>A fast, native Kubernetes cluster browser</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.tsenkotsenkov">
+    <name>Tsenko Tsenkov</name>
+  </developer>
+  <description>
+    <p>
+      Skiff is a desktop client for Kubernetes clusters. It is a native
+      program, not a web page in a window: it starts instantly, stays
+      responsive in clusters with tens of thousands of objects and uses
+      little memory.
+    </p>
+    <ul>
+      <li>Browse, filter and edit any resource, including custom resources</li>
+      <li>Follow logs, open shells in containers and forward ports</li>
+      <li>Uses your kubeconfig as it is, including exec credential plugins and OIDC</li>
+      <li>No account, no telemetry, no bundled kubectl</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.tsenkotsenkov.skiff.desktop</launchable>
+  <url type="homepage">https://github.com/TsenkoTsenkov/skiff</url>
+  <url type="bugtracker">https://github.com/TsenkoTsenkov/skiff/issues</url>
+  <url type="vcs-browser">https://github.com/TsenkoTsenkov/skiff</url>
+  <categories>
+    <category>Development</category>
+  </categories>
+  <keywords>
+    <keyword>kubernetes</keyword>
+    <keyword>k8s</keyword>
+    <keyword>kubectl</keyword>
+  </keywords>
+  <provides>
+    <binary>skiff</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+@RELEASES@
+  </releases>
+</component>
