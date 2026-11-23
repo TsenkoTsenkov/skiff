@@ -957,7 +957,12 @@ fn pod_like_panels(sel: &str, by: &'static str, range: &TimeRange) -> Vec<Panel>
     // `container!=""` drops the pod-level cgroup (which would double the
     // sum), `POD` the pause container on older runtimes.
     let containers = format!("{sel},container!=\"\",container!=\"POD\"");
-    let resource = |metric: &str, res: &str| format!("sum({metric}{{{sel},resource=\"{res}\"}})");
+    // What one pod requests and may use: the lines of a workload chart are
+    // single pods, so its reference is the (largest) pod's, not the sum.
+    let resource = |metric: &str, res: &str| match by {
+        "pod" => format!("max(sum by(pod)({metric}{{{sel},resource=\"{res}\"}}))"),
+        _ => format!("sum({metric}{{{sel},resource=\"{res}\"}})"),
+    };
     vec![
         Panel {
             title: "CPU",
@@ -1083,7 +1088,127 @@ pub fn node_panels(node: &str, by: NodeBy, range: &TimeRange) -> Vec<Panel> {
                 reference(allocatable("memory"), "allocatable"),
             ],
         },
+        // What the pods on the node send and receive; pods on the host
+        // network report the node's own interfaces.
+        Panel {
+            title: "Pod network",
+            unit: Unit::BytesPerSec,
+            queries: vec![
+                usage(
+                    format!("sum(rate(container_network_receive_bytes_total{{{sel}}}[{w}]))"),
+                    Legend::Name("received"),
+                ),
+                usage(
+                    format!("sum(rate(container_network_transmit_bytes_total{{{sel}}}[{w}]))"),
+                    Legend::Name("sent"),
+                ),
+            ],
+        },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Charts of one object
+
+/// What a set of charts is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChartTarget {
+    Pod { namespace: String, name: String },
+    /// A workload, by the pods it owns right now.
+    Workload { namespace: String, pods: Vec<String> },
+    Node { name: String },
+}
+
+/// One chart with its data, or why it could not be loaded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chart {
+    pub title: &'static str,
+    pub unit: Unit,
+    pub data: Result<PanelData, PromError>,
+}
+
+impl ChartTarget {
+    /// The panels for this target. Nodes are selected by their `node`
+    /// label here; [`Prom::charts`] falls back to `instance`.
+    pub fn panels(&self, range: &TimeRange) -> Vec<Panel> {
+        match self {
+            ChartTarget::Pod { namespace, name } => pod_panels(namespace, name, range),
+            ChartTarget::Workload { namespace, pods } => {
+                let pods: Vec<&str> = pods.iter().map(String::as_str).collect();
+                workload_panels(namespace, &pods, range)
+            }
+            ChartTarget::Node { name } => node_panels(name, NodeBy::Label, range),
+        }
+    }
+
+    /// The CPU and memory usage queries, for handing to another tool
+    /// (Grafana's Explore). Empty for a workload without pods.
+    pub fn usage_queries(&self) -> Vec<String> {
+        self.panels(&TimeRange::last(3600, 0))
+            .into_iter()
+            .filter(|p| matches!(p.unit, Unit::Cores | Unit::Bytes))
+            .filter_map(|p| p.queries.into_iter().find(|q| !q.reference).map(|q| q.expr))
+            .collect()
+    }
+}
+
+impl Prom {
+    async fn run_panels(&self, panels: Vec<Panel>, range: &TimeRange) -> Vec<Chart> {
+        let data = futures::future::join_all(panels.iter().map(|p| self.panel(p, range))).await;
+        panels
+            .into_iter()
+            .zip(data)
+            .map(|(panel, data)| Chart {
+                title: panel.title,
+                unit: panel.unit,
+                data,
+            })
+            .collect()
+    }
+
+    /// Loads every chart of `target`, all at once. A chart that fails
+    /// carries its own error; the others are unaffected. For a node whose
+    /// series are not labelled with `node`, the `instance` label is tried.
+    pub async fn charts(&self, target: &ChartTarget, range: &TimeRange) -> Vec<Chart> {
+        let charts = self.run_panels(target.panels(range), range).await;
+        if let ChartTarget::Node { name } = target {
+            let nothing = charts.iter().all(|c| matches!(&c.data, Ok(d) if d.is_empty()));
+            if nothing && !charts.is_empty() {
+                let by_instance = self
+                    .run_panels(node_panels(name, NodeBy::Instance, range), range)
+                    .await;
+                if by_instance.iter().any(|c| matches!(&c.data, Ok(d) if !d.is_empty())) {
+                    return by_instance;
+                }
+            }
+        }
+        charts
+    }
+}
+
+/// A moment in the computer's own time zone, for chart axes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalTime {
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    /// Seconds east of UTC at that moment.
+    pub utc_offset: i32,
+}
+
+/// `unix` seconds in the system's time zone (UTC when that is unknown).
+pub fn local_time(unix: i64) -> LocalTime {
+    let zoned = jiff::Timestamp::from_second(unix)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .to_zoned(jiff::tz::TimeZone::system());
+    LocalTime {
+        month: zoned.month() as u8,
+        day: zoned.day() as u8,
+        hour: zoned.hour() as u8,
+        minute: zoned.minute() as u8,
+        utc_offset: zoned.offset().seconds(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,6 +1820,37 @@ mod tests {
     ];
 
     #[test]
+    fn chart_targets_pick_their_panels_and_explore_queries() {
+        let range = TimeRange::last(3600, 1_700_000_000);
+        let pod = ChartTarget::Pod { namespace: "shop".into(), name: "web-1".into() };
+        assert_eq!(pod.panels(&range), pod_panels("shop", "web-1", &range));
+        let queries = pod.usage_queries();
+        assert_eq!(queries.len(), 2, "{queries:?}");
+        assert!(queries[0].starts_with("sum by(container)(rate(container_cpu_usage_seconds_total{namespace=\"shop\",pod=\"web-1\""));
+        assert!(queries[1].starts_with("sum by(container)(container_memory_working_set_bytes{"));
+
+        let workload = ChartTarget::Workload { namespace: "shop".into(), pods: vec!["a".into(), "b".into()] };
+        assert_eq!(workload.panels(&range), workload_panels("shop", &["a", "b"], &range));
+        let empty = ChartTarget::Workload { namespace: "shop".into(), pods: vec![] };
+        assert!(empty.panels(&range).is_empty() && empty.usage_queries().is_empty());
+
+        let node = ChartTarget::Node { name: "node-1".into() };
+        let titles: Vec<&str> = node.panels(&range).iter().map(|p| p.title).collect();
+        assert_eq!(titles, ["CPU", "Memory", "Pod network"]);
+        assert_eq!(node.usage_queries().len(), 2);
+    }
+
+    #[test]
+    fn local_time_is_consistent_with_its_offset() {
+        let t = 1_700_000_000;
+        let local = local_time(t);
+        let shifted = t + i64::from(local.utc_offset);
+        assert_eq!(i64::from(local.hour), shifted.rem_euclid(86_400) / 3600);
+        assert_eq!(i64::from(local.minute), shifted.rem_euclid(3600) / 60);
+        assert!((1..=12).contains(&local.month) && (1..=31).contains(&local.day));
+    }
+
+    #[test]
     fn hostile_names_stay_inside_their_matcher() {
         let range = TimeRange::last(3600, 1_700_000_000);
         for hostile in HOSTILE {
@@ -1716,7 +1872,8 @@ mod tests {
                 for panel in node_panels(hostile, by, &range) {
                     for q in &panel.queries {
                         let (matchers, _) = selector_shape(&q.expr);
-                        assert_eq!(matchers, 2, "{}", q.expr);
+                        // id="/" and the node; the network panel has only the node.
+                        assert!((1..=2).contains(&matchers), "{}", q.expr);
                     }
                 }
             }
@@ -1793,7 +1950,8 @@ mod tests {
         assert_eq!(panels[0].queries[0].legend, Legend::Label("pod"));
         assert_eq!(
             panels[1].queries[1].expr,
-            r#"sum(kube_pod_container_resource_requests{namespace="shop",pod=~"web-1|web-2\\.x",resource="memory"})"#
+            // Per pod, like the usage lines it is compared with.
+            r#"max(sum by(pod)(kube_pod_container_resource_requests{namespace="shop",pod=~"web-1|web-2\\.x",resource="memory"}))"#
         );
         // No pods: no query that would match everything.
         assert!(workload_panels("shop", &[], &range).is_empty());

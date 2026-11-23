@@ -200,9 +200,9 @@ impl ShellTab {
                 .on_hover_text("Open this shell in your own terminal (iTerm, Terminal, ...) with kubectl exec")
                 .clicked()
             {
-                let cmd =
-                    crate::external::exec_command(&self.session.context, &self.ns, &self.pod, self.container.as_deref());
-                match crate::external::open(&cmd) {
+                let inv =
+                    crate::external::exec_invocation(&self.session.context, &self.ns, &self.pod, self.container.as_deref());
+                match crate::external::open_invocation(&inv) {
                     Ok(app) => toasts.push((format!("Opened in {app}"), Tone::Normal)),
                     Err(e) => toasts.push((e, Tone::Err)),
                 }

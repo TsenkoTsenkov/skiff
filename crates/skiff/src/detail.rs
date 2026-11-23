@@ -12,8 +12,10 @@ use serde_json::Value;
 use skiff_core::cells::{parse_time, status_tone};
 use skiff_core::kinds;
 use skiff_core::ops::{containers_of, pod_selector_of};
+use skiff_core::prom::ChartTarget;
 use skiff_core::{fmt_age, now_unix, ColSource, Job, ListQuery, ObjectData, ResourceKey, Session, Snapshot, Tone};
 
+use crate::metrics_view::{self, MetricsView};
 use crate::table_view::{actions_for, RowAction};
 use crate::theme::{self, Palette};
 use crate::widgets;
@@ -21,6 +23,8 @@ use crate::widgets;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailTab {
     Overview,
+    /// CPU, memory, network and restarts over time (pods, workloads, nodes).
+    Metrics,
     Yaml,
     Events,
 }
@@ -30,9 +34,15 @@ pub enum DetailAction {
     Row(RowAction),
     Open { kind: String, ns: String, name: String },
     Toast(String, Tone),
+    /// Put a secret on the clipboard (the app clears it again later);
+    /// `what` names it in the notification.
+    CopySecret { text: String, what: String },
     LogsOf { container: String },
     ShellIn { container: String },
     ForwardPort { port: u16 },
+    /// Apply was pressed in the YAML editor of a cluster that asks first:
+    /// the app confirms and then calls [`Detail::apply_edit`].
+    ConfirmApply,
 }
 
 struct EditState {
@@ -95,6 +105,15 @@ pub struct Detail {
     /// Highlighted YAML for (resourceVersion, dark theme), so switching
     /// tabs or repainting does not re-run the highlighter.
     yaml_job: Option<(String, bool, egui::text::LayoutJob)>,
+    /// Why everything that changes the cluster is disabled, when it is
+    /// (the cluster is read-only in Skiff). Set by the app every frame.
+    pub locked: Option<String>,
+    /// Applying a YAML edit asks first ([`DetailAction::ConfirmApply`]).
+    pub confirm_apply: bool,
+    metrics: MetricsView,
+    /// `clusters.<context>.grafana_url` from the config file, for the
+    /// Metrics tab's link. Set by the app every frame.
+    pub grafana_url: Option<String>,
 }
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -151,7 +170,47 @@ impl Detail {
             revealed: HashSet::new(),
             gone: false,
             yaml_job: None,
+            locked: None,
+            confirm_apply: false,
+            metrics: MetricsView::new(),
+            grafana_url: None,
         }
+    }
+
+    /// The tabs this object has, in the order they are shown.
+    pub fn tabs(&self) -> Vec<DetailTab> {
+        let mut tabs = vec![DetailTab::Overview];
+        if self.has_metrics() {
+            tabs.push(DetailTab::Metrics);
+        }
+        tabs.extend([DetailTab::Yaml, DetailTab::Events]);
+        tabs
+    }
+
+    /// Whether this kind of object has a Metrics tab: pods, the workloads
+    /// that own pods, and nodes.
+    pub fn has_metrics(&self) -> bool {
+        matches!(
+            (&*self.key.group, &*self.key.plural),
+            ("", "pods" | "nodes") | ("apps", "deployments" | "statefulsets" | "daemonsets" | "replicasets") | ("batch", "jobs")
+        )
+    }
+
+    /// What the Metrics tab charts; `None` while a workload's pods are
+    /// still being listed.
+    fn chart_target(&self) -> Option<ChartTarget> {
+        if self.key.is("", "pods") {
+            return Some(ChartTarget::Pod { namespace: self.ns.clone(), name: self.name.clone() });
+        }
+        if self.key.is("", "nodes") {
+            return Some(ChartTarget::Node { name: self.name.clone() });
+        }
+        let pods = self.pods.as_ref()?;
+        // Sorted: the same pods are the same charts, in whatever order
+        // the server listed them.
+        let mut names: Vec<String> = pods.rows.iter().map(|r| r.name.to_string()).collect();
+        names.sort();
+        Some(ChartTarget::Workload { namespace: self.ns.clone(), pods: names })
     }
 
     pub fn set_gone(&mut self, gone: bool) {
@@ -269,7 +328,7 @@ impl Detail {
             }
         }
         let pods_due = self.pods_at.is_none_or(|t| t.elapsed() > REFRESH);
-        if pods_due && self.pods_job.is_none() && self.tab == DetailTab::Overview {
+        if pods_due && self.pods_job.is_none() && matches!(self.tab, DetailTab::Overview | DetailTab::Metrics) {
             if let Some(obj) = &self.obj {
                 if let Some((ns, query)) = self.related_pods_query(&obj.value) {
                     self.pods_at = Some(Instant::now());
@@ -338,8 +397,18 @@ impl Detail {
                 let btn = egui::Button::new(widgets::icon(ic, 16.0).color(color))
                     .frame_when_inactive(false)
                     .min_size(egui::vec2(28.0, 26.0));
-                if widgets::named(ui.add(btn), label).clicked() {
-                    actions.push(DetailAction::Row(action));
+                match self.locked.as_deref().filter(|_| action.mutates()) {
+                    Some(reason) => {
+                        let label = label.to_string();
+                        ui.add_enabled(false, btn)
+                            .on_disabled_hover_text(format!("{label}: {reason}"))
+                            .widget_info(move || egui::WidgetInfo::labeled(egui::Role::Button, false, &label));
+                    }
+                    None => {
+                        if widgets::named(ui.add(btn), label).clicked() {
+                            actions.push(DetailAction::Row(action));
+                        }
+                    }
                 }
             }
         });
@@ -351,11 +420,17 @@ impl Detail {
             let event_count = self.events.as_ref().map(|e| e.rows.len()).unwrap_or(0);
             let warn = self.events.as_ref().is_some_and(|e| e.rows.iter().any(|r| r.tone >= Tone::Warn));
             let events_label = if event_count > 0 { format!("Events  {event_count}") } else { "Events".to_string() };
-            for (tab, label) in [
-                (DetailTab::Overview, "Overview".to_string()),
-                (DetailTab::Yaml, "YAML".to_string()),
-                (DetailTab::Events, events_label),
-            ] {
+            // A tab carried over from an object that had it.
+            if self.tab == DetailTab::Metrics && !self.has_metrics() {
+                self.tab = DetailTab::Overview;
+            }
+            for tab in self.tabs() {
+                let label = match tab {
+                    DetailTab::Overview => "Overview".to_string(),
+                    DetailTab::Metrics => "Metrics".to_string(),
+                    DetailTab::Yaml => "YAML".to_string(),
+                    DetailTab::Events => events_label.clone(),
+                };
                 let selected = self.tab == tab;
                 let mut text = RichText::new(label);
                 if tab == DetailTab::Events && warn && !selected {
@@ -391,7 +466,33 @@ impl Detail {
             ui.label(RichText::new(format!("Refresh failed: {e}")).color(pal.warn).size(12.0));
         }
 
+        // Alerts that are firing about this very object.
+        if matches!(self.tab, DetailTab::Overview | DetailTab::Metrics) {
+            let alerts = session.alerts();
+            if !alerts.items.is_empty() {
+                let addresses: Vec<&str> =
+                    arr(&obj.value, "/status/addresses").iter().map(|a| s(a, "/address")).filter(|a| !a.is_empty()).collect();
+                let mine = metrics_view::alerts_for(&alerts, &self.key, &self.ns, &self.name, &addresses);
+                metrics_view::object_alerts(ui, pal, &mine);
+            }
+        }
+
         match self.tab {
+            DetailTab::Metrics => {
+                let subject = metrics_view::Subject {
+                    context: &session.context,
+                    namespace: &self.ns,
+                    target: self.chart_target(),
+                    grafana_url: self.grafana_url.as_deref(),
+                };
+                let width = ui.available_width();
+                egui::ScrollArea::vertical().id_salt("detail-metrics").auto_shrink([false, false]).show(ui, |ui| {
+                    // (Room for the scroll bar next to the charts.)
+                    ui.set_max_width(width - 8.0);
+                    self.metrics.ui(ui, pal, session, &subject);
+                    ui.add_space(12.0);
+                });
+            }
             DetailTab::Overview => {
                 let value = obj.value.clone();
                 // Lay out at the panel's width, and scroll sideways in the
@@ -431,6 +532,8 @@ impl Detail {
         const HIGHLIGHT_EDIT_MAX: usize = 60_000;
         let theme = if pal.dark { CodeTheme::dark(12.5) } else { CodeTheme::light(12.5) };
         let Some(obj) = &self.obj else { return };
+        let locked = self.locked.clone();
+        let mut apply_now = false;
         if let Some(edit) = &mut self.edit {
             let saving = edit.job.is_some();
             // The object changes underneath (status updates, other people).
@@ -449,7 +552,12 @@ impl Detail {
             let mut reload = false;
             ui.horizontal(|ui| {
                 let label = (widgets::icon(icons::ICON_SAVE, 15.0), "Apply");
-                if ui.add_enabled(!saving, egui::Button::new(label)).on_hover_text("Ctrl+S").clicked() {
+                let button = ui.add_enabled(!saving && locked.is_none(), egui::Button::new(label));
+                let button = match &locked {
+                    Some(reason) => button.on_disabled_hover_text(reason),
+                    None => button.on_hover_text("Ctrl+S"),
+                };
+                if button.clicked() {
                     apply = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -493,7 +601,7 @@ impl Detail {
                         });
                     });
             }
-            if !overlay_open && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
+            if !overlay_open && locked.is_none() && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
                 apply = true;
             }
             // (Esc is handled by the app's shortcuts, on every tab: it
@@ -534,8 +642,11 @@ impl Detail {
                 }
             });
             if apply && !saving {
-                edit.error = None;
-                edit.job = Some(session.replace_object(&self.key, &self.ns, &self.name, edit.text.clone()));
+                if self.confirm_apply {
+                    actions.push(DetailAction::ConfirmApply);
+                } else {
+                    apply_now = true;
+                }
             }
             if reload {
                 *edit = EditState::start(obj);
@@ -545,12 +656,23 @@ impl Detail {
             }
         } else {
             ui.horizontal(|ui| {
-                if widgets::action_button(ui, icons::ICON_EDIT, "Edit").clicked() {
+                let edit = ui.add_enabled(
+                    locked.is_none(),
+                    egui::Button::new((widgets::icon(icons::ICON_EDIT, 16.0), "Edit")).min_size(egui::vec2(0.0, 28.0)),
+                );
+                if let Some(reason) = &locked {
+                    edit.on_disabled_hover_text(reason);
+                } else if edit.clicked() {
                     actions.push(DetailAction::Row(RowAction::Edit));
                 }
                 if widgets::action_button(ui, icons::ICON_CONTENT_COPY, "Copy").clicked() {
-                    ui.ctx().copy_text(obj.yaml.clone());
-                    actions.push(DetailAction::Toast("YAML copied".into(), Tone::Normal));
+                    if self.key.is("", "secrets") {
+                        // (The values in it are only base64.)
+                        actions.push(DetailAction::CopySecret { text: obj.yaml.clone(), what: "the Secret's YAML".into() });
+                    } else {
+                        ui.ctx().copy_text(obj.yaml.clone());
+                        actions.push(DetailAction::Toast("YAML copied".into(), Tone::Normal));
+                    }
                 }
                 ui.label(RichText::new("managedFields hidden").color(pal.faint).size(11.5));
             });
@@ -567,6 +689,30 @@ impl Detail {
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add(egui::Label::new(job).selectable(true).extend());
             });
+        }
+        if apply_now {
+            self.apply_edit(session);
+        }
+    }
+
+    /// A "forward this port" button: disabled, saying why, on a read-only
+    /// cluster. Returns whether it was clicked.
+    fn forward_button(&self, ui: &mut Ui, button: egui::Button<'_>) -> bool {
+        match &self.locked {
+            Some(reason) => {
+                ui.add_enabled(false, button).on_disabled_hover_text(reason);
+                false
+            }
+            None => ui.add(button).on_hover_text("Forward this port to localhost").clicked(),
+        }
+    }
+
+    /// Sends the YAML editor's text to the cluster (replacing the object).
+    /// Does nothing when no edit is open or one is already on its way.
+    pub fn apply_edit(&mut self, session: &Arc<Session>) {
+        if let Some(edit) = self.edit.as_mut().filter(|e| e.job.is_none()) {
+            edit.error = None;
+            edit.job = Some(session.replace_object(&self.key, &self.ns, &self.name, edit.text.clone()));
         }
     }
 
@@ -877,8 +1023,17 @@ impl Detail {
                     ui.label(widgets::semibold(&name, 13.0).color(pal.text));
                     widgets::pill(ui, &state_text, pal.tone(state_tone), pal);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::icon_button(ui, icons::ICON_TERMINAL, "Open a shell in this container").clicked() {
-                            actions.push(DetailAction::ShellIn { container: name.clone() });
+                        let shell = ui.add_enabled_ui(self.locked.is_none(), |ui| {
+                            widgets::icon_button(ui, icons::ICON_TERMINAL, "Open a shell in this container")
+                        });
+                        match &self.locked {
+                            Some(reason) => {
+                                shell.inner.on_disabled_hover_text(reason);
+                            }
+                            None if shell.inner.clicked() => {
+                                actions.push(DetailAction::ShellIn { container: name.clone() });
+                            }
+                            None => {}
                         }
                         if widgets::icon_button(ui, icons::ICON_SUBJECT, "Logs of this container").clicked() {
                             actions.push(DetailAction::LogsOf { container: name.clone() });
@@ -928,7 +1083,7 @@ impl Detail {
                                 RichText::new(label).size(12.0),
                             ))
                             .small();
-                            if ui.add(btn).on_hover_text("Forward this port to localhost").clicked() {
+                            if self.forward_button(ui, btn) {
                                 actions.push(DetailAction::ForwardPort { port: port as u16 });
                             }
                         }
@@ -1126,7 +1281,7 @@ impl Detail {
                         RichText::new("Forward").size(12.0),
                     ))
                     .small();
-                    if ui.add(btn).on_hover_text("Forward this port to localhost").clicked() {
+                    if self.forward_button(ui, btn) {
                         actions.push(DetailAction::ForwardPort { port: port as u16 });
                     }
                 });
@@ -1263,9 +1418,7 @@ impl Detail {
                 ui.label(RichText::new(widgets::plural(widgets::base64_len(encoded), "byte")).color(pal.faint).size(12.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, icons::ICON_CONTENT_COPY, "Copy decoded value").clicked() {
-                        let decoded = decode_secret(encoded);
-                        ui.ctx().copy_text(decoded);
-                        actions.push(DetailAction::Toast(format!("Copied {k}"), Tone::Normal));
+                        actions.push(DetailAction::CopySecret { text: decode_secret(encoded), what: k.clone() });
                     }
                     let ic = if revealed { icons::ICON_VISIBILITY_OFF } else { icons::ICON_VISIBILITY };
                     if widgets::icon_button(ui, ic, if revealed { "Hide" } else { "Reveal" }).clicked() {

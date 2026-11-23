@@ -1,6 +1,6 @@
 //! Small reusable UI pieces.
 
-use egui::{Align, Color32, CornerRadius, FontId, Layout, Response, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Response, RichText, Sense, Stroke, Ui, Vec2};
 use egui_material_icons::MaterialIcon;
 
 use crate::theme::{self, Palette};
@@ -42,6 +42,33 @@ pub fn action_button(ui: &mut Ui, ic: MaterialIcon, label: &str) -> Response {
     ui.add(egui::Button::new((icon(ic, 16.0), label)).min_size(Vec2::new(0.0, 28.0)))
 }
 
+/// The one button a page wants pressed: filled with the accent colour.
+pub fn primary_button(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, label: &str, min_width: f32, enabled: bool) -> Response {
+    let button = egui::Button::new((icon(ic, 16.0).color(pal.bg), semibold(label, 13.0).color(pal.bg)))
+        .fill(pal.accent)
+        .min_size(Vec2::new(min_width, 32.0));
+    ui.add_enabled(enabled, button)
+}
+
+/// Rounded badge with a leading icon, for a standing condition (read-only,
+/// unverified TLS).
+pub fn badge(ui: &mut Ui, ic: MaterialIcon, text: &str, color: Color32, pal: &Palette) -> Response {
+    let glyph = ui.painter().layout_no_wrap(ic.codepoint.to_string(), FontId::new(13.0, ic.font_family()), color);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(11.5), color);
+    let size = Vec2::new(glyph.size().x + 4.0 + galley.size().x + 16.0, 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(10), pal.tint(color, 0.16));
+        let x = rect.left() + 8.0;
+        p.galley(egui::pos2(x, rect.center().y - glyph.size().y / 2.0), glyph.clone(), color);
+        p.galley(egui::pos2(x + glyph.size().x + 4.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    }
+    let label = text.to_string();
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
+    resp
+}
+
 pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).font(FontId::new(size, theme::semibold()))
 }
@@ -77,10 +104,79 @@ pub fn chip(ui: &mut Ui, text: &str, pal: &Palette) -> Response {
         ui.painter().rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
         ui.painter().galley(rect.center() - galley.size() / 2.0, galley, pal.muted);
     }
+    focus_ring(ui, &resp, 5, pal);
     if shortened {
         resp = resp.on_hover_text(text);
     }
     resp
+}
+
+/// Draws the keyboard-focus outline around a widget that paints itself
+/// (egui draws it for its own buttons and fields).
+pub fn focus_ring(ui: &Ui, resp: &Response, radius: u8, pal: &Palette) {
+    if resp.has_focus() && ui.is_rect_visible(resp.rect) {
+        ui.painter().rect_stroke(resp.rect, CornerRadius::same(radius), theme::focus_stroke(pal), egui::StrokeKind::Inside);
+    }
+}
+
+/// A key as it is printed on a keyboard: `Ctrl+K`, `?`, `↓`.
+pub fn keycap(ui: &mut Ui, text: &str, pal: &Palette) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::mono(11.5), pal.text);
+    let size = Vec2::new((galley.size().x + 12.0).max(22.0), 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(5), pal.tint(pal.muted, 0.12));
+        p.rect_stroke(rect, CornerRadius::same(5), Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+        p.galley(rect.center() - galley.size() / 2.0, galley, pal.text);
+    }
+    let label = text.to_string();
+    resp.widget_info(move || egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
+    resp
+}
+
+/// A row of mutually exclusive choices drawn as one control. Returns the
+/// index that was clicked.
+pub fn segmented(ui: &mut Ui, pal: &Palette, options: &[&str], selected: usize, min_width: f32) -> Option<usize> {
+    let mut clicked = None;
+    Frame::new()
+        .fill(pal.tint(pal.muted, 0.10))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // (In a right-to-left row what is added first ends up
+                // rightmost: the choices still read in their own order.)
+                let mut order: Vec<usize> = (0..options.len()).collect();
+                if ui.layout().prefer_right_to_left() {
+                    order.reverse();
+                }
+                for i in order {
+                    let label = &options[i];
+                    let on = i == selected;
+                    let text = if on { semibold(*label, 12.5).color(pal.text) } else { RichText::new(*label).size(12.5).color(pal.muted) };
+                    let button = egui::Button::new(text)
+                        .fill(if on { pal.raised } else { Color32::TRANSPARENT })
+                        .stroke(if on { Stroke::new(1.0, pal.border) } else { Stroke::NONE })
+                        .frame_when_inactive(on)
+                        .min_size(Vec2::new(min_width, 24.0));
+                    let resp = ui.add(button);
+                    let name = label.to_string();
+                    resp.widget_info(move || egui::WidgetInfo::selected(egui::Role::RadioButton, true, on, &name));
+                    if resp.clicked() && !on {
+                        clicked = Some(i);
+                    }
+                }
+            });
+        });
+    clicked
+}
+
+/// A link: accent-coloured text that opens something.
+pub fn link(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, label: &str) -> Response {
+    ui.add(egui::Button::new((icon(ic, 14.0).color(pal.accent), RichText::new(label).color(pal.accent))).frame(false))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 pub fn dot(ui: &mut Ui, color: Color32) {

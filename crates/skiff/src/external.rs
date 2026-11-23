@@ -84,8 +84,26 @@ fn pod_arg(pod: &str) -> String {
     }
 }
 
+/// The kubeconfig files the app reads when they are not the kubectl
+/// default (see [`set_kubeconfig`]).
+static KUBECONFIG: Mutex<Option<String>> = Mutex::new(None);
+
+/// Tells this module which kubeconfig files the app is using, as a
+/// `KUBECONFIG` value (a path list), so that the `kubectl` commands it
+/// builds see the same clusters. `None`: the kubectl default (the
+/// environment's `KUBECONFIG`, if any).
+pub fn set_kubeconfig(path_list: Option<String>) {
+    if let Ok(mut kc) = KUBECONFIG.lock() {
+        *kc = path_list.filter(|p| !p.is_empty());
+    }
+}
+
 fn env_kubeconfig() -> Option<String> {
-    std::env::var("KUBECONFIG").ok().filter(|kc| !kc.is_empty())
+    KUBECONFIG
+        .lock()
+        .ok()
+        .and_then(|kc| kc.clone())
+        .or_else(|| std::env::var("KUBECONFIG").ok().filter(|kc| !kc.is_empty()))
 }
 
 /// A shell in a container.
@@ -724,6 +742,8 @@ mod tests {
         assert_eq!(script_text("x", None, Some(""), false), "#!/bin/sh\nx\n");
     }
 
+    // (Only unix types a script path into a shell.)
+    #[cfg(unix)]
     #[test]
     fn only_plain_paths_are_typed_into_a_shell() {
         assert!(plain_path(Path::new("/var/folders/x_1/T/skiff-term-0a/run.sh")));

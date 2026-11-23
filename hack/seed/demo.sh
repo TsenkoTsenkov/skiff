@@ -81,6 +81,9 @@ log "demo: custom resources + events"
 kc $CTX apply -f "$S/demo/90-custom-resources.yaml" >/dev/null
 kc $CTX apply -f "$S/demo/95-events.yaml" >/dev/null
 
+log "demo: Prometheus (monitoring/prometheus-operated -> hack/fake-prometheus.py)"
+prom_seed $CTX
+
 log "demo: NotReady node (kwok chaos stage keyed on a label)"
 kc $CTX label node demo-worker-5 node-not-ready.stage.kwok.x-k8s.io=true --overwrite >/dev/null
 kc $CTX annotate node demo-worker-5 node-not-ready.stage.kwok.x-k8s.io/reason=KubeletNotReady node-not-ready.stage.kwok.x-k8s.io/message="container runtime network not ready: cni plugin not initialized" --overwrite >/dev/null

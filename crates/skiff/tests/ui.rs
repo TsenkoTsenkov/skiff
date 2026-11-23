@@ -363,6 +363,26 @@ fn restricted_account_can_work_in_its_namespace() {
     top.click();
     settle(&mut h, "picker", |h| has_label_containing(h, "can't be listed"));
     shot(&mut h, "19_restricted_picker");
+
+    // The overview covers that namespace, and says that this is all the
+    // account can see, instead of zeros and errors.
+    let opts = AppOptions { context: Some("restricted".into()), namespace: Some(ns.clone()), ..Default::default() };
+    let mut h = harness_opts(opts, [1280.0, 800.0]);
+    settle(&mut h, "overview of the namespace", |h| has_label(h, "limited access") && has_label_containing(h, "NEEDS ATTENTION"));
+    let pods = kubectl(&["-n", &ns, "get", "pods", "-o", "name"]).lines().count();
+    assert!(has_label(&h, &pods.to_string()), "the pods card counts the namespace's {pods} pods");
+    assert!(has_label(&h, "no access"), "what cannot be read (nodes) says so rather than showing 0");
+    shot(&mut h, "46_restricted_overview");
+
+    // Without a namespace there is nothing to count: the overview says
+    // what to do, and offers the namespace the kubeconfig names.
+    let opts = AppOptions { context: Some("restricted".into()), ..Default::default() };
+    let mut h = harness_opts(opts, [1280.0, 800.0]);
+    settle(&mut h, "limited access note", |h| has_label(h, "Limited access"));
+    assert!(!has_label_containing(&h, "NEEDS ATTENTION"));
+    shot(&mut h, "47_restricted_overview_no_namespace");
+    h.get_by_label(&format!("Use namespace {ns}")).click();
+    settle(&mut h, "overview of the namespace", |h| has_label_containing(h, "NEEDS ATTENTION"));
 }
 
 fn kubectl(args: &[&str]) -> String {
@@ -1042,4 +1062,1194 @@ fn notifications_are_centred_each() {
         // (The text sits right of a small dot, hence the allowance.)
         assert!((x - 720.0).abs() < 12.0, "{text:?} is centred at x={x:.0}, not in the middle of the window");
     }
+}
+
+// ----------------------------------------------------------------------
+// First run, failures and protection. These bring their own kubeconfig and
+// config files (in a temp folder) through `AppOptions.kubeconfigs` and
+// `SkiffApp::headless_with_config`.
+// ----------------------------------------------------------------------
+
+/// A fresh folder for one test's files.
+fn scratch(name: &str) -> PathBuf {
+    let root = workspace().canonicalize().unwrap_or_else(|_| workspace());
+    let dir = root.join("target/tmp").join(format!("ui-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn harness_opts(opts: AppOptions, size: [f32; 2]) -> Harness<'static, SkiffApp> {
+    Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless(&cc.egui_ctx, opts))
+}
+
+/// The app with a config file of its own: `json` is written to
+/// `dir/config.json`, which is also where the app saves changes.
+fn harness_config(opts: AppOptions, dir: &std::path::Path, json: &str, size: [f32; 2]) -> Harness<'static, SkiffApp> {
+    let path = dir.join("config.json");
+    std::fs::write(&path, json).unwrap();
+    let (config, warnings) = skiff::config::Config::load_from(&path);
+    Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless_with_config(&cc.egui_ctx, opts, config, warnings))
+}
+
+fn config_json(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
+}
+
+/// A kubeconfig with one context whose server is a closed local port.
+fn offline_kubeconfig(context: &str, insecure: bool) -> String {
+    let tls = if insecure { "\n    insecure-skip-tls-verify: true" } else { "" };
+    format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: {context}\nclusters:\n- name: c\n  cluster:\n    server: https://127.0.0.1:1{tls}\n\
+         contexts:\n- name: {context}\n  context:\n    cluster: c\n    user: u\nusers:\n- name: u\n  user:\n    token: not-a-real-token\n"
+    )
+}
+
+/// Opens the cluster switcher: its button is the topmost thing that shows
+/// the cluster's name.
+fn open_cluster_menu(h: &mut Harness<'static, SkiffApp>, context: &str) {
+    h.query_all_by_label_contains(context)
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("cluster switcher")
+        .click();
+    settle(h, "cluster menu", |h| has_label_containing(h, "Reload kubeconfig"));
+}
+
+fn is_disabled(h: &Harness<'static, SkiffApp>, label: &str) -> Option<bool> {
+    h.query_all_by_label(label).next().map(|n| n.accesskit_node().is_disabled())
+}
+
+#[test]
+fn welcome_page_when_there_is_no_kubeconfig() {
+    let dir = scratch("welcome");
+    let missing = dir.join("kube").join("config");
+    for light in [false, true] {
+        let opts = AppOptions { kubeconfigs: vec![missing.clone()], light, ..Default::default() };
+        let mut h = harness_opts(opts, [1280.0, 800.0]);
+        steps(&mut h, 4);
+        assert!(has_label(&h, "Welcome to Skiff"));
+        assert!(has_label_containing(&h, "Add kubeconfig file"), "the way forward is offered");
+        assert!(has_label_containing(&h, "Reload"));
+        assert!(has_label(&h, "not found"), "the searched file is listed with what became of it");
+        assert!(has_label_containing(&h, "aws eks update-kubeconfig"), "says how clusters get there");
+        assert!(!has_label(&h, "Workloads") && !has_label(&h, "Pods"), "no sidebar of resource types without a cluster");
+        assert_eq!(h.state().window_title(), "Skiff");
+        shot(&mut h, if light { "31_welcome_light" } else { "30_welcome" });
+    }
+
+    // The file appears while Skiff is in the background (`aws eks
+    // update-kubeconfig` in a terminal): coming back picks it up and opens
+    // the cluster, without a restart.
+    let Some(ctx) = test_context() else { return };
+    let opts = AppOptions { kubeconfigs: vec![missing.clone()], ..Default::default() };
+    let mut h = harness_opts(opts, [1280.0, 800.0]);
+    steps(&mut h, 3);
+    assert!(!h.state_mut().reload_kubeconfig_if_changed(), "nothing changed yet: nothing is read");
+    h.get_by_label_contains("Reload").click();
+    settle(&mut h, "reload says what it found", |h| has_label_containing(h, "Kubeconfig reloaded: 0 contexts"));
+    std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+    std::fs::copy(workspace().join("hack/kubeconfig"), &missing).unwrap();
+    assert!(h.state_mut().reload_kubeconfig_if_changed(), "a searched file that appears is noticed");
+    settle(&mut h, "the cluster to open", |h| has_label_containing(h, "NEEDS ATTENTION"));
+    assert_eq!(h.state().active.as_deref(), Some(ctx.as_str()), "the kubeconfig's current context is opened");
+    assert_eq!(h.state().window_title(), format!("Skiff — {ctx}"));
+    assert!(!has_label(&h, "Welcome to Skiff"));
+
+    // A context that goes away takes its (inactive) session with it, but
+    // the cluster in use stays connected.
+    let text = std::fs::read_to_string(&missing).unwrap().replace("name: scale", "name: scale-renamed");
+    std::fs::write(&missing, text).unwrap();
+    assert!(h.state_mut().reload_kubeconfig_if_changed());
+    settle(&mut h, "change notice", |h| has_label_containing(h, "Kubeconfig changed"));
+    assert_eq!(h.state().active.as_deref(), Some(ctx.as_str()));
+    assert!(h.state().contexts.items.iter().any(|c| c.name == "scale-renamed"));
+    assert!(has_label_containing(&h, "NEEDS ATTENTION"), "the open cluster is still shown");
+}
+
+#[test]
+fn a_broken_kubeconfig_is_listed_and_a_good_one_can_be_added() {
+    let dir = scratch("broken");
+    let broken = dir.join("broken.yaml");
+    std::fs::write(&broken, "clusters: [this is: not, a kubeconfig\n").unwrap();
+    let empty = dir.join("empty.yaml");
+    std::fs::write(&empty, "apiVersion: v1\nkind: Config\n").unwrap();
+    let opts = AppOptions { kubeconfigs: vec![broken.clone(), empty.clone(), dir.join("missing.yaml")], ..Default::default() };
+    let mut h = harness_config(opts, &dir, "{}", [1280.0, 800.0]);
+    steps(&mut h, 4);
+    assert!(has_label(&h, "Welcome to Skiff"));
+    assert!(has_label(&h, "can't be used"), "the broken file is called out");
+    assert!(has_label(&h, "no contexts") && has_label(&h, "not found"));
+    assert_eq!(h.state().kubeconfig_report().problems.len(), 1);
+    let message = h.state().kubeconfig_report().problems[0].message.clone();
+    assert!(has_label(&h, &message), "its problem is shown: {message}");
+    shot(&mut h, "32_welcome_broken_file");
+
+    // Without a desktop file dialog (as here), the file is named by path.
+    h.get_by_label_contains("Add kubeconfig file").click();
+    settle(&mut h, "path dialog", |h| has_label_containing(h, "Enter the path"));
+    h.get_by_role(Role::TextInput).type_text(&dir.join("nowhere.yaml").display().to_string());
+    steps(&mut h, 2);
+    h.get_by_label("Add").click();
+    settle(&mut h, "refusal", |h| has_label_containing(h, "There is no file at"));
+    shot(&mut h, "33_add_kubeconfig_dialog");
+    assert!(h.state().contexts.items.is_empty());
+
+    let Some(ctx) = test_context() else { return };
+    let good = workspace().join("hack/kubeconfig").canonicalize().unwrap();
+    h.state_mut().dialog = None;
+    h.state_mut().add_kubeconfig(&good.display().to_string()).expect("a good kubeconfig is accepted");
+    settle(&mut h, "the cluster to open", |h| has_label_containing(h, "NEEDS ATTENTION"));
+    assert_eq!(h.state().active.as_deref(), Some(ctx.as_str()));
+    assert!(has_label_containing(&h, "Added 2 clusters"));
+    // Saved, and without dropping what was read before.
+    let saved = config_json(&dir);
+    let list: Vec<&str> = saved["kubeconfigs"].as_array().expect("kubeconfigs saved").iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(list.last().copied(), Some(good.to_str().unwrap()), "{list:?}");
+    assert!(list.len() >= 2, "the default sources are kept next to the new file: {list:?}");
+    // The files that could not be used are still pointed out, in the menu.
+    open_cluster_menu(&mut h, &ctx);
+    assert!(has_label_containing(&h, "can't be used"));
+    shot(&mut h, "34_cluster_menu_with_problem");
+}
+
+#[test]
+fn an_unreachable_cluster_says_so_on_every_page() {
+    let dir = scratch("offline");
+    let file = dir.join("offline.yaml");
+    std::fs::write(&file, offline_kubeconfig("offline", true)).unwrap();
+    for (view, name) in [(Some("pods"), "35_unreachable"), (None, "36_unreachable_overview")] {
+        let opts = AppOptions { kubeconfigs: vec![file.clone()], view: view.map(String::from), ..Default::default() };
+        let mut h = harness_opts(opts, [1280.0, 800.0]);
+        settle(&mut h, "failure page", |h| has_label(h, "Can't connect to offline"));
+        assert!(has_label_containing(&h, "Connection refused"), "what happened");
+        assert!(has_label_containing(&h, "Check that the cluster is running"), "what to do about it");
+        assert!(has_label(&h, "https://127.0.0.1:1"), "the address that was tried");
+        assert!(has_label_containing(&h, "Retry") && has_label_containing(&h, "Copy details"));
+        assert!(has_label_containing(&h, "Reconnect"), "the top bar offers it as well");
+        assert!(has_label(&h, "TLS not verified"), "an insecure context is marked");
+        assert!(!has_label(&h, "NEEDS ATTENTION"), "no numbers for a cluster that cannot be seen");
+        assert_eq!(h.state().window_title(), "Skiff — offline");
+        shot(&mut h, name);
+        h.get_by_label_contains("Copy details").click();
+        settle(&mut h, "copied", |h| has_label(h, "Copied the connection details"));
+        // Retrying goes through "connecting" back to the same page.
+        h.get_by_label_contains("Retry").click();
+        settle(&mut h, "failure page again", |h| has_label(h, "Can't connect to offline"));
+    }
+    // The light theme, and the words in the switcher's tooltip.
+    let opts = AppOptions { kubeconfigs: vec![file], view: Some("pods".into()), light: true, ..Default::default() };
+    let mut h = harness_opts(opts, [1280.0, 800.0]);
+    settle(&mut h, "failure page", |h| has_label(h, "Can't connect to offline"));
+    shot(&mut h, "37_unreachable_light");
+}
+
+#[test]
+fn a_read_only_cluster_offers_no_changes() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("readonly");
+    let json = format!(r#"{{"clusters": {{"{ctx}": {{"read_only": true}}}}}}"#);
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("deployments.apps".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    assert!(h.state().read_only());
+    assert!(has_label(&h, "Read-only"), "the lock is shown next to the cluster name");
+    assert_eq!(is_disabled(&h, "Create resource from YAML"), Some(true));
+
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    for action in ["Scale", "Restart", "Edit YAML", "Delete"] {
+        assert_eq!(is_disabled(&h, action), Some(true), "{action} must be disabled on a read-only cluster");
+    }
+    assert_eq!(is_disabled(&h, "Logs"), Some(false), "reading stays possible");
+    shot(&mut h, "38_read_only_detail");
+
+    // The row menu: the same actions, greyed out.
+    let (name, ns) = h.state().row_at(0).expect("a row");
+    // (The row is the leftmost thing with that name; the panel shows it too.)
+    h.query_all_by_label(&name)
+        .min_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .expect("row")
+        .click_secondary();
+    settle(&mut h, "row menu", |h| h.query_all_by_label_contains("Copy name").count() >= 2);
+    let in_menu = |h: &Harness<'static, SkiffApp>, label: &str| {
+        h.query_all_by_label_contains(label).filter(|n| n.accesskit_node().is_disabled()).count()
+    };
+    assert!(in_menu(&h, "Restart") >= 2 && in_menu(&h, "Delete") >= 2, "the menu's changing actions are disabled too");
+    shot(&mut h, "39_read_only_row_menu");
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+
+    // An attempt that gets past the buttons is refused, by the app and by
+    // the session underneath it.
+    let key = skiff_core::kinds::builtin("apps", "deployments").unwrap().key();
+    let egui_ctx = h.ctx.clone();
+    h.state_mut().run_row_action(&egui_ctx, skiff::table_view::RowAction::Restart, &key, &ns, &name);
+    settle(&mut h, "refusal", |h| has_label_containing(h, "is read-only in Skiff"));
+    let job = h.state().session().unwrap().restart(&key, &ns, &name);
+    let refused = job.take().expect("refused at once, without a request");
+    assert!(refused.is_err_and(|e| e.contains("read-only")));
+    h.state_mut().open_create_dialog();
+    h.step();
+    assert!(h.state().dialog.is_none(), "nothing can be created either");
+
+    // The cluster menu has the switch; turning it off is saved.
+    open_cluster_menu(&mut h, &ctx);
+    assert!(has_label(&h, "Ask before changes") && has_label_containing(&h, "Add kubeconfig file…"));
+    shot(&mut h, "40_cluster_menu_read_only");
+    h.get_all_by_label("Read-only").find(|n| n.accesskit_node().role() == Role::CheckBox).expect("checkbox").click();
+    settle(&mut h, "writable again", |h| !h.state().read_only());
+    assert_eq!(config_json(&dir)["clusters"][&ctx]["read_only"], serde_json::json!(false));
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert_eq!(is_disabled(&h, "Restart"), Some(false));
+
+    // And back on from the palette.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.step();
+    h.get_all_by_role(Role::TextInput).last().expect("palette input").type_text("read-only");
+    steps(&mut h, 3);
+    assert!(has_label(&h, &format!("Make {ctx} read-only")));
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "read-only again", |h| h.state().read_only());
+    assert_eq!(config_json(&dir)["clusters"][&ctx]["read_only"], serde_json::json!(true));
+}
+
+#[test]
+fn changes_are_confirmed_on_a_cluster_that_asks_first() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("confirm");
+    let json = format!(r#"{{"clusters": {{"{ctx}": {{"confirm": true}}}}}}"#);
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("deployments.apps".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "table", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "detail panel", |h| has_label(h, "YAML"));
+    let (name, ns) = {
+        let d = h.state().detail.as_ref().unwrap();
+        (d.name.clone(), d.ns.clone())
+    };
+    let before = kubectl(&["-n", &ns, "get", "deploy", &name, "-o", "jsonpath={.metadata.generation}"]);
+
+    h.get_by_label("Restart").click();
+    settle(&mut h, "question", |h| has_label(h, "Restart Deployment?"));
+    assert!(has_label(&h, &format!("{ns}/{name}")), "the object is named");
+    assert!(has_label(&h, "on cluster") && has_label(&h, &ctx), "the cluster is named");
+    shot(&mut h, "41_confirm_restart");
+    // Cancel is the default: Enter (even held down) does not go ahead.
+    h.key_press(egui::Key::Enter);
+    steps(&mut h, 4);
+    assert!(h.state().confirm.is_none(), "Enter answers with the default, Cancel");
+    assert!(!has_label_containing(&h, "Restarting"));
+    let after = kubectl(&["-n", &ns, "get", "deploy", &name, "-o", "jsonpath={.metadata.generation}"]);
+    assert_eq!(before, after, "nothing was restarted");
+
+    // Scaling asks after the number is chosen.
+    h.get_by_label("Scale").click();
+    settle(&mut h, "replica count", |h| {
+        h.query_all_by_role(Role::TextInput).last().and_then(|n| n.value()).is_some_and(|v| !v.is_empty())
+    });
+    h.get_all_by_label("Scale").last().expect("dialog button").click();
+    settle(&mut h, "question", |h| has_label_containing(h, "Scale Deployment to"));
+    shot(&mut h, "42_confirm_scale");
+    h.get_all_by_label("Cancel").last().unwrap().click();
+    steps(&mut h, 3);
+    assert!(h.state().confirm.is_none() && h.state().dialog.is_none());
+
+    // Applying a manifest asks too, and goes ahead only on a yes.
+    let cm = format!("skiff-ui-confirm-{}", std::process::id());
+    h.state_mut().dialog = Some(skiff::app::Dialog::Create {
+        text: format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {cm}\n  namespace: default\ndata:\n  key: value\n"),
+        pristine: String::new(),
+        context: ctx.clone(),
+        job: None,
+        error: None,
+    });
+    // (The dialog takes a few frames to find its size and place.)
+    steps(&mut h, 8);
+    h.get_by_label("Apply").click();
+    settle(&mut h, "question", |h| has_label(h, "Apply this manifest?"));
+    shot(&mut h, "43_confirm_apply");
+    assert!(kubectl(&["-n", "default", "get", "cm", &cm, "--ignore-not-found", "-o", "name"]).is_empty(), "not applied before the answer");
+    h.get_all_by_label("Apply").last().expect("the confirming button").click();
+    settle(&mut h, "applied", |h| h.state().dialog.is_none() && has_label_containing(h, &cm));
+    assert_eq!(kubectl(&["-n", "default", "get", "cm", &cm, "-o", "jsonpath={.data.key}"]), "value");
+    kubectl(&["-n", "default", "delete", "cm", &cm]);
+}
+
+#[test]
+fn an_apply_conflict_names_the_owners_and_can_be_overridden() {
+    let Some(ctx) = test_context() else { return };
+    let cm = format!("skiff-ui-conflict-{}", std::process::id());
+    let manifest = |mode: &str| {
+        format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {cm}\n  namespace: default\ndata:\n  mode: {mode}\n  other: same\n")
+    };
+    // Someone else (say, Helm) owns the object's fields.
+    let theirs = scratch("conflict").join("theirs.yaml");
+    std::fs::write(&theirs, manifest("theirs")).unwrap();
+    kubectl(&["apply", "--server-side", "--field-manager=helm", "-f", theirs.to_str().unwrap()]);
+    assert_eq!(kubectl(&["-n", "default", "get", "cm", &cm, "-o", "jsonpath={.data.mode}"]), "theirs");
+
+    let mut h = harness_with(&ctx, "configmaps", [1440.0, 900.0], false);
+    settle(&mut h, "table", |h| h.state().table_stats().1);
+    h.state_mut().dialog = Some(skiff::app::Dialog::Create {
+        text: manifest("mine"),
+        pristine: String::new(),
+        context: ctx.clone(),
+        job: None,
+        error: None,
+    });
+    // (The dialog takes a few frames to find its size and place.)
+    steps(&mut h, 8);
+    h.get_by_label("Apply").click();
+    settle(&mut h, "conflict report", |h| has_label(h, "Apply anyway"));
+    assert!(has_label(&h, ".data.mode") && has_label(&h, "helm"), "which field, and whose it is");
+    assert!(has_label_containing(&h, "belong to another manager"));
+    assert_eq!(kubectl(&["-n", "default", "get", "cm", &cm, "-o", "jsonpath={.data.mode}"]), "theirs", "nothing is taken over unasked");
+    shot(&mut h, "44_apply_conflict");
+
+    h.get_by_label("Apply anyway").click();
+    settle(&mut h, "applied", |h| h.state().dialog.is_none());
+    assert_eq!(kubectl(&["-n", "default", "get", "cm", &cm, "-o", "jsonpath={.data.mode}"]), "mine");
+    kubectl(&["-n", "default", "delete", "cm", &cm]);
+}
+
+#[test]
+fn config_problems_are_shown_once_and_can_be_dismissed() {
+    let dir = scratch("notice");
+    let opts = AppOptions { kubeconfigs: vec![dir.join("none.yaml")], ..Default::default() };
+    let json = r#"{"zoom": "big", "updates": {"channel": "weekly"}, "colour": "blue"}"#;
+    let mut h = harness_config(opts, &dir, json, [1280.0, 800.0]);
+    steps(&mut h, 4);
+    assert_eq!(h.state().notices().len(), 1);
+    assert!(has_label_containing(&h, "config.json were ignored"), "the notice names the file");
+    assert!(has_label_containing(&h, "zoom"), "and what was wrong in it");
+    shot(&mut h, "45_config_notice");
+    h.get_by_label("Dismiss").click();
+    steps(&mut h, 3);
+    assert!(h.state().notices().is_empty());
+    assert!(!has_label_containing(&h, "were ignored"));
+}
+
+// ---------------------------------------------------------------------
+// Settings, About, keyboard help, zoom, accessibility
+
+/// Opens the Settings window on a section.
+fn open_settings(h: &mut Harness<'static, SkiffApp>, section: skiff::settings::Section) {
+    h.state_mut().open_settings(section);
+    settle(h, "settings window", |h| has_label(h, "Close settings"));
+}
+
+/// Runs frames until the app puts text on the clipboard, and returns it.
+fn step_until_copied(h: &mut Harness<'static, SkiffApp>) -> String {
+    for _ in 0..40 {
+        h.step();
+        let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+        if let Some(text) = copied {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("nothing was copied");
+}
+
+/// A kubeconfig whose one context signs in with a credential plugin.
+fn plugin_kubeconfig(context: &str, command: &str) -> String {
+    format!(
+        "apiVersion: v1\nkind: Config\nclusters:\n- name: c-{context}\n  cluster:\n    server: https://127.0.0.1:1\n\
+         contexts:\n- name: {context}\n  context:\n    cluster: c-{context}\n    user: u-{context}\nusers:\n- name: u-{context}\n  user:\n    exec:\n      \
+         apiVersion: client.authentication.k8s.io/v1beta1\n      command: {command}\n      args: [eks, get-token]\n"
+    )
+}
+
+/// The labels of buttons that have no name a screen reader could say:
+/// nothing at all, or only an icon glyph.
+fn unnamed_buttons(h: &Harness<'static, SkiffApp>) -> Vec<String> {
+    let glyph = |c: char| ('\u{e000}'..='\u{f8ff}').contains(&c) || c >= '\u{f0000}';
+    h.query_all_by_role(Role::Button)
+        .filter_map(|n| {
+            let label = n.accesskit_node().label().unwrap_or_default();
+            let bare = label.chars().filter(|c| !c.is_whitespace()).all(glyph);
+            bare.then(|| format!("{label:?} at {:?}", n.rect()))
+        })
+        .collect()
+}
+
+/// The dev clusters' kubeconfig, as an absolute path without `..`.
+fn dev_kubeconfig() -> String {
+    let path = std::env::var("SKIFF_TEST_KUBECONFIG").map(PathBuf::from).unwrap_or_else(|_| workspace().join("hack/kubeconfig"));
+    path.canonicalize().unwrap_or(path).display().to_string()
+}
+
+#[test]
+fn settings_window_shows_and_saves_every_section() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("settings");
+    // A list of kubeconfigs of every kind: used, with a credential plugin
+    // that is not installed, broken, and missing.
+    let eks = dir.join("eks.yaml");
+    std::fs::write(&eks, plugin_kubeconfig("eks-prod", "skiff-test-aws")).unwrap();
+    let broken = dir.join("broken.yaml");
+    std::fs::write(&broken, "clusters: [unclosed").unwrap();
+    let missing = dir.join("staging.yaml");
+    let entries = [dev_kubeconfig(), eks.display().to_string(), broken.display().to_string(), missing.display().to_string()];
+    let json = serde_json::json!({ "kubeconfigs": entries }).to_string();
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("pods".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+
+    // The gear in the top bar opens it; Esc closes it; so does Ctrl+,.
+    h.get_by_label_contains("Settings  (").click();
+    settle(&mut h, "settings window", |h| has_label(h, "Close settings"));
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert!(h.state().settings.is_none(), "Esc closes the window");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Comma);
+    settle(&mut h, "settings window", |h| has_label(h, "Close settings"));
+
+    // Appearance: the theme applies at once and is saved.
+    assert!(has_label(&h, "Theme") && has_label(&h, "Zoom"));
+    shot(&mut h, "50_settings_appearance");
+    h.get_by_label("Light").click();
+    settle(&mut h, "light theme", |h| !h.state().pal.dark);
+    assert_eq!(config_json(&dir)["theme"], "light");
+    shot(&mut h, "51_settings_appearance_light");
+    h.get_by_label("System").click();
+    steps(&mut h, 3);
+    assert_eq!(config_json(&dir)["theme"], "system");
+    assert!(h.state().pal.dark, "a system that does not say is taken as dark");
+    // "System" follows the computer while Skiff runs.
+    h.input_mut().system_theme = Some(egui::Theme::Light);
+    steps(&mut h, 3);
+    assert!(!h.state().pal.dark, "the system switched to light");
+    assert!(has_label_containing(&h, "which is set to light now"));
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    steps(&mut h, 3);
+    assert!(h.state().pal.dark);
+    h.get_by_label("Dark").click();
+    steps(&mut h, 3);
+    assert_eq!(config_json(&dir)["theme"], "dark");
+
+    // Zoom: the buttons step it, and it is saved.
+    h.get_by_label("Zoom in").click();
+    settle(&mut h, "zoom", |h| (h.ctx.zoom_factor() - 1.1).abs() < 0.001);
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(1.1));
+    assert!(has_label(&h, "110%"));
+    h.get_by_label("Reset").click();
+    settle(&mut h, "zoom reset", |h| (h.ctx.zoom_factor() - 1.0).abs() < 0.001);
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(1.0));
+
+    // Clusters: the files in effect and what became of each.
+    h.get_by_label("Clusters").click();
+    steps(&mut h, 4);
+    for expected in ["2 contexts", "1 context", "can't be used", "not found", "which was not found"] {
+        assert!(has_label_containing(&h, expected), "missing {expected:?}");
+    }
+    shot(&mut h, "52_settings_clusters");
+    // Protection is per cluster, saved, and applied to the open one.
+    h.get_by_label(&format!("{ctx} is read-only")).click();
+    settle(&mut h, "read-only", |h| h.state().read_only());
+    assert_eq!(config_json(&dir)["clusters"][&ctx]["read_only"], serde_json::json!(true));
+    assert_eq!(is_disabled(&h, &format!("Ask before changes to {ctx}")), Some(true), "nothing to ask while read-only");
+    h.get_by_label(&format!("{ctx} is read-only")).click();
+    settle(&mut h, "writable", |h| !h.state().read_only());
+    h.get_by_label("Ask before changes to eks-prod").scroll_to_me();
+    steps(&mut h, 3);
+    h.get_by_label("Ask before changes to eks-prod").click();
+    steps(&mut h, 3);
+    assert_eq!(config_json(&dir)["clusters"]["eks-prod"]["confirm"], serde_json::json!(true));
+    // A file can be taken off the list.
+    h.get_by_label(&format!("Remove {} from the list", missing.display())).click();
+    settle(&mut h, "entry removed", |h| !has_label_containing(h, "staging.yaml"));
+    assert_eq!(config_json(&dir)["kubeconfigs"].as_array().map(Vec::len), Some(3));
+    h.get_by_label(&format!("Remove {} from the list", eks.display())).click();
+    settle(&mut h, "cluster gone", |h| !has_label_containing(h, "eks-prod"));
+    assert!(h.state().contexts.items.iter().all(|c| c.name != "eks-prod"));
+    assert!(h.state().session().is_some(), "the open cluster stays open");
+    // "Add file" asks for one (by path here: no file dialog in a test).
+    h.get_by_label_contains("Add file…").click();
+    settle(&mut h, "path dialog", |h| has_label(h, "Add kubeconfig file"));
+    h.get_all_by_role(Role::TextInput).last().expect("path field").type_text(&eks.display().to_string());
+    h.step();
+    h.get_by_label("Add").click();
+    settle(&mut h, "cluster back", |h| has_label_containing(h, "eks-prod") && h.state().dialog.is_none());
+    assert!(h.state().settings.is_some(), "the window stays open behind the dialog");
+
+    // Updates.
+    h.get_by_label("Updates").click();
+    steps(&mut h, 4);
+    shot(&mut h, "53_settings_updates");
+    h.get_by_label("Nightly").click();
+    steps(&mut h, 3);
+    assert_eq!(config_json(&dir)["updates"]["channel"], "nightly");
+    h.get_all_by_label("Check for updates automatically").find(|n| n.accesskit_node().role() == Role::CheckBox).expect("check box").click();
+    steps(&mut h, 3);
+    assert_eq!(config_json(&dir)["updates"]["check"], serde_json::json!(false));
+
+    // Terminal: saved when the field is left.
+    h.get_by_label("Terminal").click();
+    steps(&mut h, 4);
+    if !cfg!(windows) {
+        let field = h.get_all_by_role(Role::TextInput).last().expect("terminal field");
+        field.focus();
+        field.type_text("kitty");
+        h.step();
+        h.key_press(egui::Key::Enter);
+        steps(&mut h, 3);
+        assert_eq!(config_json(&dir)["terminal"], "kitty");
+    }
+    shot(&mut h, "54_settings_terminal");
+
+    // Files: opening creates what is missing, without touching what is there.
+    h.get_by_label("Files").click();
+    steps(&mut h, 4);
+    shot(&mut h, "55_settings_files");
+    h.get_by_label_contains("Open keys file").click();
+    settle(&mut h, "keys file", |h| has_label_containing(h, "with the standard keys"));
+    let keys = std::fs::read_to_string(dir.join("keys.json")).unwrap();
+    let (_, errors) = skiff::keymap::Keymap::from_json(&keys);
+    assert!(errors.is_empty() && keys.contains("\"help\""), "{keys}");
+    let before = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    h.get_by_label_contains("Open config file").click();
+    steps(&mut h, 3);
+    assert_eq!(std::fs::read_to_string(dir.join("config.json")).unwrap(), before);
+
+    // About.
+    h.get_by_label("About").click();
+    steps(&mut h, 4);
+    for expected in ["Version", "Build", "Commit", "Target", "Licence", "MIT", "Repository", "Releases", "Report a problem", "Third-party licences"] {
+        assert!(has_label_containing(&h, expected), "missing {expected:?}");
+    }
+    shot(&mut h, "56_settings_about");
+    h.get_by_label_contains("Copy version info").click();
+    let info = step_until_copied(&mut h);
+    assert!(info.starts_with(&format!("Skiff {}", env!("CARGO_PKG_VERSION"))) && info.contains("Target: "), "{info}");
+    assert!(info.contains("Update channel: nightly"));
+    assert!(unnamed_buttons(&h).is_empty(), "{:?}", unnamed_buttons(&h));
+
+    h.get_by_label("Close settings").click();
+    steps(&mut h, 3);
+    assert!(h.state().settings.is_none());
+}
+
+#[test]
+fn settings_in_the_light_theme_and_from_the_palette() {
+    use skiff::settings::Section;
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("settings-light");
+    let eks = dir.join("eks.yaml");
+    std::fs::write(&eks, plugin_kubeconfig("eks-prod", "skiff-test-aws")).unwrap();
+    let json = serde_json::json!({
+        "theme": "light",
+        "kubeconfigs": [dev_kubeconfig(), eks.display().to_string()],
+        "clusters": { "eks-prod": { "read_only": true } },
+    })
+    .to_string();
+    let opts = AppOptions { context: Some(ctx.clone()), view: Some("pods".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    assert!(!h.state().pal.dark, "the config file's theme applies from the start");
+
+    // From the palette.
+    for (query, title, section) in [("about", "About", Section::About), ("cluster settings", "Clusters", Section::Clusters)] {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.step();
+        h.get_all_by_role(Role::TextInput).last().expect("palette input").type_text(query);
+        steps(&mut h, 3);
+        h.key_press(egui::Key::Enter);
+        settle(&mut h, "settings window", |h| has_label(h, "Close settings"));
+        assert_eq!(h.state().settings.as_ref().map(|s| s.section), Some(section), "{title}");
+        shot(&mut h, if section == Section::About { "57_settings_about_light" } else { "58_settings_clusters_light" });
+        h.key_press(egui::Key::Escape);
+        steps(&mut h, 3);
+    }
+    open_settings(&mut h, Section::Updates);
+    shot(&mut h, "59_settings_updates_light");
+}
+
+#[test]
+fn keyboard_help_lists_the_live_keymap() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+
+    // "?" opens it (Shift+/ on most keyboards), "?" or Esc closes it.
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Questionmark);
+    settle(&mut h, "help", |h| has_label(h, "Keyboard shortcuts"));
+    for expected in ["EVERYWHERE", "MOVING AROUND", "TABLES", "DETAILS", "LOGS", "SHELL", "Search or jump to anything", "Filter the table"] {
+        assert!(has_label_containing(&h, expected), "missing {expected:?}");
+    }
+    assert!(has_label(&h, "j") && has_label(&h, "Shift+G") && has_label(&h, "?"));
+    shot(&mut h, "60_keyboard_help");
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Questionmark);
+    steps(&mut h, 3);
+    assert!(!h.state().help_open, "the same key closes it");
+
+    // Custom bindings are what is shown, and what works.
+    let (keymap, errors) = skiff::keymap::Keymap::from_json(r#"{ "down": ["n"], "help": ["F1"], "filter": [] }"#);
+    assert!(errors.is_empty());
+    h.state_mut().keymap = keymap;
+    h.key_press(egui::Key::Questionmark);
+    steps(&mut h, 3);
+    assert!(!h.state().help_open, "? is no longer bound");
+    h.key_press(egui::Key::F1);
+    settle(&mut h, "help", |h| has_label(h, "Keyboard shortcuts"));
+    assert!(has_label(&h, "n") && has_label(&h, "F1") && has_label(&h, "not set") && !has_label(&h, "j"));
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+    assert!(!h.state().help_open);
+    h.state_mut().keymap = skiff::keymap::Keymap::default();
+
+    // In a text field "?" is a character.
+    h.key_press(egui::Key::Slash);
+    h.step();
+    h.get_by_role(Role::TextInput).type_text("?");
+    h.key_press(egui::Key::Questionmark);
+    steps(&mut h, 3);
+    assert!(!h.state().help_open, "typing ? into the filter does not open the list");
+    h.key_press(egui::Key::Escape);
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+
+    // The palette has it too.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.step();
+    h.get_all_by_role(Role::TextInput).last().expect("palette input").type_text("keyboard");
+    steps(&mut h, 3);
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "help", |h| h.state().help_open && has_label(h, "Keyboard shortcuts"));
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 3);
+
+    let mut light = harness_with(&ctx, "pods", [1100.0, 760.0], true);
+    settle(&mut light, "pods to load", |h| has_label(h, "alertmanager-0"));
+    light.state_mut().open_help();
+    settle(&mut light, "help", |h| has_label(h, "Keyboard shortcuts"));
+    shot(&mut light, "61_keyboard_help_light");
+}
+
+#[test]
+fn first_run_hint_points_at_the_palette_and_the_shortcuts() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "overview", [1440.0, 900.0]);
+    settle(&mut h, "overview", |h| has_label_containing(h, "to search or jump to anything"));
+    assert!(has_label(&h, "?") && has_label(&h, "Dismiss this hint"));
+    shot(&mut h, "62_overview_first_run_hint");
+    // Using what it points at is enough to make it go away.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    steps(&mut h, 2);
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 4);
+    assert!(!has_label_containing(&h, "to search or jump to anything"));
+
+    let mut h = harness_with(&ctx, "overview", [1440.0, 900.0], true);
+    settle(&mut h, "overview", |h| has_label_containing(h, "to search or jump to anything"));
+    shot(&mut h, "63_overview_first_run_hint_light");
+    h.get_by_label("Dismiss this hint").click();
+    steps(&mut h, 3);
+    assert!(!has_label_containing(&h, "to search or jump to anything"));
+}
+
+/// The app in a window of `window` pixels at a zoom factor (from the
+/// config file, as at startup).
+fn zoomed(dir: &std::path::Path, ctx: &str, zoom: f32, window: [f32; 2], light: bool) -> Harness<'static, SkiffApp> {
+    let json = serde_json::json!({ "zoom": zoom, "theme": if light { "light" } else { "dark" } }).to_string();
+    let opts = AppOptions { context: Some(ctx.to_string()), view: Some("pods".into()), ..Default::default() };
+    // (The harness is sized in points: a window of this many pixels.)
+    harness_config(opts, dir, &json, [window[0] / zoom, window[1] / zoom])
+}
+
+#[test]
+fn zoom_keeps_tables_dialogs_and_the_shell_laid_out() {
+    let Some(ctx) = test_context() else { return };
+    for (zoom, tag) in [(0.8_f32, "080"), (1.25, "125"), (1.5, "150")] {
+        let dir = scratch(&format!("zoom-{tag}"));
+        let mut h = zoomed(&dir, &ctx, zoom, [1440.0, 900.0], zoom == 1.25);
+        settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+        assert!((h.ctx.zoom_factor() - zoom).abs() < 0.001, "the config file's zoom applies from the start");
+        assert!((h.ctx.pixels_per_point() - zoom).abs() < 0.001);
+        let screen = h.ctx.content_rect();
+        let inside = |h: &Harness<'static, SkiffApp>, label: &str| {
+            let rect = h.query_all_by_label(label).next().unwrap_or_else(|| panic!("no {label:?}")).rect();
+            assert!(screen.contains_rect(rect), "{label:?} at {rect:?} is outside the window {screen:?} at zoom {zoom}");
+        };
+
+        // Table and details.
+        h.get_by_label("alertmanager-0").click();
+        settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+        for label in ["alertmanager-0", "Logs", "Shell", "Close (Esc)", "Create resource from YAML"] {
+            inside(&h, label);
+        }
+        shot(&mut h, &format!("64_zoom_{tag}_table_and_details"));
+
+        // A shell: the terminal's grid follows the zoom.
+        h.get_by_label("Shell").click();
+        settle(&mut h, "shell to connect", |h| has_label(h, "connected"));
+        h.get_by_label("Terminal").type_text("echo zoom-$((6*7))");
+        h.key_press(egui::Key::Enter);
+        settle(&mut h, "command output", |h| {
+            h.state().dock.shell_screen().unwrap_or_default().lines().any(|l| l.trim() == "zoom-42")
+        });
+        inside(&h, "Terminal");
+        shot(&mut h, &format!("65_zoom_{tag}_shell"));
+
+        // A dialog, and the Settings window.
+        h.state_mut().palette = None;
+        h.state_mut().open_create_dialog();
+        settle(&mut h, "create dialog", |h| has_label(h, "Apply"));
+        inside(&h, "Apply");
+        inside(&h, "Cancel");
+        shot(&mut h, &format!("66_zoom_{tag}_dialog"));
+        h.get_by_label("Cancel").click();
+        steps(&mut h, 3);
+        open_settings(&mut h, skiff::settings::Section::Appearance);
+        inside(&h, "Close settings");
+        inside(&h, "About");
+        inside(&h, "Reset");
+        assert!(has_label(&h, &format!("{}%", (zoom * 100.0).round() as i32)));
+        shot(&mut h, &format!("67_zoom_{tag}_settings"));
+        h.key_press(egui::Key::Escape);
+        steps(&mut h, 3);
+    }
+}
+
+#[test]
+fn zoom_shortcuts_step_clamp_and_persist() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("zoom-keys");
+    let opts = AppOptions { context: Some(ctx), view: Some("pods".into()), ..Default::default() };
+    let mut h = harness_config(opts, &dir, "{}", [1440.0, 900.0]);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+    let cmd = egui::Modifiers::COMMAND;
+    let zoom = |h: &Harness<'static, SkiffApp>| (h.ctx.zoom_factor() * 100.0).round() as i32;
+
+    h.key_press_modifiers(cmd, egui::Key::Equals);
+    steps(&mut h, 3);
+    assert_eq!(zoom(&h), 110);
+    assert!(has_label(&h, "Zoom 110%"), "the new size is said");
+    // (Ctrl and + on a keyboard where + needs Shift.)
+    h.key_press_modifiers(cmd | egui::Modifiers::SHIFT, egui::Key::Plus);
+    steps(&mut h, 3);
+    assert_eq!(zoom(&h), 125);
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(1.25));
+    h.key_press_modifiers(cmd, egui::Key::Minus);
+    steps(&mut h, 3);
+    assert_eq!(zoom(&h), 110);
+    h.key_press_modifiers(cmd, egui::Key::Num0);
+    steps(&mut h, 3);
+    assert_eq!(zoom(&h), 100);
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(1.0));
+
+    // The ends of the range hold.
+    for _ in 0..12 {
+        h.key_press_modifiers(cmd, egui::Key::Minus);
+        steps(&mut h, 2);
+    }
+    assert_eq!(zoom(&h), 50);
+    for _ in 0..20 {
+        h.key_press_modifiers(cmd, egui::Key::Equals);
+        steps(&mut h, 2);
+    }
+    assert_eq!(zoom(&h), 300);
+    assert_eq!(config_json(&dir)["zoom"], serde_json::json!(3.0));
+
+    // A change made in the file is picked up when Skiff gets the focus back.
+    std::fs::write(dir.join("config.json"), r#"{ "zoom": 1.5, "theme": "light" }"#).unwrap();
+    assert!(h.state_mut().reload_settings_if_changed());
+    steps(&mut h, 3);
+    assert_eq!(zoom(&h), 150);
+    assert!(!h.state().pal.dark);
+    assert!(!h.state_mut().reload_settings_if_changed(), "nothing changed since");
+}
+
+#[test]
+fn a_copied_secret_is_cleared_from_the_clipboard() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness(&ctx, "secrets", [1440.0, 900.0]);
+    settle(&mut h, "secrets to load", |h| h.state().table_stats().1 && h.state().table_stats().0 > 0);
+    h.state_mut().secret_clipboard_time = Duration::from_millis(600);
+    h.key_press(egui::Key::ArrowDown);
+    h.step();
+    h.key_press(egui::Key::Enter);
+    settle(&mut h, "secret details", |h| has_label(h, "Copy decoded value"));
+
+    // The decoded value: copied, announced, and cleared when the time is up.
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    let copied = step_until_copied(&mut h);
+    assert!(!copied.is_empty());
+    assert!(h.state().secret_on_clipboard());
+    steps(&mut h, 2);
+    assert!(has_label_containing(&h, "The clipboard will be cleared in"), "the notification says so");
+    shot(&mut h, "68_secret_copied");
+    std::thread::sleep(Duration::from_millis(650));
+    assert_eq!(step_until_copied(&mut h), "", "the clipboard is cleared");
+    assert!(!h.state().secret_on_clipboard());
+    settle(&mut h, "cleared notice", |h| has_label(h, "Clipboard cleared"));
+
+    // Copying something else from Skiff in the meantime calls it off:
+    // that is not ours to clear.
+    h.get_all_by_label("Copy decoded value").next().expect("copy button").click();
+    step_until_copied(&mut h);
+    assert!(h.state().secret_on_clipboard());
+    let (name, _) = h.state().selected_row().expect("selected secret");
+    let key = skiff_core::kinds::builtin("", "secrets").unwrap().key();
+    let (row_name, ns) = (name.clone(), h.state().selected_row().unwrap().1);
+    let egui_ctx = h.ctx.clone();
+    h.state_mut().run_row_action(&egui_ctx, skiff::table_view::RowAction::CopyName, &key, &ns, &row_name);
+    assert_eq!(step_until_copied(&mut h), name);
+    assert!(!h.state().secret_on_clipboard(), "another copy cancels the clearing");
+    std::thread::sleep(Duration::from_millis(650));
+    steps(&mut h, 3);
+    assert!(h.output().platform_output.commands.is_empty(), "nothing is cleared after another copy");
+
+    // The Secret's YAML counts as a secret too.
+    h.get_by_label("YAML").click();
+    settle(&mut h, "yaml tab", |h| has_label_containing(h, "managedFields hidden"));
+    h.query_all_by_role(Role::Button)
+        .find(|n| n.accesskit_node().label().is_some_and(|l| l.trim_end().ends_with("Copy")))
+        .expect("the YAML tab's Copy button")
+        .click();
+    let yaml = step_until_copied(&mut h);
+    assert!(yaml.contains("kind: Secret"));
+    assert!(h.state().secret_on_clipboard());
+    std::thread::sleep(Duration::from_millis(650));
+    assert_eq!(step_until_copied(&mut h), "");
+}
+
+#[test]
+fn keyboard_focus_is_outlined_and_icon_buttons_have_names() {
+    let Some(ctx) = test_context() else { return };
+    for light in [false, true] {
+        let mut h = harness_with(&ctx, "pods", [1440.0, 900.0], light);
+        settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+        h.get_by_label("alertmanager-0").click();
+        settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+        h.get_by_label("Logs").click();
+        settle(&mut h, "logs", |h| h.state().dock.open);
+        steps(&mut h, 6);
+        assert!(unnamed_buttons(&h).is_empty(), "buttons without a name: {:?}", unnamed_buttons(&h));
+
+        // Tab moves the focus; the focused control is outlined.
+        open_settings(&mut h, skiff::settings::Section::Appearance);
+        for _ in 0..3 {
+            h.key_press(egui::Key::Tab);
+            h.step();
+        }
+        steps(&mut h, 2);
+        assert!(h.query_all_by_role(Role::Button).chain(h.query_all_by_role(Role::Tab)).chain(h.query_all_by_role(Role::RadioButton)).any(|n| n.is_focused()));
+        assert!(unnamed_buttons(&h).is_empty(), "buttons without a name: {:?}", unnamed_buttons(&h));
+        shot(&mut h, if light { "70_focus_outline_light" } else { "69_focus_outline" });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics charts, firing alerts and Grafana links. The demo cluster's
+// Prometheus is `hack/fake-prometheus.py` behind the Service
+// monitoring/prometheus-operated, reached through the API server's proxy.
+
+/// Whether the demo cluster has its (fake) Prometheus; the tests that need
+/// it are skipped otherwise.
+fn demo_has_prometheus() -> bool {
+    let path = "/api/v1/namespaces/monitoring/services/http:prometheus-operated:9090/proxy/api/v1/query?query=vector(1)";
+    let ok = kubectl(&["get", "--raw", path]).contains("success");
+    if !ok {
+        eprintln!("skipping: no Prometheus in the demo cluster (run hack/cluster-up.sh)");
+    }
+    ok
+}
+
+/// A pod that stays: one of kube-system's kube-proxy pods. (The test bed
+/// keeps deleting pods in the application namespaces.)
+fn steady_pod() -> String {
+    let out = kubectl(&["-n", "kube-system", "get", "pods", "-o", "name"]);
+    let mut names: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("pod/")).filter(|n| n.starts_with("kube-proxy-")).collect();
+    names.sort();
+    names.first().expect("a kube-proxy pod").to_string()
+}
+
+fn in_namespace(context: &str, view: &str, namespace: &str, light: bool) -> Harness<'static, SkiffApp> {
+    let opts = AppOptions {
+        context: Some(context.to_string()),
+        view: Some(view.to_string()),
+        light,
+        namespace: Some(namespace.to_string()),
+        ..Default::default()
+    };
+    harness_opts(opts, [1440.0, 900.0])
+}
+
+/// Opens the Metrics tab of the object in the table row called `name`
+/// and waits for `loaded` to be on screen.
+fn open_metrics(h: &mut Harness<'static, SkiffApp>, name: &str, loaded: &str) {
+    settle(h, "the row", |h| has_label(h, name));
+    h.query_all_by_label(name).min_by(|a, b| a.rect().left().total_cmp(&b.rect().left())).expect("row").click();
+    settle(h, "detail panel", |h| has_label(h, "Metrics"));
+    h.get_by_label("Metrics").click();
+    let what = format!("metrics to show {loaded:?}");
+    settle(h, &what, |h| has_label_containing(h, loaded));
+    steps(h, 4);
+}
+
+/// Puts the pointer into the plot of the chart titled `title` in the
+/// detail panel (the rightmost thing with that label).
+fn hover_chart(h: &mut Harness<'static, SkiffApp>, title: &str, across: f32) {
+    let rect = h
+        .query_all_by_label(title)
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .expect("chart title")
+        .rect();
+    h.hover_at(egui::pos2(rect.left() + across, rect.bottom() + 80.0));
+    steps(h, 3);
+}
+
+const LOADED: &str = "one point every";
+
+#[test]
+fn pod_metrics_come_from_prometheus_through_the_api_server() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" || !demo_has_prometheus() {
+        return;
+    }
+    let pod = steady_pod();
+    for light in [false, true] {
+        let mut h = in_namespace(&ctx, "pods", "kube-system", light);
+        open_metrics(&mut h, &pod, LOADED);
+        // The source is named, and every chart of a pod is there.
+        assert!(has_label_containing(&h, "Prometheus · monitoring/prometheus-operated"));
+        for title in ["CPU", "Memory", "Network", "Restarts"] {
+            assert!(has_label(&h, title), "{title} chart");
+        }
+        assert!(!has_label(&h, "Open in Grafana"), "no Grafana link unless one is configured");
+        shot(&mut h, if light { "81_pod_metrics_light" } else { "80_pod_metrics" });
+
+        if !light {
+            hover_chart(&mut h, "CPU", 250.0);
+            // The readout names the container and the reference lines.
+            assert!(has_label_containing(&h, " · kube-proxy ") && has_label_containing(&h, " · request 50m"));
+            assert!(has_label_containing(&h, " · limit 200m"));
+            shot(&mut h, "82_pod_metrics_hover");
+            h.hover_at(egui::pos2(5.0, 5.0));
+            steps(&mut h, 2);
+
+            // Another range loads its own data and is remembered.
+            h.get_by_label("24h").click();
+            settle(&mut h, "the 24h range", |h| has_label_containing(h, "one point every 15 min"));
+            shot(&mut h, "83_pod_metrics_24h");
+            h.get_by_label("7d").click();
+            settle(&mut h, "the 7d range", |h| has_label_containing(h, "one point every 2 h"));
+            hover_chart(&mut h, "Memory", 120.0);
+            shot(&mut h, "84_pod_metrics_7d");
+        }
+    }
+}
+
+#[test]
+fn workload_and_node_metrics() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" || !demo_has_prometheus() {
+        return;
+    }
+    // A deployment: one line per pod.
+    let mut h = in_namespace(&ctx, "deployments.apps", "payments", false);
+    open_metrics(&mut h, "gateway", LOADED);
+    hover_chart(&mut h, "Memory", 300.0);
+    // (Any of them: the test bed replaces pods all the time.)
+    assert!(has_label_containing(&h, " · gateway-"), "the readout lists the pods by their full names");
+    shot(&mut h, "85_deployment_metrics");
+
+    // A crash-looping workload: restarts show up. (A tall window, so
+    // that all four charts are in the picture.)
+    let opts = AppOptions {
+        context: Some(ctx.clone()),
+        view: Some("deployments.apps".to_string()),
+        light: true,
+        namespace: Some("payments".to_string()),
+        ..Default::default()
+    };
+    let mut h = harness_opts(opts, [1440.0, 1100.0]);
+    open_metrics(&mut h, "fraud-detector", LOADED);
+    shot(&mut h, "86_deployment_metrics_crashloop_light");
+
+    // A node: usage against what is allocatable.
+    let mut h = harness(&ctx, "nodes", [1440.0, 900.0]);
+    open_metrics(&mut h, "demo-worker-1", LOADED);
+    assert!(has_label(&h, "Pod network") && !has_label(&h, "Restarts"));
+    hover_chart(&mut h, "CPU", 200.0);
+    assert!(has_label_containing(&h, " · allocatable 16 cores"));
+    shot(&mut h, "87_node_metrics");
+
+    // A kind without metrics has no such tab, and a tab carried over
+    // from one that has falls back to the overview.
+    assert_eq!(h.state().detail.as_ref().map(|d| d.tabs().len()), Some(4));
+    let cm = skiff_core::kinds::builtin("", "configmaps").unwrap().key();
+    h.state_mut().open_object(&cm, "kube-system", "kube-root-ca.crt");
+    settle(&mut h, "the config map", |h| has_label_containing(h, "DATA"));
+    assert!(!has_label(&h, "Metrics"));
+}
+
+#[test]
+fn firing_alerts_on_the_overview_lead_to_their_objects() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" || !demo_has_prometheus() {
+        return;
+    }
+    for light in [false, true] {
+        let mut h = harness_with(&ctx, "overview", [1440.0, 900.0], light);
+        settle(&mut h, "alerts", |h| has_label_containing(h, "FIRING ALERTS · "));
+        // Critical first; pending alerts and the Watchdog are not shown.
+        assert!(has_label(&h, "KubeNodeNotReady") && has_label(&h, "KubeDeploymentReplicasMismatch"));
+        assert!(!has_label(&h, "Watchdog") && !has_label(&h, "KubeMemoryOvercommit"));
+        // The top bar counts what is critical or a warning (not "info").
+        assert!(has_label(&h, "6 alerts"), "badge");
+        shot(&mut h, if light { "89_overview_alerts_light" } else { "88_overview_alerts" });
+    }
+
+    // An alert names its object; the link opens it, and the object's own
+    // panel shows the alert. (The alert also carries the `pod` label of
+    // kube-state-metrics, which must not win.)
+    let mut h = harness(&ctx, "overview", [1440.0, 900.0]);
+    settle(&mut h, "alerts", |h| has_label_containing(h, "FIRING ALERTS · "));
+    // (The alerts come first on the page; "Needs attention" lists it too.)
+    h.query_all_by_label("ledger").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).expect("link").click();
+    settle(&mut h, "the deployment", |h| has_label_containing(h, "firing for"));
+    assert_eq!(h.state().view_id(), "deployments.apps");
+    let detail = h.state().detail.as_ref().expect("detail");
+    assert_eq!((&*detail.ns, &*detail.name), ("payments", "ledger"));
+    shot(&mut h, "90_alert_on_its_object");
+
+    // A node known to the alert by `instance` only is found too.
+    h.get_by_label("6 alerts").click();
+    settle(&mut h, "back on the overview", |h| has_label_containing(h, "FIRING ALERTS · "));
+    h.query_all_by_label("demo-worker-2").min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).expect("link").click();
+    settle(&mut h, "the node", |h| has_label(h, "NodeFilesystemAlmostOutOfSpace") && has_label_containing(h, "firing for"));
+    assert_eq!(h.state().view_id(), "nodes");
+
+    // With a namespace selected, alerts of other namespaces are left out;
+    // cluster-level ones stay.
+    let mut h = in_namespace(&ctx, "overview", "payments", false);
+    settle(&mut h, "alerts", |h| has_label_containing(h, "FIRING ALERTS · "));
+    assert!(has_label(&h, "KubeNodeNotReady") && has_label(&h, "KubeDeploymentReplicasMismatch"));
+    assert!(!has_label(&h, "CPUThrottlingHigh") && !has_label(&h, "TargetDown"));
+}
+
+#[test]
+fn without_prometheus_usage_is_charted_from_metrics_server() {
+    if !use_test_kubeconfig() || !kubectl(&["--context", "scale", "get", "--raw", "/readyz"]).contains("ok") {
+        eprintln!("skipping: the scale cluster is not running");
+        return;
+    }
+    let mut h = harness("scale", "nodes", [1440.0, 900.0]);
+    settle(&mut h, "nodes", |h| h.state().row_at(0).is_some());
+    let (node, _) = h.state().row_at(0).expect("a node");
+    open_metrics(&mut h, &node, "metrics-server · collected since");
+    // Not an error: one quiet line on what Prometheus would add and how
+    // to point Skiff at one.
+    assert!(has_label_containing(&h, "Longer history, network and restarts need Prometheus."));
+    assert!(has_label_containing(&h, "clusters.scale.prometheus"));
+    assert!(has_label(&h, "CPU") && has_label(&h, "Memory") && !has_label(&h, "Network"));
+    assert!(!has_label(&h, "1h"), "no range to choose without history");
+    // A second sample arrives (metrics-server is polled every 15 s).
+    let session = h.state().session().unwrap().clone();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while session.node_usage_history(&node).cpu.len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        h.step();
+    }
+    assert!(session.node_usage_history(&node).cpu.len() >= 2, "history grows while the tab is open");
+    steps(&mut h, 3);
+    shot(&mut h, "91_metrics_without_prometheus");
+
+    // The overview has no alerts section and the top bar no badge.
+    let mut h = harness("scale", "overview", [1440.0, 900.0]);
+    settle(&mut h, "overview", |h| has_label_containing(h, "NEEDS ATTENTION"));
+    steps(&mut h, 20);
+    assert!(!has_label_containing(&h, "FIRING ALERTS") && !has_label_containing(&h, "alerts"));
+}
+
+#[test]
+fn a_prometheus_that_refuses_or_does_not_answer_is_explained() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" || !demo_has_prometheus() {
+        return;
+    }
+    let opts = |view: &str| AppOptions {
+        context: Some(ctx.clone()),
+        view: Some(view.to_string()),
+        namespace: Some("kube-system".to_string()),
+        ..Default::default()
+    };
+    let pod = steady_pod();
+
+    // Configured, but something in front of it says no.
+    let dir = scratch("prom-denied");
+    let json = r#"{"clusters": {"demo": {"prometheus": {"namespace": "monitoring", "service": "prometheus-operated", "path_prefix": "/deny"}}}}"#;
+    let mut h = harness_config(opts("pods"), &dir, json, [1440.0, 900.0]);
+    assert!(h.state().notices().is_empty(), "the config is valid: {:?}", h.state().notices().len());
+    open_metrics(&mut h, &pod, "No access to Prometheus");
+    assert!(has_label_containing(&h, "services/proxy"), "says which permission is missing");
+    // Usage from metrics-server is still charted.
+    settle(&mut h, "the metrics-server charts", |h| has_label_containing(h, "metrics-server · collected since"));
+    shot(&mut h, "92_prometheus_forbidden");
+    // Looking again asks again (and is refused again).
+    h.get_by_label("Look for Prometheus again").click();
+    settle(&mut h, "the second refusal", |h| has_label_containing(h, "No access to Prometheus"));
+
+    // Configured, but there is no such Service.
+    let dir = scratch("prom-missing");
+    let json = r#"{"clusters": {"demo": {"prometheus": {"namespace": "monitoring", "service": "prometheus-elsewhere"}}}}"#;
+    let mut h = harness_config(opts("overview"), &dir, json, [1440.0, 900.0]);
+    settle(&mut h, "the explanation", |h| has_label_containing(h, "Prometheus is not answering"));
+    assert!(has_label_containing(&h, "monitoring/prometheus-elsewhere:9090"), "names the Service that was tried");
+    assert!(!has_label_containing(&h, "alerts"), "no badge without alerts");
+    shot(&mut h, "93_overview_prometheus_unreachable");
+}
+
+#[test]
+fn grafana_link_opens_explore_for_the_object() {
+    let Some(ctx) = test_context() else { return };
+    if ctx != "demo" || !demo_has_prometheus() {
+        return;
+    }
+    let dir = scratch("grafana");
+    let json = r#"{"clusters": {"demo": {"grafana_url": "https://grafana.example.com/"}}}"#;
+    let opts = AppOptions {
+        context: Some(ctx.clone()),
+        view: Some("pods".to_string()),
+        namespace: Some("kube-system".to_string()),
+        ..Default::default()
+    };
+    let mut h = harness_config(opts, &dir, json, [1440.0, 900.0]);
+    let pod = steady_pod();
+    open_metrics(&mut h, &pod, LOADED);
+    shot(&mut h, "94_pod_metrics_grafana");
+    h.get_by_label_contains("Open in Grafana").click();
+    h.step();
+    let opened: Vec<String> = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::OpenUrl(open) => Some(open.url.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].starts_with("https://grafana.example.com/explore?schemaVersion=1&panes=%7B"), "{}", opened[0]);
+    assert!(opened[0].contains(&pod) && opened[0].contains("container_cpu_usage_seconds_total"), "{}", opened[0]);
+    assert!(opened[0].contains("now-1h"));
 }

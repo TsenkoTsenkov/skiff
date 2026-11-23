@@ -46,10 +46,39 @@ pub enum Action {
     PrevTab,
     /// Focus the table filter.
     Filter,
+    /// Show the list of keyboard shortcuts.
+    Help,
+}
+
+/// Where a shortcut applies, for the list of shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    Global,
+    Navigation,
+    Tables,
+    Details,
+    Logs,
+    Shell,
+}
+
+impl Group {
+    pub const ALL: [Group; 6] =
+        [Group::Global, Group::Navigation, Group::Tables, Group::Details, Group::Logs, Group::Shell];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Global => "Everywhere",
+            Group::Navigation => "Moving around",
+            Group::Tables => "Tables",
+            Group::Details => "Details",
+            Group::Logs => "Logs",
+            Group::Shell => "Shell",
+        }
+    }
 }
 
 impl Action {
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::Down,
         Action::Up,
         Action::PageDown,
@@ -62,6 +91,7 @@ impl Action {
         Action::NextTab,
         Action::PrevTab,
         Action::Filter,
+        Action::Help,
     ];
 
     /// The name used in the keymap file.
@@ -79,6 +109,39 @@ impl Action {
             Action::NextTab => "next_tab",
             Action::PrevTab => "prev_tab",
             Action::Filter => "filter",
+            Action::Help => "help",
+        }
+    }
+
+    /// What the action does, for the list of shortcuts.
+    pub fn title(self) -> &'static str {
+        match self {
+            Action::Down => "Next row or sidebar entry",
+            Action::Up => "Previous row or sidebar entry",
+            Action::PageDown => "Down a page",
+            Action::PageUp => "Up a page",
+            Action::Top => "First row",
+            Action::Bottom => "Last row",
+            Action::Open => "Open the selected row or sidebar entry",
+            Action::FocusLeft => "Move to the sidebar",
+            Action::FocusRight => "Back to the table, or open the selected row",
+            Action::NextTab => "Next tab",
+            Action::PrevTab => "Previous tab",
+            Action::Filter => "Filter the table",
+            Action::Help => "Show keyboard shortcuts",
+        }
+    }
+
+    /// Where the action applies.
+    pub fn group(self) -> Group {
+        match self {
+            Action::Down | Action::Up | Action::PageDown | Action::PageUp | Action::Top | Action::Bottom => {
+                Group::Navigation
+            }
+            Action::Open | Action::FocusLeft | Action::FocusRight => Group::Navigation,
+            Action::NextTab | Action::PrevTab => Group::Details,
+            Action::Filter => Group::Tables,
+            Action::Help => Group::Global,
         }
     }
 
@@ -100,6 +163,7 @@ impl Action {
             Action::NextTab => &["]"],
             Action::PrevTab => &["["],
             Action::Filter => &["/"],
+            Action::Help => &["?"],
         }
     }
 }
@@ -141,11 +205,105 @@ impl Binding {
         Ok(Binding { key, mods })
     }
 
+    /// Whether a press of `key` with `modifiers` held is this binding.
+    ///
+    /// A symbol that is typed with Shift on most keyboards (`?`, `+`, `:`)
+    /// matches with or without Shift held: where it sits differs between
+    /// layouts, and whoever binds `?` means the character.
+    pub fn matches(&self, key: Key, modifiers: Modifiers) -> bool {
+        if key != self.key {
+            return false;
+        }
+        let mut held = modifiers;
+        if shifted_symbol(key) && !self.mods.shift {
+            held.shift = false;
+        }
+        held.matches_exact(self.mods)
+    }
+
     fn pressed_in(&self, i: &InputState) -> bool {
-        i.events.iter().any(|e| {
-            matches!(e, Event::Key { key, pressed: true, modifiers, .. }
-                if *key == self.key && modifiers.matches_exact(self.mods))
-        })
+        i.events
+            .iter()
+            .any(|e| matches!(e, Event::Key { key, pressed: true, modifiers, .. } if self.matches(*key, *modifiers)))
+    }
+
+    /// The binding as it is shown to the user: `j`, `Shift+G`, `Ctrl+D`,
+    /// `↓`. `mac` names the modifiers the way a Mac keyboard does.
+    pub fn label(&self, mac: bool) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        let m = self.mods;
+        // (`command` is Ctrl everywhere but on a Mac.)
+        if m.ctrl || (m.command && !mac) {
+            parts.push("Ctrl");
+        }
+        if m.mac_cmd || (m.command && mac) {
+            parts.push("Cmd");
+        }
+        if m.alt {
+            parts.push(if mac { "Option" } else { "Alt" });
+        }
+        if m.shift {
+            parts.push("Shift");
+        }
+        let name = match self.key {
+            Key::ArrowDown => "↓".to_string(),
+            Key::ArrowUp => "↑".to_string(),
+            Key::ArrowLeft => "←".to_string(),
+            Key::ArrowRight => "→".to_string(),
+            Key::PageDown => "Page Down".to_string(),
+            Key::PageUp => "Page Up".to_string(),
+            Key::Escape => "Esc".to_string(),
+            key => {
+                let name = key.symbol_or_name();
+                // A letter on its own is shown as it is typed.
+                let letter = name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic());
+                if letter && parts.is_empty() {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.to_string()
+                }
+            }
+        };
+        parts.push(&name);
+        parts.join("+")
+    }
+}
+
+/// Keys that stand for a character typed with Shift on most layouts.
+fn shifted_symbol(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Questionmark | Key::Plus | Key::Colon | Key::Exclamationmark | Key::Pipe | Key::OpenCurlyBracket | Key::CloseCurlyBracket
+    )
+}
+
+impl Binding {
+    /// The binding in the form the keymap file takes (what
+    /// [`Binding::parse`] reads back).
+    pub fn to_config(&self) -> String {
+        let mut out = String::new();
+        let m = self.mods;
+        if m.command {
+            out.push_str("Cmd+");
+        } else if m.ctrl {
+            out.push_str("Ctrl+");
+        }
+        if m.alt {
+            out.push_str("Alt+");
+        }
+        if m.shift {
+            out.push_str("Shift+");
+        }
+        // (Arrows by name: their symbols are not what the file takes.)
+        let arrow = matches!(self.key, Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight);
+        let name = if arrow { self.key.name() } else { self.key.symbol_or_name() };
+        let letter = name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic());
+        if letter {
+            out.push_str(&name.to_ascii_lowercase());
+        } else {
+            out.push_str(name);
+        }
+        out
     }
 }
 
@@ -225,6 +383,21 @@ impl Keymap {
         (map, errors)
     }
 
+    /// A keymap file that spells out the default bindings: a starting
+    /// point to edit (every line of it may be deleted again).
+    pub fn starter_json() -> String {
+        let defaults = Keymap::default();
+        let mut out = String::from("{\n");
+        for (i, action) in Action::ALL.into_iter().enumerate() {
+            let keys: Vec<String> =
+                defaults.bindings(action).iter().map(|b| format!("{:?}", b.to_config())).collect();
+            let comma = if i + 1 < Action::ALL.len() { "," } else { "" };
+            out.push_str(&format!("  {:?}: [{}]{comma}\n", action.name(), keys.join(", ")));
+        }
+        out.push_str("}\n");
+        out
+    }
+
     pub fn bindings(&self, action: Action) -> &[Binding] {
         self.bindings.get(&action).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -237,7 +410,7 @@ impl Keymap {
     /// Whether `ev` is a press of a key bound to `action`.
     pub fn is_event(&self, ev: &Event, action: Action) -> bool {
         matches!(ev, Event::Key { key, pressed: true, modifiers, .. }
-            if self.bindings(action).iter().any(|b| b.key == *key && modifiers.matches_exact(b.mods)))
+            if self.bindings(action).iter().any(|b| b.matches(*key, *modifiers)))
     }
 }
 
@@ -269,6 +442,51 @@ mod tests {
         // Untouched actions keep their defaults.
         assert_eq!(map.bindings(Action::FocusLeft), Keymap::default().bindings(Action::FocusLeft));
         assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn labels_read_like_keycaps() {
+        let label = |text: &str, mac: bool| Binding::parse(text).unwrap().label(mac);
+        assert_eq!(label("j", false), "j");
+        assert_eq!(label("G", false), "Shift+G");
+        assert_eq!(label("Ctrl+d", false), "Ctrl+D");
+        assert_eq!(label("Cmd+k", false), "Ctrl+K");
+        assert_eq!(label("Cmd+k", true), "Cmd+K");
+        assert_eq!(label("Alt+Enter", true), "Option+Enter");
+        assert_eq!(label("ArrowDown", false), "↓");
+        assert_eq!(label("PageUp", false), "Page Up");
+        assert_eq!(label("/", false), "/");
+        assert_eq!(label("?", false), "?");
+    }
+
+    #[test]
+    fn the_starter_file_is_the_default_keymap() {
+        let text = Keymap::starter_json();
+        let (map, errors) = Keymap::from_json(&text);
+        assert!(errors.is_empty(), "{errors:?}");
+        for action in Action::ALL {
+            assert_eq!(map.bindings(action), Keymap::default().bindings(action), "{}", action.name());
+            assert!(text.contains(&format!("\"{}\"", action.name())));
+        }
+    }
+
+    #[test]
+    fn a_shifted_symbol_matches_with_or_without_shift() {
+        let map = Keymap::default();
+        let ev = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        assert!(map.is_event(&ev(Key::Questionmark, Modifiers::SHIFT), Action::Help));
+        assert!(map.is_event(&ev(Key::Questionmark, Modifiers::NONE), Action::Help));
+        assert!(!map.is_event(&ev(Key::Questionmark, Modifiers::CTRL), Action::Help));
+        // Not for ordinary keys: Shift+/ is not the filter key.
+        assert!(!map.is_event(&ev(Key::Slash, Modifiers::SHIFT), Action::Filter));
+    }
+
+    #[test]
+    fn every_action_is_described() {
+        for action in Action::ALL {
+            assert!(!action.title().is_empty());
+            assert!(Group::ALL.contains(&action.group()));
+        }
     }
 
     #[test]

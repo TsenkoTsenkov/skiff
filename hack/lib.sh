@@ -20,6 +20,7 @@ METRICS_SERVER_VERSION="${METRICS_SERVER_VERSION:-v0.8.1}"
 DEMO_PORT="${DEMO_PORT:-18080}"
 SCALE_PORT="${SCALE_PORT:-18081}"
 PF_TARGET_PORT="${PF_TARGET_PORT:-18090}"   # tiny HTTP server that fake pods port-forward to
+PROM_PORT="${PROM_PORT:-18091}"             # fake Prometheus behind the demo cluster's monitoring/prometheus-operated Service
 
 export PATH="/usr/local/bin:$BIN_DIR:$PATH"
 
@@ -116,5 +117,35 @@ daemon_stop() {
       log "stopped $name (pid $pid)"
     fi
     rm -f "$f"
+  fi
+}
+
+# ---- fake Prometheus for the demo cluster (charts and alerts in Skiff) ----
+# The API server proxies to it through a selector-less Service, and refuses
+# loopback addresses in Endpoints, so it listens on this host's own address.
+prom_address() { python3 -I "$HACK_DIR/fake-prometheus.py" --print-address 2>/dev/null; }
+prom_start() {
+  local ip; ip="$(prom_address)"
+  if [ -z "$ip" ]; then log "WARN: this host has no non-loopback IPv4 address; the demo cluster gets no Prometheus"; return 0; fi
+  # Restart when the host's address changed since it was started.
+  [ "$(cat "$STATE_DIR/fake-prometheus.addr" 2>/dev/null)" = "$ip" ] || daemon_stop fake-prometheus
+  echo "$ip" > "$STATE_DIR/fake-prometheus.addr"
+  daemon_start fake-prometheus python3 -I "$HACK_DIR/fake-prometheus.py" "$PROM_PORT" --bind "$ip" --kubeconfig "$KUBECONFIG" --context demo
+}
+# Points monitoring/prometheus-operated at the fake Prometheus (idempotent).
+prom_seed() {   # ctx
+  local ip now status; ip="$(cat "$STATE_DIR/fake-prometheus.addr" 2>/dev/null)"
+  [ -n "$ip" ] || return 0
+  # (kubectl warns that v1 Endpoints is deprecated; the service proxy still reads it.)
+  sed -e "s|@PROM_IP@|$ip|g" -e "s|@PROM_PORT@|$PROM_PORT|g" "$HACK_DIR/seed/demo/96-prometheus.yaml.tpl" \
+    | kc "$1" apply -f - 2>&1 >/dev/null | grep -v 'v1 Endpoints is deprecated' >&2
+  # The proxy only forwards to a Pod whose status carries the endpoint's IP.
+  now="$(date -u +%FT%TZ)"
+  status='{"status":{"phase":"Running","podIP":"'$ip'","podIPs":[{"ip":"'$ip'"}],"hostIP":"'$ip'","startTime":"'$now'",
+    "conditions":[{"type":"Ready","status":"True","lastTransitionTime":"'$now'"},{"type":"ContainersReady","status":"True","lastTransitionTime":"'$now'"}],
+    "containerStatuses":[{"name":"prometheus","ready":true,"started":true,"restartCount":0,"image":"skiff.dev/hack/fake-prometheus:local","imageID":"","state":{"running":{"startedAt":"'$now'"}}}]}}'
+  if [ "$(kc "$1" -n monitoring get pod fake-prometheus -o jsonpath='{.status.podIP}' 2>/dev/null)" != "$ip" ]; then
+    kc "$1" -n monitoring patch pod fake-prometheus --subresource=status --type=merge -p "$status" >/dev/null \
+      || log "WARN: could not set the fake Prometheus pod's status; charts will say Prometheus is not answering"
   fi
 }

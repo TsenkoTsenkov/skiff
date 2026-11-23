@@ -26,7 +26,10 @@ pub use kubeconfig::{find_executable, KubeconfigProblem, KubeconfigSources, Load
 pub use logs::{LogLine, LogOptions, LogStream, LogTarget, SourceState};
 pub use ops::{ContainerInfo, ObjectData};
 pub use prom::{Alert, AlertKind, AlertTarget, Prom, PromEndpoint, PromError, SampleRing, TimeRange};
-pub use session::{load_contexts, load_contexts_from, ConnStatus, ContextInfo, Contexts, Core, Metrics, Session, Usage};
+pub use session::{
+    load_contexts, load_contexts_from, Alerts, ConnStatus, ContextInfo, Contexts, Core, Metrics, PromStatus, Session, Usage,
+    UsageHistory,
+};
 pub use table::{compare, ColSource, Column, LoadState, Row, Snapshot, TableStore};
 pub use util::{classify, ErrorInfo, ErrorKind, Job, Notifier};
 pub use watch::ListQuery;

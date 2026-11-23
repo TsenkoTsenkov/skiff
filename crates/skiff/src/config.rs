@@ -180,6 +180,12 @@ pub const KEYS: &[KeyDoc] = &[
               or on Linux a program path. $SKIFF_TERMINAL wins over it.",
     },
     KeyDoc {
+        key: "theme",
+        kind: "\"dark\", \"light\" or \"system\"",
+        default: "\"dark\"",
+        doc: "The colours of the window. \"system\" follows the light or dark mode of your computer.",
+    },
+    KeyDoc {
         key: "zoom",
         kind: "number, 0.5 to 3.0",
         default: "1.0",
@@ -244,6 +250,7 @@ pub const EXAMPLE: &str = r#"{
   "kubeconfigs": ["~/.kube/config", "~/.kube/conf.d/*.yaml"],
   "updates": { "check": true, "channel": "stable" },
   "terminal": "iTerm",
+  "theme": "system",
   "zoom": 1.0,
   "clusters": {
     "production": {
@@ -328,6 +335,37 @@ impl Channel {
     }
 }
 
+/// The colours of the window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+    /// Whichever of the two the computer is set to.
+    System,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::Dark, Theme::Light, Theme::System];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::System => "system",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Theme> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            "system" | "auto" => Some(Theme::System),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Updates {
     pub check: bool,
@@ -368,6 +406,7 @@ struct Settings {
     kubeconfigs: Option<Vec<String>>,
     updates: Updates,
     terminal: Option<String>,
+    theme: Option<Theme>,
     zoom: Option<f32>,
     clusters: BTreeMap<String, ClusterConfig>,
 }
@@ -446,6 +485,11 @@ impl Config {
         self.settings.terminal.as_deref()
     }
 
+    /// The theme, if the file names one.
+    pub fn theme(&self) -> Option<Theme> {
+        self.settings.theme
+    }
+
     /// The zoom factor, within [`ZOOM_MIN`]..=[`ZOOM_MAX`], if set.
     pub fn zoom(&self) -> Option<f32> {
         self.settings.zoom
@@ -492,6 +536,16 @@ impl Config {
         }
     }
 
+    /// Takes one entry off the `kubeconfigs` list. Taking the last one
+    /// removes the key (back to `$KUBECONFIG` / `~/.kube/config`).
+    pub fn remove_kubeconfig(&mut self, entry: &str) {
+        let Some(list) = &self.settings.kubeconfigs else { return };
+        let kept: Vec<String> = list.iter().filter(|e| e.as_str() != entry).cloned().collect();
+        if kept.len() != list.len() {
+            self.set_kubeconfigs((!kept.is_empty()).then_some(&kept[..]));
+        }
+    }
+
     pub fn set_update_check(&mut self, check: bool) {
         self.edit(&["updates", "check"], Some(json!(check)));
     }
@@ -504,6 +558,10 @@ impl Config {
     pub fn set_terminal(&mut self, name: Option<&str>) {
         let name = name.map(str::trim).filter(|n| !n.is_empty());
         self.edit(&["terminal"], name.map(|n| json!(n)));
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.edit(&["theme"], Some(json!(theme.name())));
     }
 
     /// Sets the zoom factor, clamped to [`ZOOM_MIN`]..=[`ZOOM_MAX`].
@@ -771,6 +829,19 @@ fn interpret(raw: &Map<String, Value>, warnings: &mut Vec<String>) -> Settings {
         }
     }
 
+    match raw.get("theme") {
+        None => {}
+        Some(Value::String(name)) => match Theme::from_name(name) {
+            Some(t) => s.theme = Some(t),
+            None => warnings
+                .push(format!("theme: should be \"dark\", \"light\" or \"system\", not {name:?}; ignored")),
+        },
+        Some(other) => warnings.push(format!(
+            "theme: should be \"dark\", \"light\" or \"system\", not {}; ignored",
+            kind_of(other)
+        )),
+    }
+
     match raw.get("zoom") {
         None => {}
         Some(Value::Number(n)) => match n.as_f64().filter(|z| z.is_finite()) {
@@ -992,6 +1063,8 @@ mod tests {
 
     // -- locations ----------------------------------------------------
 
+    // (Unix path rules: `/xdg` is not absolute for a Windows `Path`.)
+    #[cfg(unix)]
     #[test]
     fn unix_paths() {
         let env = PathEnv { home: os("/home/ada"), ..Default::default() };
@@ -1139,7 +1212,7 @@ mod tests {
 
     #[test]
     fn known_keys_come_from_the_docs() {
-        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "zoom", "clusters"]);
+        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "theme", "zoom", "clusters"]);
         assert_eq!(known_keys("updates"), ["check", "channel"]);
         assert_eq!(known_keys("clusters.<context>"), ["read_only", "confirm", "prometheus", "grafana_url"]);
         assert_eq!(
@@ -1241,6 +1314,32 @@ mod tests {
         assert_eq!(one_warning(r#"{ "terminal": 1 }"#, "terminal:", "a number").terminal(), None);
         assert_eq!(one_warning(r#"{ "terminal": " " }"#, "terminal:", "empty").terminal(), None);
         assert_eq!(Config::from_json(r#"{ "terminal": " kitty " }"#).0.terminal(), Some("kitty"));
+    }
+
+    #[test]
+    fn theme_is_one_of_three() {
+        assert_eq!(Config::from_json("{}").0.theme(), None);
+        for (name, theme) in [("dark", Theme::Dark), ("Light", Theme::Light), ("system", Theme::System)] {
+            assert_eq!(Config::from_json(&format!(r#"{{ "theme": "{name}" }}"#)).0.theme(), Some(theme));
+        }
+        assert_eq!(one_warning(r#"{ "theme": "pink" }"#, "theme:", "pink").theme(), None);
+        assert_eq!(one_warning(r#"{ "theme": true }"#, "theme:", "true/false").theme(), None);
+        let mut c = Config::default();
+        c.set_theme(Theme::System);
+        assert_eq!(c.theme(), Some(Theme::System));
+        assert_eq!(c.raw["theme"], json!("system"));
+    }
+
+    #[test]
+    fn removing_the_last_kubeconfig_entry_removes_the_key() {
+        let (mut c, _) = Config::from_json(r#"{ "kubeconfigs": ["~/a", "~/b"] }"#);
+        c.remove_kubeconfig("~/missing");
+        assert_eq!(c.kubeconfigs().map(<[String]>::len), Some(2));
+        c.remove_kubeconfig("~/a");
+        assert_eq!(c.kubeconfigs(), Some(&["~/b".to_string()][..]));
+        c.remove_kubeconfig("~/b");
+        assert_eq!(c.kubeconfigs(), None);
+        assert!(!c.raw.contains_key("kubeconfigs"));
     }
 
     #[test]

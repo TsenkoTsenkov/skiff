@@ -24,6 +24,7 @@ use crate::kinds::{self, Discovered, ResourceKey};
 use crate::kubeconfig::{self, KubeconfigSources, LoadedKubeconfig};
 use crate::logs::{self, LogOptions, LogStream, LogTarget};
 use crate::ops::{self, ContainerInfo, ObjectData};
+use crate::prom::{self, Alert, Chart, ChartTarget, Prom, PromEndpoint, PromError, SampleRing, TimeRange};
 use crate::table::{LoadState, Snapshot, TableStore};
 use crate::util::{self, classify, classify_kube, friendly, get_request, ErrorInfo, ErrorKind, Job, Notifier};
 use crate::watch::{self, ListQuery};
@@ -123,6 +124,230 @@ impl Metrics {
     }
 }
 
+/// Whether this cluster has a Prometheus that Skiff can query.
+#[derive(Clone)]
+pub enum PromStatus {
+    /// Being looked for (or not asked for yet).
+    Detecting,
+    Ready(Prom),
+    /// None found, not allowed, or found and not answering: the error
+    /// says which.
+    Unavailable(PromError),
+}
+
+impl PromStatus {
+    pub fn ready(&self) -> Option<&Prom> {
+        match self {
+            PromStatus::Ready(prom) => Some(prom),
+            _ => None,
+        }
+    }
+}
+
+/// The firing alerts of a cluster, as of the last fetch.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Alerts {
+    /// False until the first fetch finished (and whenever there is no
+    /// Prometheus to ask).
+    pub loaded: bool,
+    /// Most severe first.
+    pub items: Vec<Alert>,
+    /// Why the last fetch failed; `items` is empty then.
+    pub error: Option<PromError>,
+}
+
+impl Alerts {
+    /// How many alerts are critical (or `page`/`error`) and how many are warnings.
+    pub fn counts(&self) -> (usize, usize) {
+        let critical = self.items.iter().filter(|a| is_critical(&a.severity)).count();
+        let warning = self.items.iter().filter(|a| a.severity == "warning").count();
+        (critical, warning)
+    }
+}
+
+/// Severities that mean "someone should look now".
+pub fn is_critical(severity: &str) -> bool {
+    matches!(severity, "critical" | "page" | "error" | "high")
+}
+
+/// CPU (cores) and memory (bytes) over time, from metrics-server samples.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageHistory {
+    pub cpu: Vec<(f64, f64)>,
+    pub memory: Vec<(f64, f64)>,
+}
+
+/// Samples kept per object: an hour at one sample every 15 seconds.
+const HISTORY_SAMPLES: usize = 240;
+/// History of an object nobody has looked at for this long is dropped.
+const HISTORY_KEEP_SECS: i64 = 900;
+/// Objects with history at any one time. With two rings each this bounds
+/// the history at about two megabytes.
+const HISTORY_MAX_OBJECTS: usize = 256;
+/// A Prometheus that did not answer is looked for again after this long.
+const PROM_RETRY_SECS: i64 = 120;
+const ALERTS_INTERVAL_SECS: i64 = 45;
+/// Alerts are refreshed while something asked for them this recently.
+const ALERTS_WANTED_SECS: i64 = 90;
+
+struct Tracked {
+    wanted: i64,
+    cpu: SampleRing,
+    memory: SampleRing,
+}
+
+/// Usage history of the objects the UI is showing or showed recently.
+/// Nothing is recorded for anything else: a ring per pod of a large
+/// cluster would cost more memory than the rest of the app.
+#[derive(Default)]
+struct History {
+    pods: HashMap<Box<str>, Tracked>,
+    nodes: HashMap<Box<str>, Tracked>,
+}
+
+impl History {
+    /// Marks an object as wanted and returns its rings, creating them
+    /// (seeded with `current`) when it is new.
+    fn touch<'a>(
+        map: &'a mut HashMap<Box<str>, Tracked>,
+        key: &str,
+        now: i64,
+        current: Option<Usage>,
+    ) -> Option<&'a Tracked> {
+        if !map.contains_key(key) {
+            if map.len() >= HISTORY_MAX_OBJECTS {
+                // Make room by dropping whatever was looked at longest ago.
+                let oldest = map.iter().min_by_key(|(_, t)| t.wanted).map(|(k, _)| k.clone())?;
+                map.remove(&oldest);
+            }
+            let mut tracked =
+                Tracked { wanted: now, cpu: SampleRing::new(HISTORY_SAMPLES), memory: SampleRing::new(HISTORY_SAMPLES) };
+            if let Some(u) = current {
+                tracked.cpu.push(now as f64, u.cpu);
+                tracked.memory.push(now as f64, u.memory);
+            }
+            map.insert(key.into(), tracked);
+        }
+        let tracked = map.get_mut(key)?;
+        tracked.wanted = now;
+        Some(tracked)
+    }
+
+    /// Adds a metrics-server sample to every tracked object and forgets
+    /// the ones nobody has asked about for a while.
+    fn record(&mut self, metrics: &Metrics, now: i64) {
+        for (map, samples) in [(&mut self.pods, &metrics.pods), (&mut self.nodes, &metrics.nodes)] {
+            map.retain(|_, t| now - t.wanted < HISTORY_KEEP_SECS);
+            for (key, tracked) in map.iter_mut() {
+                if let Some(u) = samples.get(key) {
+                    tracked.cpu.push(now as f64, u.cpu);
+                    tracked.memory.push(now as f64, u.memory);
+                }
+            }
+        }
+    }
+}
+
+/// Adds up the rings of several objects, sample time by sample time.
+fn sum_rings<'a>(rings: impl Iterator<Item = &'a SampleRing>) -> Vec<(f64, f64)> {
+    let mut total: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for ring in rings {
+        for (at, value) in ring.iter() {
+            *total.entry(at as i64).or_default() += value;
+        }
+    }
+    total.into_iter().map(|(at, value)| (at as f64, value)).collect()
+}
+
+/// Prometheus, alerts and usage history of one session. Shared with the
+/// background tasks, which must not keep the session itself alive.
+struct Observability {
+    status: ArcSwap<PromStatus>,
+    /// Number of the current detection; a finished one publishes only
+    /// while this is still its own.
+    generation: AtomicU64,
+    /// A detection for `generation` has been started.
+    started: AtomicBool,
+    /// When the current status was decided.
+    decided_at: AtomicI64,
+    /// Serialises publishing an outcome with starting over.
+    lock: Mutex<()>,
+    /// `clusters.<context>.prometheus` from the config file.
+    endpoint: Mutex<Option<PromEndpoint>>,
+    alerts: ArcSwap<Alerts>,
+    alerts_wanted: AtomicI64,
+    alerts_started: AtomicBool,
+    history: Mutex<History>,
+}
+
+impl Observability {
+    fn new() -> Self {
+        Observability {
+            status: ArcSwap::from_pointee(PromStatus::Detecting),
+            generation: AtomicU64::new(0),
+            started: AtomicBool::new(false),
+            decided_at: AtomicI64::new(0),
+            lock: Mutex::new(()),
+            endpoint: Mutex::new(None),
+            alerts: ArcSwap::from_pointee(Alerts::default()),
+            alerts_wanted: AtomicI64::new(0),
+            alerts_started: AtomicBool::new(false),
+            history: Mutex::new(History::default()),
+        }
+    }
+
+    /// Forgets what is known about Prometheus; the next question starts a
+    /// new detection. Alerts go with it: they came from the old answer.
+    fn reset(&self) {
+        let _publishing = self.lock.lock();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.started.store(false, Ordering::SeqCst);
+        self.status.store(Arc::new(PromStatus::Detecting));
+        if self.alerts.load().loaded {
+            self.alerts.store(Arc::new(Alerts::default()));
+        }
+    }
+
+    fn publish(&self, generation: u64, status: PromStatus) -> bool {
+        let _publishing = self.lock.lock();
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        self.decided_at.store(now_unix(), Ordering::SeqCst);
+        self.status.store(Arc::new(status));
+        true
+    }
+}
+
+/// Finds Prometheus for a session: the configured endpoint when there is
+/// one (it only has to answer), otherwise by looking through the cluster.
+async fn find_prometheus(client: Client, endpoint: Option<PromEndpoint>, namespaces: &[String]) -> PromStatus {
+    let found = match endpoint {
+        Some(endpoint) => match endpoint.validate() {
+            Err(problem) => Err(PromError::Other(format!("The Prometheus set in Skiff's config can't be used: {problem}"))),
+            Ok(()) => {
+                let prom = Prom::new(client, endpoint);
+                match prom.ping().await {
+                    Ok(()) => Ok(prom),
+                    // Say which Service it was: the name is the user's own.
+                    Err(PromError::Unreachable(msg)) => {
+                        Err(PromError::Unreachable(format!("{} ({msg})", prom.endpoint().display())))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        },
+        None => {
+            let extra: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+            prom::detect(&client, &extra).await
+        }
+    };
+    match found {
+        Ok(prom) => PromStatus::Ready(prom),
+        Err(e) => PromStatus::Unavailable(e),
+    }
+}
+
 type ClientState = Option<Result<Client, String>>;
 /// Live tables by (resource, namespace scope).
 type Stores = HashMap<(ResourceKey, Option<Box<str>>), Arc<TableStore>>;
@@ -158,6 +383,8 @@ pub struct Session {
     /// Refuse everything that changes the cluster, opens a shell or
     /// forwards a port.
     read_only: AtomicBool,
+    /// Prometheus, firing alerts and usage history.
+    obs: Arc<Observability>,
 }
 
 fn kubeconfig_error(summary: String, hint: &str) -> ErrorInfo {
@@ -434,6 +661,7 @@ impl Session {
             failure: ArcSwap::from_pointee(None),
             waiting: Mutex::new((0, None)),
             read_only: AtomicBool::new(false),
+            obs: Arc::new(Observability::new()),
         });
         session.start_connect();
         session.start_janitor();
@@ -630,6 +858,7 @@ impl Session {
                         match sample {
                             Ok(Ok(m)) => {
                                 failures = 0;
+                                s.obs.history.lock().record(&m, now_unix());
                                 s.metrics.store(Arc::new(m));
                                 s.notify.ping();
                             }
@@ -755,8 +984,159 @@ impl Session {
                 self.metrics.store(Arc::new(Metrics { generation: old.generation + 1, ..Default::default() }));
             }
         }
+        // Prometheus is looked for again on the new connection.
+        self.obs.reset();
         self.start_connect();
         self.notify.ping();
+    }
+
+    // ------------------------------------------------------------------
+    // Prometheus, alerts, usage history
+    // ------------------------------------------------------------------
+
+    /// Whether this cluster has a Prometheus Skiff can use. The first call
+    /// starts looking for it in the background (the configured endpoint,
+    /// else detection); call again each frame for the outcome, which is
+    /// kept until the session reconnects or [`Self::retry_prometheus`].
+    /// `namespaces` are where to look when the account may not list
+    /// Services across the cluster: pass the namespaces in view.
+    ///
+    /// Call this only from views that show Prometheus data, so that a
+    /// cluster is not searched for nothing.
+    pub fn prometheus(&self, namespaces: &[&str]) -> Arc<PromStatus> {
+        let obs = &self.obs;
+        // A Prometheus that did not answer may be back by now.
+        if let PromStatus::Unavailable(PromError::Unreachable(_)) = &**obs.status.load() {
+            if now_unix() - obs.decided_at.load(Ordering::SeqCst) > PROM_RETRY_SECS {
+                obs.reset();
+            }
+        }
+        if !obs.started.swap(true, Ordering::SeqCst) {
+            let generation = obs.generation.load(Ordering::SeqCst);
+            let (obs, notify, client) = (obs.clone(), self.notify.clone(), self.client());
+            let endpoint = obs.endpoint.lock().clone();
+            let namespaces: Vec<String> = namespaces.iter().map(|ns| ns.to_string()).collect();
+            self.spawn_tracked(async move {
+                let status = match client.await {
+                    Ok(client) => find_prometheus(client, endpoint, &namespaces).await,
+                    Err(e) => PromStatus::Unavailable(PromError::Unreachable(e)),
+                };
+                if obs.publish(generation, status) {
+                    notify.ping();
+                }
+            });
+        }
+        obs.status.load_full()
+    }
+
+    /// What is known about Prometheus right now, without starting to look.
+    pub fn prometheus_known(&self) -> Arc<PromStatus> {
+        self.obs.status.load_full()
+    }
+
+    /// Looks for Prometheus again (after it was installed, or access was
+    /// granted).
+    pub fn retry_prometheus(&self) {
+        self.obs.reset();
+        self.notify.ping();
+    }
+
+    /// Sets `clusters.<context>.prometheus` from the config file: the
+    /// endpoint to use instead of detecting one (`None`: detect). A change
+    /// takes effect at once.
+    pub fn set_prometheus_endpoint(&self, endpoint: Option<PromEndpoint>) {
+        let mut current = self.obs.endpoint.lock();
+        if *current != endpoint {
+            *current = endpoint;
+            drop(current);
+            self.retry_prometheus();
+        }
+    }
+
+    /// Loads the charts of a pod, workload or node for a time range.
+    /// Every chart carries its own data or error.
+    pub fn charts(&self, prom: &Prom, target: ChartTarget, range: TimeRange) -> Job<Vec<Chart>> {
+        let job = Job::new();
+        let (j, notify, prom) = (job.clone(), self.notify.clone(), prom.clone());
+        // Each query has its own time limit.
+        self.handle.spawn(async move {
+            j.finish(Ok(prom.charts(&target, &range).await));
+            notify.ping();
+        });
+        job
+    }
+
+    /// The cluster's firing alerts, refreshed in the background for as
+    /// long as this keeps being called (every frame of a view that shows
+    /// them). Never starts looking for Prometheus by itself: until
+    /// [`Self::prometheus`] found one this is empty and not `loaded`.
+    pub fn alerts(&self) -> Arc<Alerts> {
+        let obs = &self.obs;
+        obs.alerts_wanted.store(now_unix(), Ordering::Relaxed);
+        // The refresh loop exists only once there is a Prometheus to ask.
+        if obs.status.load().ready().is_some() && !obs.alerts_started.swap(true, Ordering::SeqCst) {
+            let (obs, notify) = (obs.clone(), self.notify.clone());
+            self.spawn_tracked(async move {
+                // (generation, time) of the last fetch.
+                let mut last: Option<(u64, i64)> = None;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let now = now_unix();
+                    if now - obs.alerts_wanted.load(Ordering::Relaxed) > ALERTS_WANTED_SECS {
+                        continue;
+                    }
+                    let generation = obs.generation.load(Ordering::SeqCst);
+                    let Some(prom) = obs.status.load().ready().cloned() else { continue };
+                    if last.is_some_and(|(g, at)| g == generation && now - at < ALERTS_INTERVAL_SECS) {
+                        continue;
+                    }
+                    let fetched = prom.firing_alerts().await;
+                    last = Some((generation, now_unix()));
+                    let alerts = match fetched {
+                        Ok(items) => Alerts { loaded: true, items, error: None },
+                        Err(e) => Alerts { loaded: true, items: Vec::new(), error: Some(e) },
+                    };
+                    let _publishing = obs.lock.lock();
+                    if obs.generation.load(Ordering::SeqCst) == generation && **obs.alerts.load() != alerts {
+                        obs.alerts.store(Arc::new(alerts));
+                        notify.ping();
+                    }
+                }
+            });
+        }
+        obs.alerts.load_full()
+    }
+
+    /// CPU and memory of pods over the time Skiff has been watching them,
+    /// added up: the stand-in for charts on a cluster without Prometheus.
+    /// History is kept only for what is asked about here, from the first
+    /// call until a while after the last, so call it every frame of the
+    /// view that shows it.
+    pub fn pod_usage_history(&self, namespace: &str, pods: &[&str]) -> UsageHistory {
+        let metrics = self.metrics();
+        let now = now_unix();
+        let mut history = self.obs.history.lock();
+        let mut keys = Vec::with_capacity(pods.len());
+        for pod in pods.iter().take(HISTORY_MAX_OBJECTS) {
+            let key = format!("{namespace}/{pod}");
+            History::touch(&mut history.pods, &key, now, metrics.pods.get(key.as_str()).copied());
+            keys.push(key);
+        }
+        let tracked: Vec<&Tracked> = keys.iter().filter_map(|k| history.pods.get(k.as_str())).collect();
+        UsageHistory {
+            cpu: sum_rings(tracked.iter().map(|t| &t.cpu)),
+            memory: sum_rings(tracked.iter().map(|t| &t.memory)),
+        }
+    }
+
+    /// Like [`Self::pod_usage_history`], for one node.
+    pub fn node_usage_history(&self, node: &str) -> UsageHistory {
+        let metrics = self.metrics();
+        let mut history = self.obs.history.lock();
+        match History::touch(&mut history.nodes, node, now_unix(), metrics.nodes.get(node).copied()) {
+            Some(t) => UsageHistory { cpu: t.cpu.to_vec(), memory: t.memory.to_vec() },
+            None => UsageHistory::default(),
+        }
     }
 
     /// Reads the session's current client without waiting; `None` while
@@ -859,11 +1239,22 @@ impl Session {
         )
     }
 
+    /// Applies a manifest; a field owned by another manager is reported as
+    /// a conflict (see `ops::is_apply_conflict`) and left alone.
     pub fn apply_manifest(&self, yaml: String) -> Job<Vec<String>> {
+        self.apply_manifest_with(yaml, false)
+    }
+
+    /// Applies a manifest. With `force`, fields owned by other managers
+    /// are taken over instead of being reported as conflicts
+    /// (`kubectl apply --server-side --force-conflicts`).
+    pub fn apply_manifest_with(&self, yaml: String, force: bool) -> Job<Vec<String>> {
         let discovered = self.discovered();
         // A manifest can hold hundreds of documents: each request has its
         // own time limit rather than the whole job.
-        self.mutating_job(None, move |c| async move { ops::apply_manifest(&c, &discovered, &yaml).await })
+        self.mutating_job(None, move |c| async move {
+            ops::apply_manifest_with(&c, &discovered, &yaml, force).await.map_err(|e| e.to_string())
+        })
     }
 
     pub fn delete_object(&self, key: &ResourceKey, ns: &str, name: &str, force: bool) -> Job<()> {
@@ -1165,6 +1556,112 @@ mod tests {
         wait_until("scale to finish", || scale.is_done());
         let err = scale.take().expect("done").expect_err("no cluster");
         assert!(!err.contains("read-only"), "{err}");
+    }
+
+    fn usage(cpu: f64, memory: f64) -> Usage {
+        Usage { cpu, memory }
+    }
+
+    #[test]
+    fn history_is_kept_only_for_what_is_asked_about() {
+        let mut history = History::default();
+        let mut metrics = Metrics { available: true, ..Default::default() };
+        metrics.pods.insert("ns/a".into(), usage(0.1, 100.0));
+        metrics.pods.insert("ns/b".into(), usage(0.2, 200.0));
+        metrics.nodes.insert("n1".into(), usage(2.0, 4096.0));
+
+        // Nothing was asked for: nothing is recorded.
+        history.record(&metrics, 1000);
+        assert!(history.pods.is_empty() && history.nodes.is_empty());
+
+        // The first question seeds the ring with the current sample.
+        let t = History::touch(&mut history.pods, "ns/a", 1010, metrics.pods.get("ns/a").copied()).expect("tracked");
+        assert_eq!(t.cpu.to_vec(), [(1010.0, 0.1)]);
+        History::touch(&mut history.pods, "ns/gone", 1010, None);
+        history.record(&metrics, 1015);
+        history.record(&metrics, 1030);
+        assert_eq!(history.pods["ns/a"].memory.to_vec(), [(1010.0, 100.0), (1015.0, 100.0), (1030.0, 100.0)]);
+        assert!(history.pods["ns/gone"].cpu.is_empty(), "no sample, no point");
+        assert!(!history.pods.contains_key("ns/b"));
+
+        // Not asked about for a while: forgotten.
+        history.record(&metrics, 1010 + HISTORY_KEEP_SECS);
+        assert!(history.pods.is_empty());
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut map = HashMap::new();
+        for i in 0..(HISTORY_MAX_OBJECTS as i64 + 10) {
+            History::touch(&mut map, &format!("ns/pod-{i}"), 1000 + i, Some(usage(1.0, 1.0)));
+        }
+        assert_eq!(map.len(), HISTORY_MAX_OBJECTS);
+        assert!(!map.contains_key("ns/pod-0"), "the one looked at longest ago goes first");
+        assert!(map.contains_key(format!("ns/pod-{}", HISTORY_MAX_OBJECTS + 9).as_str()));
+        let mut ring = SampleRing::new(HISTORY_SAMPLES);
+        for i in 0..10_000 {
+            ring.push(i as f64, 1.0);
+        }
+        assert_eq!(ring.len(), HISTORY_SAMPLES);
+    }
+
+    #[test]
+    fn rings_are_summed_by_sample_time() {
+        let (mut a, mut b) = (SampleRing::new(8), SampleRing::new(8));
+        for (at, v) in [(10.0, 1.0), (25.0, 2.0)] {
+            a.push(at, v);
+        }
+        for (at, v) in [(25.0, 0.5), (40.0, 0.25)] {
+            b.push(at, v);
+        }
+        assert_eq!(sum_rings([&a, &b].into_iter()), [(10.0, 1.0), (25.0, 2.5), (40.0, 0.25)]);
+        assert!(sum_rings(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn alerts_are_counted_by_severity() {
+        let alert = |severity: &str| Alert {
+            name: "A".into(),
+            severity: severity.into(),
+            state: "firing".into(),
+            summary: String::new(),
+            description: String::new(),
+            labels: Default::default(),
+            active_since: None,
+        };
+        let alerts = Alerts {
+            loaded: true,
+            items: ["critical", "page", "warning", "info", ""].iter().map(|s| alert(s)).collect(),
+            error: None,
+        };
+        assert_eq!(alerts.counts(), (2, 1));
+        assert_eq!(Alerts::default().counts(), (0, 0));
+    }
+
+    #[test]
+    fn prometheus_is_not_looked_for_until_asked_and_reports_no_connection() {
+        let (_core, s) = offline("nowhere");
+        wait_until("connection to fail", || matches!(&*s.status(), ConnStatus::Failed(_)));
+        assert!(matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        assert!(!s.obs.started.load(Ordering::SeqCst), "nothing asked, nothing started");
+        assert!(!s.alerts().loaded);
+
+        s.prometheus(&[]);
+        wait_until("the outcome", || !matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        assert!(matches!(&*s.prometheus_known(), PromStatus::Unavailable(PromError::Unreachable(_))));
+
+        // A retry (and a changed config endpoint) starts over.
+        s.retry_prometheus();
+        assert!(matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        s.prometheus(&[]);
+        wait_until("the second outcome", || !matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090)));
+        assert!(matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        // Setting the same endpoint again changes nothing.
+        s.prometheus(&[]);
+        wait_until("the third outcome", || !matches!(&*s.prometheus_known(), PromStatus::Detecting));
+        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090)));
+        assert!(!matches!(&*s.prometheus_known(), PromStatus::Detecting));
     }
 
     #[test]
