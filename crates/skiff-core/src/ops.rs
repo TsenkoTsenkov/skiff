@@ -34,8 +34,124 @@ fn to_object_data(mut value: Value) -> Result<ObjectData, String> {
     Ok(ObjectData { value, yaml, rv })
 }
 
+/// The most one response body (a list page, an object) may be. Far beyond
+/// anything a healthy API server sends; a broken or hostile one must not be
+/// able to fill our memory. With gzip this counts the decompressed size.
+pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Why a response body could not be collected.
+#[derive(Debug)]
+pub(crate) enum BodyError {
+    /// The body is larger than the limit; reading stopped there.
+    TooLarge { limit: usize },
+    Read(kube::Error),
+}
+
+impl BodyError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            BodyError::TooLarge { limit } => format!(
+                "the server's response is larger than {} MiB; narrow it down (a namespace or a filter) and try again",
+                limit / (1024 * 1024)
+            ),
+            BodyError::Read(e) => friendly(e),
+        }
+    }
+}
+
+/// Collects a response body, giving up as soon as it exceeds `limit` bytes
+/// (instead of buffering whatever the server chooses to send).
+pub(crate) async fn collect_capped(mut body: kube::client::Body, limit: usize) -> Result<Vec<u8>, BodyError> {
+    use http_body_util::BodyExt;
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        // (Trailers carry no data.)
+        if let Ok(data) = frame.map_err(BodyError::Read)?.into_data() {
+            if data.len() > limit - out.len() {
+                return Err(BodyError::TooLarge { limit });
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
+}
+
+/// A response that was not a success: the HTTP status and the body, which
+/// normally is a `Status` object describing the failure.
+struct Refused {
+    status: http::StatusCode,
+    body: Vec<u8>,
+}
+
+impl Refused {
+    /// The failure in the words `friendly` uses for the same error.
+    fn message(&self) -> String {
+        if let Ok(st) = serde_json::from_slice::<kube::core::Status>(&self.body) {
+            if !st.message.is_empty() || !st.reason.is_empty() {
+                let st = if st.code == 0 { st.with_code(self.status.as_u16()) } else { st };
+                return friendly(&kube::Error::Api(Box::new(st)));
+            }
+        }
+        // Not every error is a Status: a proxy or ingress in front of the
+        // API server answers in plain text or HTML.
+        let text = String::from_utf8_lossy(&self.body);
+        let text: String = text.trim().chars().take(300).collect();
+        if text.is_empty() {
+            format!("request failed ({})", self.status.as_u16())
+        } else {
+            format!("{text} ({})", self.status.as_u16())
+        }
+    }
+}
+
+enum SendError {
+    /// The server answered, with an error.
+    Refused(Refused),
+    /// No (complete) answer.
+    Other(String),
+}
+
+impl SendError {
+    fn message(&self) -> String {
+        match self {
+            SendError::Refused(r) => r.message(),
+            SendError::Other(msg) => msg.clone(),
+        }
+    }
+}
+
+/// Sends a request and returns the status and body of a successful answer.
+/// The body is read with a size limit, whatever the outcome.
+async fn send_raw(client: &Client, req: http::Request<Vec<u8>>) -> Result<(http::StatusCode, Vec<u8>), SendError> {
+    let res = client
+        .send(req.map(kube::client::Body::from))
+        .await
+        .map_err(|e| SendError::Other(friendly(&e)))?;
+    let status = res.status();
+    let body = collect_capped(res.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|e| SendError::Other(e.message()))?;
+    if status.is_success() {
+        Ok((status, body))
+    } else {
+        Err(SendError::Refused(Refused { status, body }))
+    }
+}
+
+/// Sends a request and parses the answer.
+async fn send_as<T: serde::de::DeserializeOwned>(client: &Client, req: http::Request<Vec<u8>>) -> Result<T, String> {
+    let (_, body) = send_raw(client, req).await.map_err(|e| e.message())?;
+    serde_json::from_slice(&body).map_err(|e| format!("unexpected response: {e}"))
+}
+
 async fn send(client: &Client, req: http::Request<Vec<u8>>) -> Result<Value, String> {
-    client.request::<Value>(req).await.map_err(|e| friendly(&e))
+    send_as(client, req).await
+}
+
+/// A port number from server-supplied JSON; `None` unless it is a number
+/// that fits a port (never silently wrapped around).
+fn port_of(v: &Value) -> Option<u16> {
+    u16::try_from(v.as_u64()?).ok()
 }
 
 pub async fn get_object(client: &Client, key: &ResourceKey, ns: &str, name: &str) -> Result<ObjectData, String> {
@@ -140,7 +256,7 @@ pub fn containers_of(pod: &Value) -> Vec<ContainerInfo> {
                     ports
                         .iter()
                         .filter_map(|p| {
-                            let port = p.get("containerPort")?.as_u64()? as u16;
+                            let port = port_of(p.get("containerPort")?)?;
                             let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                             Some((name, port))
                         })
@@ -235,7 +351,7 @@ pub async fn resolve_service(client: &Client, ns: &str, service: &str, port: u16
         .and_then(|ports| {
             ports
                 .iter()
-                .find(|p| p.get("port").and_then(|v| v.as_u64()) == Some(port as u64))
+                .find(|p| p.get("port").and_then(|v| v.as_u64()) == Some(u64::from(port)))
         })
         .and_then(|p| p.get("targetPort").cloned())
         .unwrap_or(json!(port));
@@ -245,10 +361,7 @@ pub async fn resolve_service(client: &Client, ns: &str, service: &str, port: u16
         crate::kinds::pods().list_path(Some(ns)),
         crate::util::enc(&selector)
     );
-    let pods: PodListLite = client
-        .request(get_request(&url, None)?)
-        .await
-        .map_err(|e| friendly(&e))?;
+    let pods: PodListLite = send_as(client, get_request(&url, None)?).await?;
     let pod = pods
         .items
         .iter()
@@ -257,7 +370,9 @@ pub async fn resolve_service(client: &Client, ns: &str, service: &str, port: u16
         .ok_or("no pods match the service selector")?;
     let pod_name = pod.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let remote = match &target {
-        Value::Number(n) => n.as_u64().unwrap_or(port as u64) as u16,
+        n @ Value::Number(_) => {
+            port_of(n).ok_or_else(|| format!("service {service} has an invalid target port: {n}"))?
+        }
         Value::String(name) => containers_of(pod)
             .iter()
             .flat_map(|c| c.ports.iter())
@@ -282,7 +397,7 @@ pub async fn forwardable_ports(client: &Client, service: bool, ns: &str, name: &
                 ports
                     .iter()
                     .filter_map(|p| {
-                        let port = p.get("port")?.as_u64()? as u16;
+                        let port = port_of(p.get("port")?)?;
                         let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                         Some((name, port))
                     })
@@ -319,7 +434,7 @@ pub async fn log_targets(
             crate::util::enc(&selector),
             MAX_LOG_PODS
         );
-        let list: PodListLite = client.request(get_request(&url, None)?).await.map_err(|e| friendly(&e))?;
+        let list: PodListLite = send_as(client, get_request(&url, None)?).await?;
         list.items
     };
     let mut targets = Vec::new();
@@ -343,38 +458,125 @@ pub async fn log_targets(
 /// not answering.
 pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Sends a request and returns the HTTP status alongside the parsed body.
-async fn send_with_status(client: &Client, req: http::Request<Vec<u8>>) -> Result<(http::StatusCode, Value), String> {
-    let res = client
-        .send(req.map(kube::client::Body::from))
-        .await
-        .map_err(|e| friendly(&e))?;
-    let status = res.status();
-    let bytes = res.into_body().collect_bytes().await.map_err(|e| friendly(&e))?;
-    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    if status.is_success() {
-        Ok((status, value))
-    } else {
-        let msg = value.get("message").and_then(|m| m.as_str()).unwrap_or("request failed");
-        Err(format!("{msg} ({})", status.as_u16()))
+/// A field a server-side apply would have to take over from whoever set it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyConflict {
+    /// The object, as in the report: `deployments.apps/web`.
+    pub object: String,
+    /// Path of the field, e.g. `.spec.replicas`.
+    pub field: String,
+    /// The field manager that owns it (`helm`, `argocd-controller`, ...).
+    pub manager: String,
+}
+
+/// Why `apply_manifest_with` did not apply everything.
+#[derive(Clone, Debug, Default)]
+pub struct ApplyFailure {
+    /// What happened to each document, failures included (as in the `Ok`
+    /// report).
+    pub report: Vec<String>,
+    /// Fields owned by other managers. When not empty, applying again with
+    /// `force` takes them over.
+    pub conflicts: Vec<ApplyConflict>,
+}
+
+impl ApplyFailure {
+    /// Whether applying again with `force` could succeed where this failed.
+    pub fn is_conflict(&self) -> bool {
+        !self.conflicts.is_empty()
     }
+}
+
+impl std::fmt::Display for ApplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.report.join("\n"))
+    }
+}
+
+/// Part of every report line about a field conflict (see
+/// `is_apply_conflict`).
+const CONFLICT_PHRASE: &str = "owned by another manager";
+
+/// Whether an error text from `apply_manifest` (an `ApplyFailure` rendered
+/// as text) reports field conflicts, i.e. whether offering "Apply anyway"
+/// (apply with `force`) makes sense.
+pub fn is_apply_conflict(error: &str) -> bool {
+    error.contains(CONFLICT_PHRASE)
+}
+
+/// The field conflicts in the body of a 409 answer to an apply; empty if it
+/// is some other kind of conflict.
+fn conflicts_in(status: &Value, object: &str) -> Vec<ApplyConflict> {
+    let Some(causes) = status.pointer("/details/causes").and_then(|c| c.as_array()) else { return Vec::new() };
+    causes
+        .iter()
+        .filter(|c| c.get("reason").and_then(|r| r.as_str()) == Some("FieldManagerConflict"))
+        .map(|c| {
+            // The message reads: conflict with "manager" using apps/v1
+            let message = c.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            let manager = message.split('"').nth(1).filter(|m| !m.is_empty()).unwrap_or("unknown");
+            ApplyConflict {
+                object: object.to_string(),
+                field: c.get("field").and_then(|f| f.as_str()).unwrap_or("").to_string(),
+                manager: manager.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The report entry for an object that was not applied because of field
+/// conflicts.
+fn conflict_report(label: &str, conflicts: &[ApplyConflict]) -> String {
+    const LISTED: usize = 20;
+    let n = conflicts.len();
+    let mut out = if n == 1 {
+        format!("{label}: not applied, 1 field is {CONFLICT_PHRASE}:")
+    } else {
+        format!("{label}: not applied, {n} fields are {CONFLICT_PHRASE}:")
+    };
+    for c in conflicts.iter().take(LISTED) {
+        out.push_str(&format!("\n    {} ({})", c.field, c.manager));
+    }
+    if n > LISTED {
+        out.push_str(&format!("\n    and {} more", n - LISTED));
+    }
+    out
+}
+
+/// `apply_manifest_with` without `force`, with the failure as text: a
+/// conflict is reported, never overridden. `is_apply_conflict` recognises
+/// such a report.
+pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &str) -> Result<Vec<String>, String> {
+    apply_manifest_with(client, discovered, yaml, false).await.map_err(|e| e.to_string())
 }
 
 /// `kubectl apply --server-side` for every document in a (multi-document)
 /// manifest: fields in the manifest are set and owned by Skiff, everything
 /// else on an existing object is left alone.
 ///
+/// A field that another manager (Helm, Argo CD, a controller, ...) owns
+/// with a different value is a conflict. Without `force` the object is then
+/// left untouched and the failure lists the fields and their owners; with
+/// `force` (`kubectl apply --server-side --force-conflicts`) Skiff takes the
+/// fields over.
+///
 /// Every document is attempted. `Ok` lists what happened to each; if any
 /// document failed, `Err` carries the same per-document report including
 /// the failures. Each request has its own time limit, so a large manifest on
 /// a slow connection is not cut off half-way; only when the server stops
 /// answering are the remaining documents left alone, and the report says so.
-pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &str) -> Result<Vec<String>, String> {
+pub async fn apply_manifest_with(
+    client: &Client,
+    discovered: &[Discovered],
+    yaml: &str,
+    force: bool,
+) -> Result<Vec<String>, ApplyFailure> {
+    let fail = |message: &str| ApplyFailure { report: vec![message.to_string()], conflicts: Vec::new() };
     // Parse everything up front: the YAML parser is not `Send` and must not
     // live across an await.
     let mut docs = Vec::new();
     for doc in serde_yaml::Deserializer::from_str(yaml) {
-        let value = Value::deserialize(doc).map_err(|e| format!("invalid YAML: {e}"))?;
+        let value = Value::deserialize(doc).map_err(|e| fail(&format!("invalid YAML: {e}")))?;
         if value.is_null() {
             continue;
         }
@@ -391,9 +593,10 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
         }
     }
     if docs.is_empty() {
-        return Err("manifest is empty".into());
+        return Err(fail("manifest is empty"));
     }
     let mut report = Vec::new();
+    let mut conflicts = Vec::new();
     let mut failed = false;
     let total = docs.len();
     for (index, value) in docs.into_iter().enumerate() {
@@ -437,7 +640,10 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
             String::new()
         };
         let label = format!("{}/{}", key.id(), name);
-        let url = format!("{}?fieldManager=skiff&force=true", key.object_path(&ns, &name));
+        let mut url = format!("{}?fieldManager=skiff", key.object_path(&ns, &name));
+        if force {
+            url.push_str("&force=true");
+        }
         let body = match serde_json::to_vec(&value) {
             Ok(b) => b,
             Err(e) => {
@@ -447,7 +653,7 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
             }
         };
         let outcome = match request(Method::PATCH, &url, body, Some(APPLY_PATCH), None) {
-            Ok(req) => match tokio::time::timeout(REQUEST_TIMEOUT, send_with_status(client, req)).await {
+            Ok(req) => match tokio::time::timeout(REQUEST_TIMEOUT, send_raw(client, req)).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     report.push(format!(
@@ -462,19 +668,30 @@ pub async fn apply_manifest(client: &Client, discovered: &[Discovered], yaml: &s
                     break;
                 }
             },
-            Err(e) => Err(e),
+            Err(e) => Err(SendError::Other(e)),
         };
         match outcome {
             Ok((status, _)) if status == http::StatusCode::CREATED => report.push(format!("{label} created")),
             Ok(_) => report.push(format!("{label} configured")),
             Err(e) => {
-                report.push(format!("{label}: {e}"));
                 failed = true;
+                let found = match &e {
+                    SendError::Refused(r) if r.status == http::StatusCode::CONFLICT => {
+                        serde_json::from_slice::<Value>(&r.body).map(|v| conflicts_in(&v, &label)).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                if found.is_empty() {
+                    report.push(format!("{label}: {}", e.message()));
+                } else {
+                    report.push(conflict_report(&label, &found));
+                    conflicts.extend(found);
+                }
             }
         }
     }
     if failed {
-        Err(report.join("\n"))
+        Err(ApplyFailure { report, conflicts })
     } else {
         Ok(report)
     }
@@ -516,5 +733,168 @@ mod tests {
         assert!(!c[0].init);
         assert_eq!(c[0].ports, vec![("http".to_string(), 8080)]);
         assert!(c[1].init);
+    }
+
+    #[test]
+    fn ports_are_checked_not_wrapped() {
+        // 65536 + 80 would wrap to port 80.
+        let pod = json!({"spec":{"containers":[{"name":"app","ports":[
+            {"name":"ok","containerPort":8080},
+            {"name":"wraps","containerPort":65616},
+            {"name":"negative","containerPort":-1},
+            {"name":"text","containerPort":"80"}]}]}});
+        assert_eq!(containers_of(&pod)[0].ports, vec![("ok".to_string(), 8080)]);
+        assert_eq!(port_of(&json!(65535)), Some(65535));
+        assert_eq!(port_of(&json!(65536)), None);
+        assert_eq!(port_of(&json!(1.5)), None);
+    }
+
+    #[test]
+    fn conflicts_are_read_from_the_status() {
+        let status = json!({"kind":"Status","status":"Failure","reason":"Conflict","code":409,
+            "message":"Apply failed with 2 conflicts: ...",
+            "details":{"causes":[
+                {"reason":"FieldManagerConflict","message":"conflict with \"helm\" using apps/v1","field":".spec.replicas"},
+                {"reason":"FieldManagerConflict","message":"conflict with \"kube-controller-manager\" with subresource \"status\" using apps/v1","field":".status.x"},
+                {"reason":"SomethingElse","message":"other","field":".a"}]}});
+        let found = conflicts_in(&status, "deployments.apps/web");
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].field.as_str(), found[0].manager.as_str()), (".spec.replicas", "helm"));
+        assert_eq!(found[1].manager, "kube-controller-manager");
+        let text = conflict_report("deployments.apps/web", &found);
+        assert!(is_apply_conflict(&text), "{text}");
+        assert!(text.contains(".spec.replicas (helm)"), "{text}");
+        // An ordinary conflict (a stale resourceVersion) is not one of these.
+        let plain = json!({"kind":"Status","code":409,"reason":"Conflict","message":"the object has been modified"});
+        assert!(conflicts_in(&plain, "x").is_empty());
+        assert!(!is_apply_conflict("configmaps/a: the object has been modified (409)"));
+    }
+
+    /// A minimal API server: reads one request per connection, records its
+    /// request line and answers with what `answer` makes of it.
+    async fn fake_api(
+        answer: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, answer) = (seen.clone(), std::sync::Arc::new(answer));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let (log, answer) = (log.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // The head, then as much body as it announces.
+                    let body_at = loop {
+                        if let Some(i) = req.windows(4).position(|x| x == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&req[..body_at]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while req.len() < body_at + length {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    let (code, body) = answer(&line);
+                    log.lock().unwrap().push(line);
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let client = Client::try_from(kube::Config::new(format!("http://{addr}").parse().unwrap())).unwrap();
+        (client, seen)
+    }
+
+    const MANIFEST: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  namespace: shop\ndata:\n  mode: fast\n";
+
+    /// The server refuses an apply that would take a field from another
+    /// manager unless it is forced.
+    fn conflicting(request_line: &str) -> (u16, String) {
+        if request_line.contains("force=true") {
+            (200, r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings"}}"#.to_string())
+        } else {
+            let status = json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","code":409,
+                "message":"Apply failed with 1 conflict: conflict with \"helm\" using v1: .data.mode",
+                "details":{"causes":[{"reason":"FieldManagerConflict","message":"conflict with \"helm\" using v1","field":".data.mode"}]}});
+            (409, status.to_string())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_without_force_reports_the_conflict() {
+        let (client, seen) = fake_api(conflicting).await;
+        let failure = apply_manifest_with(&client, &[], MANIFEST, false).await.unwrap_err();
+        assert!(failure.is_conflict());
+        assert_eq!(
+            failure.conflicts,
+            vec![ApplyConflict { object: "configmaps/settings".into(), field: ".data.mode".into(), manager: "helm".into() }]
+        );
+        let text = failure.to_string();
+        assert!(is_apply_conflict(&text), "{text}");
+        assert!(text.contains(".data.mode (helm)"), "{text}");
+        // The entry point without the flag does not force either, and its
+        // text error is recognisable.
+        let text = apply_manifest(&client, &[], MANIFEST).await.unwrap_err();
+        assert!(is_apply_conflict(&text), "{text}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for line in seen.iter() {
+            assert!(line.starts_with("PATCH /api/v1/namespaces/shop/configmaps/settings?fieldManager=skiff "), "{line}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_with_force_takes_the_fields() {
+        let (client, seen) = fake_api(conflicting).await;
+        let report = apply_manifest_with(&client, &[], MANIFEST, true).await.unwrap();
+        assert_eq!(report, vec!["configmaps/settings configured".to_string()]);
+        assert!(seen.lock().unwrap()[0].contains("fieldManager=skiff&force=true "));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn errors_keep_their_wording_and_bodies_are_capped() {
+        let (client, _) = fake_api(|line| {
+            if line.contains("/missing") {
+                (404, r#"{"kind":"Status","status":"Failure","message":"configmaps \"missing\" not found","reason":"NotFound","code":404}"#.to_string())
+            } else if line.contains("/html") {
+                (502, "<html>Bad Gateway</html>".to_string())
+            } else {
+                (200, format!(r#"{{"data":"{}"}}"#, "x".repeat(4096)))
+            }
+        })
+        .await;
+        let key = crate::kinds::builtin("", "configmaps").unwrap().key();
+        let err = get_object(&client, &key, "x", "missing").await.unwrap_err();
+        assert_eq!(err, "configmaps \"missing\" not found (404)");
+        let err = get_object(&client, &key, "x", "html").await.unwrap_err();
+        assert_eq!(err, "<html>Bad Gateway</html> (502)");
+        assert!(get_object(&client, &key, "x", "big").await.is_ok());
+        // The same answer against a small limit is refused, not collected.
+        let req = get_request(&key.object_path("x", "big"), None).unwrap();
+        let res = client.send(req.map(kube::client::Body::from)).await.unwrap();
+        let err = collect_capped(res.into_body(), 1024).await.unwrap_err();
+        assert!(matches!(err, BodyError::TooLarge { limit: 1024 }), "{err:?}");
+        assert!(err.message().contains("larger than"), "{}", err.message());
     }
 }

@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::AsyncBufReadExt;
 use indexmap::IndexMap;
 use kube::Client;
 use serde::Deserialize;
@@ -20,6 +19,8 @@ use serde_json::Value;
 
 use crate::cells::{cell_from_value, is_status_column, parse_time, value_text, Cell, ColKind, Tone};
 use crate::kinds::ResourceKey;
+use crate::logs::{LineRead, LineReader};
+use crate::ops::{collect_capped, BodyError, MAX_BODY_BYTES};
 use crate::table::{ColSource, Column, LoadState, Row, Snapshot, TableStore};
 use crate::util::{enc, get_request, Notifier};
 use crate::views::{tweaks_for, Tweaks};
@@ -61,6 +62,11 @@ const QUIET_REOPEN_DELAY: Duration = Duration::from_millis(300);
 /// How long a housekeeping list may take before the table stops saying
 /// "live" (no watch is open while it runs).
 const ROUTINE_GRACE: Duration = Duration::from_secs(2);
+/// Bytes kept of one watch line (one event). Far more than a real object
+/// can be (the API server refuses objects of a few megabytes), so only a
+/// broken or hostile server sends more; the excess is discarded as it
+/// arrives and the event is skipped.
+const MAX_WATCH_LINE: usize = if cfg!(test) { 256 * 1024 } else { 32 * 1024 * 1024 };
 const BACKOFF_START: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const PERMANENT_RETRY: Duration = Duration::from_secs(60);
@@ -476,9 +482,13 @@ async fn fetch_page(
         .await
         .map_err(|_| Fail::Transient("no response from the API server".into()))??;
     let status = res.status();
-    let bytes = tokio::time::timeout(BODY_TIMEOUT, res.into_body().collect_bytes())
-        .await
-        .map_err(|_| Fail::Transient("timed out reading the response".into()))??;
+    let bytes = match tokio::time::timeout(BODY_TIMEOUT, collect_capped(res.into_body(), MAX_BODY_BYTES)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(BodyError::Read(e))) => return Err(e.into()),
+        // Asking again would get the same answer: not worth retrying fast.
+        Ok(Err(e @ BodyError::TooLarge { .. })) => return Err(Fail::Permanent { code: 0, msg: e.message() }),
+        Err(_) => return Err(Fail::Transient("timed out reading the response".into())),
+    };
     if !status.is_success() {
         // The body is a Status object describing the failure.
         return Err(match serde_json::from_slice::<kube::core::Status>(&bytes) {
@@ -834,7 +844,7 @@ impl Engine {
             }
         }
 
-        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut line = LineReader::new(MAX_WATCH_LINE);
         let mut dirty = false;
         let mut last_publish = Instant::now();
         // Liveness: a healthy watch delivers events or periodic bookmarks.
@@ -869,10 +879,10 @@ impl Engine {
                 }
                 wait = wait.min(remaining);
             }
-            // `read_until` keeps partial data in `buf` when cancelled, so
-            // timing out here loses nothing.
+            // The reader keeps a partial line when cancelled, so timing out
+            // here loses nothing.
             let read = tokio::select! {
-                r = tokio::time::timeout(wait, reader.read_until(b'\n', &mut buf)) => r,
+                r = tokio::time::timeout(wait, line.read(&mut reader)) => r,
                 _ = store.relist.notified() => {
                     if self.refresh_requested() {
                         if dirty {
@@ -907,18 +917,24 @@ impl Engine {
                     }
                     return WatchEnd::Failed(Fail::Transient(e.to_string()));
                 }
-                Ok(Ok(_)) => {
-                    if buf.last() != Some(&b'\n') {
-                        // EOF: the server ended the watch.
-                        if dirty {
-                            self.publish();
-                        }
-                        return WatchEnd::Resume(watch_health(lines, started.elapsed(), self.quiet_min));
+                Ok(Ok(LineRead::Eof)) => {
+                    // The server ended the watch.
+                    if dirty {
+                        self.publish();
                     }
+                    return WatchEnd::Resume(watch_health(lines, started.elapsed(), self.quiet_min));
+                }
+                Ok(Ok(LineRead::Line { truncated })) => {
                     last_data = Instant::now();
                     lines += 1;
-                    let res = self.apply(&buf, rv);
-                    buf.clear();
+                    if truncated {
+                        // Longer than any real event (see MAX_WATCH_LINE):
+                        // what was kept is not valid JSON, so skip it and
+                        // carry on with the events that follow.
+                        tracing::debug!("skipped a watch line longer than {MAX_WATCH_LINE} bytes");
+                        continue;
+                    }
+                    let res = self.apply(line.line(), rv);
                     match res {
                         Ok((changed, _bookmark)) => dirty |= changed,
                         // This is how the API server reports an expired
@@ -1699,5 +1715,27 @@ mod tests {
         let row = plan.build_row(&[], Some(env.items.unwrap()[0])).unwrap();
         assert_eq!(&*row.name, "a");
         assert_eq!(&*row.uid, "x/a");
+    }
+
+    /// One event far longer than any real one, followed by an ordinary
+    /// event: the long one is skipped without being held in memory and the
+    /// watch carries on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_watch_line_is_survived() {
+        let huge = "x".repeat(4 * MAX_WATCH_LINE);
+        let body = format!(
+            "{{\"type\":\"ADDED\",\"object\":{{\"kind\":\"Table\",\"junk\":\"{huge}\"}}}}\n\
+             {{\"type\":\"ADDED\",\"object\":{{\"kind\":\"Table\",\"rows\":[{{\"cells\":[\"b\"],\"object\":{{\"metadata\":{{\"name\":\"b\",\"namespace\":\"x\",\"uid\":\"u-b\",\"resourceVersion\":\"6\"}}}}}}]}}}}\n"
+        );
+        // The first watch delivers both lines; later ones stay quiet.
+        let api = FakeApi::start_with(
+            Arc::new(move |n| if n == 0 { (Duration::ZERO, body.clone()) } else { (Duration::from_secs(60), String::new()) }),
+            false,
+        )
+        .await;
+        let store = api.store();
+        until("the row after the oversized line", Duration::from_secs(10), || store.peek().rows.len() == 2).await;
+        let (lists, _) = api.counts();
+        assert_eq!(lists, 1, "the row came from the watch, not from a relist");
     }
 }

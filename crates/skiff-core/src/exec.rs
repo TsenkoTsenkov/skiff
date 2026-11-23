@@ -31,6 +31,11 @@ const MAX_PENDING_OUTPUT: usize = 4 * 1024 * 1024;
 /// the queue grow without end. What does not fit is dropped.
 const MAX_PENDING_INPUT: usize = 8 * 1024 * 1024;
 
+/// How long the API server may take to open the session. Without a limit a
+/// server that accepts the request and then says nothing would leave the
+/// terminal "connecting" for ever.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 1 } else { 20 });
+
 /// Output not yet taken: `bytes[start..]`.
 #[derive(Default)]
 struct Output {
@@ -199,7 +204,12 @@ async fn drive(
     }
     .container(target.container.clone());
     let mut proc = tokio::select! {
-        p = pods.exec(&target.pod, command, &ap) => p.map_err(|e| friendly(&e))?,
+        p = tokio::time::timeout(OPEN_TIMEOUT, pods.exec(&target.pod, command, &ap)) => match p {
+            Ok(p) => p.map_err(|e| friendly(&e))?,
+            Err(_) => {
+                return Err(format!("no response from the API server within {} s", OPEN_TIMEOUT.as_secs()));
+            }
+        },
         _ = closing.notified() => return Ok("closed".into()),
     };
     let mut stdin = proc.stdin().ok_or("no stdin")?;
@@ -345,4 +355,43 @@ pub(crate) fn open(
     });
     *session.abort.lock() = Some(task.abort_handle());
     session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server that accepts the request and never answers: the session
+    /// must fail after the open timeout instead of connecting for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exec_that_is_never_answered_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let client = Client::try_from(kube::Config::new(format!("http://{addr}").parse().unwrap())).unwrap();
+        let session = open(
+            &tokio::runtime::Handle::current(),
+            async move { Ok(client) },
+            "x",
+            "p",
+            "c",
+            default_shell(),
+            true,
+            Notifier::noop(),
+        );
+        let deadline = std::time::Instant::now() + OPEN_TIMEOUT * 5;
+        while session.state() == ExecState::Connecting {
+            assert!(std::time::Instant::now() < deadline, "still connecting");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        match session.state() {
+            ExecState::Failed(why) => assert!(why.contains("no response"), "{why}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
 }
