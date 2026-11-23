@@ -102,6 +102,23 @@ SectionEnd
 
 Section "Uninstall"
   SetShellVarContext current
+  ; A running Skiff keeps skiff.exe locked: deleting it would fail without a
+  ; word, and the rest of this section would then remove the uninstaller
+  ; and the "Installed apps" entry, leaving the program behind with nothing
+  ; to remove it. So stop before anything is touched. (A running program
+  ; cannot be opened for writing; the file is only opened, not changed.)
+  IfFileExists "$INSTDIR\skiff.exe" 0 not_running
+  ClearErrors
+  FileOpen $0 "$INSTDIR\skiff.exe" a
+  IfErrors 0 not_locked
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Skiff is still running. Close it, then uninstall again." /SD IDOK
+    ; (So that a silent uninstall, as winget runs it, reports the failure.)
+    SetErrorLevel 1
+    Abort "Skiff is still running. Close it, then uninstall again."
+  not_locked:
+  FileClose $0
+  not_running:
+
   Delete "$SMPROGRAMS\Skiff.lnk"
   Delete "$INSTDIR\skiff.exe"
   Delete "$INSTDIR\LICENSE.txt"

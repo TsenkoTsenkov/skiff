@@ -44,6 +44,12 @@ unsigned packages; the header of each script lists its options.
 - **Trying the pipeline.** Actions → Release → Run workflow (or push a branch
   named `release/…`) builds everything and attaches it to the run as
   artifacts. Nothing is published.
+- **Pull requests.** A pull request that changes the release workflow, one
+  of the three packaging scripts, anything under `packaging/`, or the
+  program's build script or icons runs the same builds and checks: every
+  package is made, installed or started, and attached to the run. Such a
+  run can only read the repository, is given no secret (so nothing is
+  signed) and has no publish job.
 
 `<N>` is the build number, `git rev-list --count HEAD`: the number of commits
 on the built revision. It is compiled into the program and is what the
@@ -94,8 +100,10 @@ so.
 2. **Put all secrets and variables below into that environment**
    (Environment secrets / Environment variables), not into the
    repository-wide ones. Then only a build of `main` or of a `v*` tag can
-   sign anything; a run started by hand or from another branch gets no
-   secrets and builds unsigned.
+   sign anything; a run started by hand, from another branch or by a pull
+   request gets no secrets and builds unsigned. Environment secrets only:
+   a secret stored for the whole repository can be read by any workflow
+   on any branch of it.
 3. **Settings → Actions → General → Workflow permissions:** "Read
    repository contents" is enough; the workflow asks for more only in its
    publish job.
@@ -112,6 +120,7 @@ releases.
 |---|---|---|
 | `MACOS_CERT_P12_BASE64` | secret | Signing the Mac app with a Developer ID. Without it the app is signed ad hoc and Gatekeeper refuses a downloaded copy until the user allows it. |
 | `MACOS_CERT_PASSWORD` | secret | The password of that `.p12` file. |
+| `APPLE_TEAM_ID` | variable | Required together with `MACOS_CERT_P12_BASE64`: the Team ID of that certificate (10 characters, the part in brackets of `Developer ID Application: Name (TEAMID)`). It is compiled into the app, which then only accepts updates signed by that team. Not a secret. The program is compiled before the certificate is put on the build machine, which is why the ID cannot be read from the certificate; the build fails if the two do not match, or if the certificate is set and this is not. |
 | `MACOS_SIGN_IDENTITY` | secret, optional | The identity to sign with, `Developer ID Application: Name (TEAMID)`. Only needed if the `.p12` holds more than one; otherwise it is read from the certificate. |
 | `APPLE_API_KEY_P8_BASE64` | secret | Notarization by Apple (with the two below). Without the three the app is signed but not notarized, and Gatekeeper still refuses it. |
 | `APPLE_API_KEY_ID` | secret | The key's ID (10 characters). |
@@ -146,6 +155,9 @@ membership can create this kind of certificate.
    Exchange (.p12)", and give it a strong password.
 4. `MACOS_CERT_P12_BASE64` = the base64 of that file; `MACOS_CERT_PASSWORD`
    = the password. Delete the exported file afterwards.
+5. Set the variable `APPLE_TEAM_ID` (an environment variable of `release`,
+   not a secret) to the certificate's Team ID: the 10 characters in
+   brackets at the end of the identity's name.
 
 To see the identity's exact name: `security find-identity -v -p codesigning`.
 
@@ -236,9 +248,11 @@ module, and fails the build if a file is not validly signed afterwards.
 
 **A certificate from a certificate authority** (a few hundred USD a year).
 Since 2023 the private keys of such certificates must live on a hardware
-token or in a cloud HSM, so most cannot be exported as a file. If yours can
-(or for testing with a self-signed one), set `WINDOWS_CERT_PFX_BASE64` and
-`WINDOWS_CERT_PASSWORD`; the script signs with `signtool`.
+token or in a cloud HSM, so most cannot be exported as a file. If yours can,
+set `WINDOWS_CERT_PFX_BASE64` and `WINDOWS_CERT_PASSWORD`; the script signs
+with `signtool`. A self-signed certificate does not work here, not for a
+trial either: the script requires a signature that Windows trusts, and a
+self-signed one is not trusted on the build machine.
 
 Also worth doing regardless: publish to winget (below). `winget install`
 does not show the browser's download warning.
@@ -309,7 +323,9 @@ submitted, never nightlies.
   expected to work.
 - **GitHub Actions:** pinned by commit in the workflows; Dependabot proposes
   updates.
-- **appimagetool:** version and SHA-256 at the top of
-  `hack/linux-package.sh`.
+- **appimagetool and the AppImage runtime:** version and SHA-256 of each,
+  for both architectures, at the top of `hack/linux-package.sh`. The runtime
+  is a dated release of <https://github.com/AppImage/type2-runtime>; it is
+  the first code that runs when someone starts the AppImage.
 - **cargo-deny:** version and SHA-256 in `.github/workflows/ci.yml`; its
   rules are in `deny.toml`.

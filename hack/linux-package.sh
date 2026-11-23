@@ -17,7 +17,9 @@
 # Needs Rust, tar and gzip; dpkg-deb for the .deb; for the AppImage
 # appimagetool, which is downloaded (pinned release, checked against the
 # SHA-256 below) into target/tools/ unless APPIMAGETOOL names one or it is
-# on PATH. No GPU, Wayland or X11 libraries are put into any package: the
+# on PATH, and the AppImage runtime (the small program at the front of every
+# AppImage, which starts it), downloaded and checked the same way unless
+# APPIMAGE_RUNTIME names one. No GPU, Wayland or X11 libraries are put into any package: the
 # program loads the system's at run time, and bundled copies would not match
 # the machine's drivers.
 #
@@ -25,8 +27,8 @@
 #   SKIFF_BUILD        build number (git rev-list --count HEAD); 0 locally
 #   SKIFF_UPDATE_REPO  owner/repo the update check asks, when not the default
 #   APPIMAGETOOL       path of an appimagetool to use
-#   APPIMAGE_RUNTIME   path of an AppImage type-2 runtime to embed (otherwise
-#                      appimagetool downloads the current one from GitHub)
+#   APPIMAGE_RUNTIME   path of an AppImage type-2 runtime to embed instead of
+#                      the pinned one
 #   SOURCE_DATE_EPOCH  timestamp for the files in the packages (default: the
 #                      last commit's)
 set -euo pipefail
@@ -38,6 +40,36 @@ appimagetool_sha256() {
     x86_64) echo ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
     aarch64) echo f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158 ;;
   esac
+}
+# The runtime is the first code that runs when someone starts the AppImage.
+# appimagetool would otherwise fetch whatever the "continuous" release of
+# AppImage/type2-runtime holds that day, unchecked; this is a dated release
+# of it.
+appimage_runtime_version=20251108
+appimage_runtime_sha256() {
+  case "$1" in
+    x86_64) echo 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d ;;
+    aarch64) echo 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444 ;;
+  esac
+}
+
+# fetch_pinned <url> <sha256> <file>: downloads <url> to <file> unless the
+# file is already there with that SHA-256; fails, leaving nothing behind,
+# when the download does not have it.
+fetch_pinned() {
+  local url=$1 want=$2 file=$3
+  if [ -f "$file" ] && echo "$want  $file" | sha256sum -c --status; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")"
+  echo "Downloading $url"
+  curl -fsSL --retry 3 -o "$file.part" "$url"
+  if ! echo "$want  $file.part" | sha256sum -c --status; then
+    echo "The download of $url does not have the expected SHA-256 ($want)." >&2
+    rm -f "$file.part"
+    return 1
+  fi
+  mv "$file.part" "$file"
 }
 
 target=""
@@ -254,21 +286,20 @@ if [ "$appimage" = 1 ]; then
     tool=$(command -v appimagetool)
   fi
   if [ -z "$tool" ]; then
-    want=$(appimagetool_sha256 "$arch")
     tool="$PWD/target/tools/appimagetool-$appimagetool_version-$arch.AppImage"
-    if [ ! -x "$tool" ] || ! echo "$want  $tool" | sha256sum -c --status; then
-      mkdir -p "$(dirname "$tool")"
-      echo "Downloading appimagetool $appimagetool_version"
-      curl -fsSL --retry 3 -o "$tool.part" \
-        "https://github.com/AppImage/appimagetool/releases/download/$appimagetool_version/appimagetool-$arch.AppImage"
-      if ! echo "$want  $tool.part" | sha256sum -c --status; then
-        echo "The downloaded appimagetool does not have the expected SHA-256 ($want)." >&2
-        rm -f "$tool.part"
-        exit 1
-      fi
-      chmod +x "$tool.part"
-      mv "$tool.part" "$tool"
-    fi
+    fetch_pinned "https://github.com/AppImage/appimagetool/releases/download/$appimagetool_version/appimagetool-$arch.AppImage" \
+      "$(appimagetool_sha256 "$arch")" "$tool"
+    chmod +x "$tool"
+  fi
+  # Always handed to appimagetool, so that it never downloads one itself.
+  runtime="${APPIMAGE_RUNTIME:-}"
+  if [ -z "$runtime" ]; then
+    runtime="$PWD/target/tools/appimage-runtime-$appimage_runtime_version-$arch"
+    fetch_pinned "https://github.com/AppImage/type2-runtime/releases/download/$appimage_runtime_version/runtime-$arch" \
+      "$(appimage_runtime_sha256 "$arch")" "$runtime"
+  elif [ ! -f "$runtime" ]; then
+    echo "APPIMAGE_RUNTIME does not exist: $runtime" >&2
+    exit 1
   fi
 
   appdir="$work/Skiff.AppDir"
@@ -282,15 +313,19 @@ if [ "$appimage" = 1 ]; then
 
   image="$out/Skiff-linux-$arch.AppImage"
   rm -f "$image"
-  runtime_args=()
-  if [ -n "${APPIMAGE_RUNTIME:-}" ]; then
-    runtime_args=(--runtime-file "$APPIMAGE_RUNTIME")
-  fi
   # (--appimage-extract-and-run: appimagetool is an AppImage itself, and
   # build machines and containers have no FUSE to mount it with.)
   ARCH=$arch "$tool" --appimage-extract-and-run --no-appstream \
-    ${runtime_args[@]+"${runtime_args[@]}"} "$appdir" "$image"
+    --runtime-file "$runtime" "$appdir" "$image"
   chmod +x "$image"
+  # The image must begin with the runtime chosen above. (Up to 16 bytes
+  # differ: appimagetool writes the MD5 of the payload into the runtime's
+  # .digest_md5 section.)
+  differing=$(cmp -l -n "$(stat -c %s "$runtime")" "$runtime" "$image" | wc -l || true)
+  if [ "$differing" -gt 16 ]; then
+    echo "$image does not start with the AppImage runtime $runtime." >&2
+    exit 1
+  fi
   # The metadata is checked here rather than by appimagetool, whose check
   # depends on which appstream tools happen to be installed.
   if command -v appstreamcli >/dev/null 2>&1; then

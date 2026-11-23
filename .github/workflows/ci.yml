@@ -8,7 +8,10 @@
 #   deny       cargo-deny: security advisories, licences, crate sources.
 #              Also runs every Monday, so that a newly published advisory is
 #              noticed without a push.
-#   packaging  the packaging scripts and metadata files are well-formed
+#   packaging  the packaging scripts and metadata files are well-formed.
+#              (A pull request that changes them also runs the release
+#              workflow, which builds and tries every package without
+#              publishing anything.)
 #
 # Nothing here can write to the repository or read a secret.
 name: CI
@@ -50,7 +53,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component clippy
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal --component clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -77,7 +80,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -108,7 +111,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -128,7 +131,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal
       # The released binary, pinned by version and checksum (Dependabot does
       # not see this: raise both by hand).
       - name: Install cargo-deny
@@ -157,9 +160,14 @@ jobs:
       - name: Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream nsis
+          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream nsis python3-yaml
       - name: Shell scripts
         run: shellcheck hack/macos-app.sh hack/linux-package.sh
+      # What a linter cannot see: the toolchain's name is read correctly
+      # from a CRLF checkout, the release workflow compiles nothing within
+      # reach of a signing secret, and only its publish job may write.
+      - name: Workflows
+        run: python3 .github/scripts/check-workflows.py
       - name: Desktop entry
         run: desktop-file-validate packaging/linux/io.github.tsenkotsenkov.skiff.desktop
       - name: AppStream metadata
