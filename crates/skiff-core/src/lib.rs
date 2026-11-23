@@ -8,8 +8,10 @@ pub mod cells;
 pub mod exec;
 pub mod forward;
 pub mod kinds;
+pub mod kubeconfig;
 pub mod logs;
 pub mod ops;
+pub mod prom;
 pub mod session;
 pub mod table;
 pub mod util;
@@ -20,9 +22,14 @@ pub use cells::{fmt_age, fmt_bytes, fmt_cpu, now_unix, Cell, ColKind, Tone};
 pub use exec::{ExecSession, ExecState};
 pub use forward::PortForward;
 pub use kinds::{Builtin, Category, Discovered, ResourceKey, BUILTINS};
+pub use kubeconfig::{find_executable, KubeconfigProblem, KubeconfigSources, LoadedKubeconfig};
 pub use logs::{LogLine, LogOptions, LogStream, LogTarget, SourceState};
 pub use ops::{ContainerInfo, ObjectData};
-pub use session::{load_contexts, ConnStatus, ContextInfo, Contexts, Core, Metrics, Session, Usage};
+pub use prom::{Alert, AlertKind, AlertTarget, Prom, PromEndpoint, PromError, SampleRing, TimeRange};
+pub use session::{
+    load_contexts, load_contexts_from, Alerts, ConnStatus, ContextInfo, Contexts, Core, Metrics, PromStatus, Session, Usage,
+    UsageHistory,
+};
 pub use table::{compare, ColSource, Column, LoadState, Row, Snapshot, TableStore};
-pub use util::{Job, Notifier};
+pub use util::{classify, ErrorInfo, ErrorKind, Job, Notifier};
 pub use watch::ListQuery;

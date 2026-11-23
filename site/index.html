@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skiff: a fast, native Kubernetes desktop app</title>
+<meta name="description" content="Skiff is a native desktop app for looking after Kubernetes clusters. One program, no web view, no account, no telemetry. It uses your kubeconfig like kubectl does. Free and open source for macOS, Windows and Linux.">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0E1014" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
+<meta property="og:title" content="Skiff: a fast, native Kubernetes desktop app">
+<meta property="og:description" content="One program, no web view, no account, no telemetry. It uses your kubeconfig like kubectl does.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://tsenkotsenkov.github.io/skiff/img/overview.png">
+<link rel="icon" type="image/png" sizes="64x64" href="img/icon-64.png">
+<link rel="apple-touch-icon" href="img/icon-256.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="#" aria-label="Skiff, top of page">
+      <img src="img/icon-64.png" width="28" height="28" alt="">
+      <span>Skiff</span>
+    </a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#features">Features</a>
+      <a href="#measured">Measured</a>
+      <a href="#security">Security</a>
+      <a href="#download">Download</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <a class="gh" href="https://github.com/TsenkoTsenkov/skiff">GitHub</a>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Open source · macOS, Windows, Linux</p>
+    <h1>Your Kubernetes clusters, <br>in a fast native window.</h1>
+    <p class="lead">
+      Skiff is a desktop app for looking after clusters: every resource, live,
+      with logs, shells, metrics and alerts. One program. No web view, no
+      account, no telemetry. It reads your kubeconfig and talks to the API
+      server the way <code>kubectl</code> does.
+    </p>
+    <div class="cta">
+      <a class="btn primary" id="dl-main" href="#download">
+        <span class="btn-label" id="dl-main-label">Download Skiff</span>
+        <span class="btn-sub" id="dl-main-sub">macOS, Windows and Linux</span>
+      </a>
+      <a class="btn" href="#download" id="dl-other">All downloads</a>
+    </div>
+    <p class="fine">Free, MIT licence. <a href="https://github.com/TsenkoTsenkov/skiff">Source on GitHub</a>.</p>
+
+    <figure class="shot hero-shot">
+      <div class="chrome" aria-hidden="true"><i></i><i></i><i></i></div>
+      <picture>
+        <source srcset="img/overview-light.png" media="(prefers-color-scheme: light)">
+        <img src="img/overview.png" width="1440" height="900"
+             alt="Skiff's cluster overview: node, pod and deployment counts, CPU and memory usage, a list of firing Prometheus alerts with links to the objects they are about, and the pods that need attention.">
+      </picture>
+    </figure>
+  </div>
+</section>
+
+<section class="strip" aria-label="In short">
+  <div class="wrap strip-grid">
+    <div>
+      <h2>Native, not a browser in a box</h2>
+      <p>A single Rust program that draws its own interface. One process, no
+      background services, nothing listening on a port.</p>
+    </div>
+    <div>
+      <h2>Your kubeconfig, as it is</h2>
+      <p>EKS, GKE, AKS and OIDC work through the credential plugins your
+      kubeconfig already names. If <code>kubectl</code> connects, Skiff does.</p>
+    </div>
+    <div>
+      <h2>Only what you look at</h2>
+      <p>A resource type is listed and watched when you open it, and dropped
+      a few minutes after you leave. Large clusters stay quick.</p>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="section">
+  <div class="wrap">
+    <h2 class="h">What is in it</h2>
+
+    <div class="feature">
+      <div class="feature-text">
+        <h3>Every resource, live</h3>
+        <p>Every type the cluster serves, custom resources included, with
+        instant filtering, sortable columns and a details panel that links
+        objects to each other: a pod to its node, its owner, its events.</p>
+        <ul>
+          <li>Several clusters; namespace filters remembered per cluster</li>
+          <li>YAML view, edit and apply; conflicts are shown, not overridden</li>
+          <li>Scale, restart, cordon, suspend, delete</li>
+        </ul>
+      </div>
+      <a class="shot" title="Open the full screenshot" href="img/pod-details.png">
+        <img loading="lazy" src="img/crop-pod-details.png" width="880" height="640"
+             alt="The pods table with one pod selected and its details open: labels, node, containers with image, ports, requests and limits.">
+      </a>
+    </div>
+
+    <div class="feature flip">
+      <div class="feature-text">
+        <h3>Metrics and alerts from the Prometheus you already run</h3>
+        <p>CPU, memory, network and restart charts for pods, workloads and
+        nodes, over an hour or a week. Firing alerts appear on the overview
+        and on the object each one is about.</p>
+        <ul>
+          <li>Reached through the Kubernetes API server: no extra login, no port-forward</li>
+          <li>Found automatically, or named in one setting</li>
+          <li>A short history from metrics-server where there is no Prometheus</li>
+          <li>One click to the same queries in your Grafana</li>
+        </ul>
+      </div>
+      <a class="shot" title="Open the full screenshot" href="img/metrics.png">
+        <img loading="lazy" src="img/crop-metrics.png" width="840" height="840"
+             alt="A pod's Metrics tab: CPU and memory charts with request and limit lines, and a network chart, for the last hour.">
+      </a>
+    </div>
+
+    <div class="gallery">
+      <figure>
+        <a class="shot" title="Open the full screenshot" href="img/logs.png"><img loading="lazy" src="img/crop-logs.png" width="702" height="468" alt="Following a pod's logs in the dock, with timestamps and an error line highlighted."></a>
+        <figcaption><b>Logs.</b> Follow one pod or a whole workload, with timestamps, previous containers and find.</figcaption>
+      </figure>
+      <figure>
+        <a class="shot" title="Open the full screenshot" href="img/shell.png"><img loading="lazy" src="img/crop-shell.png" width="702" height="468" alt="A shell in a container, in the built-in terminal."></a>
+        <figcaption><b>Shell.</b> A real terminal in any container, or one click into your own terminal app.</figcaption>
+      </figure>
+      <figure>
+        <a class="shot" title="Open the full screenshot" href="img/palette.png"><img loading="lazy" src="img/crop-palette.png" width="830" height="553" alt="The command palette with 'deploy' typed and Deployments offered."></a>
+        <figcaption><b>Keyboard first.</b> <kbd>Ctrl</kbd> <kbd>K</kbd> jumps to anything; vim-style keys you can rebind.</figcaption>
+      </figure>
+      <figure>
+        <a class="shot" title="Open the full screenshot" href="img/settings.png"><img loading="lazy" src="img/crop-settings.png" width="778" height="519" alt="The Settings window on its Appearance page: theme and zoom."></a>
+        <figcaption><b>Settings.</b> Dark, light or follow the system; zoom; read-only clusters; update channel.</figcaption>
+      </figure>
+    </div>
+
+    <div class="callout">
+      <h3>Read-only clusters</h3>
+      <p>Mark production read-only and Skiff refuses every change to it:
+      no edit, delete, scale, shell or port-forward. Or have it ask before
+      each change. A guard against a slip of the hand, one switch per
+      cluster.</p>
+    </div>
+  </div>
+</section>
+
+<section id="measured" class="section alt">
+  <div class="wrap narrow">
+    <h2 class="h">Measured, not claimed</h2>
+    <p class="sub">We publish only numbers we measured, with the method next to
+    them. Skiff 0.1.0 on Linux, showing all pods of a test cluster with 100
+    nodes and 5,415 pods, on a 4-vCPU virtual machine <strong>with no
+    GPU</strong>, so every frame was drawn in software.</p>
+
+    <div class="table-wrap">
+    <table class="measured">
+      <thead><tr><th scope="col">What</th><th scope="col">Median</th><th scope="col">Range</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">First frame built after launch</th><td>118 ms</td><td>96 – 127 ms</td></tr>
+        <tr><th scope="row">Window visible</th><td>160 ms</td><td>149 – 256 ms</td></tr>
+        <tr><th scope="row">All 5,415 pods listed and live</th><td>0.58 s</td><td>0.51 – 0.97 s</td></tr>
+        <tr><th scope="row">Memory with that table open (PSS)</th><td>162 MiB</td><td>161 – 163 MiB</td></tr>
+        <tr><th scope="row">CPU while idle</th><td>0.50% of one core</td><td>0.47 – 0.55%</td></tr>
+        <tr><th scope="row">Processes / threads</th><td>1 / 18</td><td></td></tr>
+        <tr><th scope="row">Listening sockets</th><td>none</td><td></td></tr>
+        <tr><th scope="row">Executable</th><td>39.2 MB</td><td></td></tr>
+        <tr><th scope="row">Download (.deb / AppImage)</th><td>11.3 MB / 15.4 MB</td><td></td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <ul class="notes">
+      <li>At least 92 of the 162 MiB are the software graphics stack that
+      stands in for a GPU on that machine. Memory and speed on a real GPU,
+      on macOS and on Windows have not been measured yet.</li>
+      <li>The test cluster's pods are simulated and the API server is local,
+      so there is no network delay in these figures.</li>
+      <li>No other tool has been measured, so there is no comparison table.
+      The same script measures any app; run it on your machine and see.</li>
+    </ul>
+    <p><a class="more" href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/benchmarks.md">Method, raw tables and caveats</a></p>
+  </div>
+</section>
+
+<section id="security" class="section">
+  <div class="wrap">
+    <h2 class="h">What it does with your access</h2>
+    <p class="sub">A cluster tool holds the keys to your clusters. This is what Skiff does with them.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Credentials stay put</h3>
+        <p>Skiff reads your kubeconfig and runs the credential plugins it
+        names, as kubectl does. No account, and no credential store of its
+        own.</p>
+      </div>
+      <div class="card">
+        <h3>Two destinations</h3>
+        <p>The API server of the cluster you open, and GitHub's API for an
+        anonymous update check that one setting turns off. Prometheus is
+        reached through the API server.</p>
+      </div>
+      <div class="card">
+        <h3>No telemetry</h3>
+        <p>No usage statistics, no crash reports, no identifier. There is
+        nothing to opt out of.</p>
+      </div>
+      <div class="card">
+        <h3>Secrets on request only</h3>
+        <p>Tables ask the server for rows, not objects. A Secret is fetched
+        in full only when you open it, and a copied value is cleared from the
+        clipboard after a minute.</p>
+      </div>
+      <div class="card">
+        <h3>Clusters are not trusted</h3>
+        <p>Log lines and responses are bounded, escape sequences in logs
+        are removed, and a program in a container cannot write to your
+        clipboard through the terminal.</p>
+      </div>
+      <div class="card">
+        <h3>Careful updates</h3>
+        <p>On Windows and Linux Skiff only tells you about a new version.
+        On macOS it installs one only after the download's code signature
+        verifies.</p>
+      </div>
+    </div>
+    <p class="after-cards">Skiff is new and has had no independent security review.
+      <a class="more" href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/security.md">The full account, with its limits</a>
+    </p>
+  </div>
+</section>
+
+<section id="download" class="section alt">
+  <div class="wrap">
+    <h2 class="h">Download</h2>
+    <p class="sub">The current stable release. Free, no sign-up.</p>
+    <div class="downloads">
+      <div class="os" data-os="mac">
+        <h3>macOS</h3>
+        <p class="req">macOS 11 or newer · Apple Silicon and Intel</p>
+        <a class="btn primary block" href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-macos-universal.dmg">Disk image (.dmg)</a>
+        <p class="hint">Open it and drag Skiff to Applications.</p>
+      </div>
+      <div class="os" data-os="windows">
+        <h3>Windows</h3>
+        <p class="req">Windows 10 or 11 · 64-bit</p>
+        <a class="btn primary block" href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64-setup.exe">Installer (.exe)</a>
+        <p class="hint">Installs for your user; no administrator rights. Or the
+          <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64.zip">portable zip</a>.</p>
+      </div>
+      <div class="os" data-os="linux">
+        <h3>Linux</h3>
+        <p class="req">glibc 2.35 or newer · x86_64 and arm64</p>
+        <a class="btn primary block" href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-x86_64.AppImage">AppImage (x86_64)</a>
+        <ul class="files">
+          <li>x86_64:
+            <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_amd64.deb">.deb</a>
+            <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-x86_64.tar.gz">.tar.gz</a></li>
+          <li>arm64:
+            <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-aarch64.AppImage">AppImage</a>
+            <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_arm64.deb">.deb</a>
+            <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-aarch64.tar.gz">.tar.gz</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="notice">
+      <p><strong>First launch.</strong> The builds are not yet signed by Apple
+      or Microsoft, so both systems ask before running Skiff the first time.
+      The steps are in the <a href="#faq-macos">FAQ</a>. Each release's notes
+      say whether that build is signed.</p>
+    </div>
+    <p class="verify">
+      Check a download against
+      <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/SHA256SUMS">SHA256SUMS</a>,
+      see <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/install.md#checking-a-download">how to verify it</a>,
+      browse <a href="https://github.com/TsenkoTsenkov/skiff/releases">all releases</a>,
+      or <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/install.md#building-from-source">build from source</a>.
+    </p>
+  </div>
+</section>
+
+<section id="faq" class="section">
+  <div class="wrap narrow">
+    <h2 class="h">Questions</h2>
+
+    <details id="faq-macos" open>
+      <summary>macOS says Skiff cannot be opened. What now?</summary>
+      <p>The Mac build is not yet signed with an Apple Developer ID, so
+      macOS stops the first start. Allow it once: open <b>System Settings →
+      Privacy &amp; Security</b>, scroll down to the message about Skiff and
+      choose <b>Open Anyway</b>. From a terminal, the same is:</p>
+      <pre><code>xattr -dr com.apple.quarantine /Applications/Skiff.app</code></pre>
+      <p>After that it opens normally. The notes of each release say whether
+      that build is signed and notarized; a notarized build needs none of
+      this.</p>
+    </details>
+
+    <details id="faq-windows" open>
+      <summary>Windows shows “Windows protected your PC”.</summary>
+      <p>The Windows build is not yet signed, so SmartScreen warns about a
+      program it has not seen before. Choose <b>More info</b>, then <b>Run
+      anyway</b>. You can check the file first against the release's
+      SHA256SUMS.</p>
+    </details>
+
+    <details>
+      <summary>Which clusters does it show? Where does it find my kubeconfig?</summary>
+      <p>The same ones as <code>kubectl</code>: the files listed in
+      <code>$KUBECONFIG</code>, or <code>~/.kube/config</code>. You can add
+      more files, folders of files or wildcards in Settings, or drop a
+      kubeconfig onto the window. When a file changes, for example after
+      <code>aws eks update-kubeconfig</code>, Skiff picks it up when you
+      switch back to it. A broken file is named and the others still
+      work.</p>
+    </details>
+
+    <details>
+      <summary>Does it work with EKS, GKE, AKS and single sign-on?</summary>
+      <p>Yes, through the credential plugins your kubeconfig names
+      (<code>aws</code>, <code>gke-gcloud-auth-plugin</code>,
+      <code>kubelogin</code> and others) and OIDC. Skiff has no sign-in of its
+      own. If a plugin is missing or a login has expired, Skiff says which
+      and what to run.
+      <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/clusters.md">Clusters and signing in</a></p>
+    </details>
+
+    <details>
+      <summary>How does it find Prometheus, and what does it need?</summary>
+      <p>It looks for the Prometheus Service in your cluster by the labels
+      and names the common installations use (kube-prometheus-stack, the
+      Prometheus chart, VictoriaMetrics) and asks it through the Kubernetes
+      API server. Your account needs <code>get</code> on
+      <code>services/proxy</code> for that Service. If yours has an unusual
+      name, one setting names it. Without Prometheus you still get CPU and
+      memory from metrics-server.
+      <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/docs/observability.md">Metrics and alerts</a></p>
+    </details>
+
+    <details>
+      <summary>How do updates work?</summary>
+      <p>Skiff asks GitHub at startup, and every four hours while open,
+      whether a newer release exists. On macOS it can install the update
+      after checking its signature; on Windows and Linux it opens the
+      release page. You can turn the check off, or choose nightly builds,
+      in Settings.</p>
+    </details>
+
+    <details>
+      <summary>What is deliberately not in it?</summary>
+      <p>No plugin system, no embedded Grafana or other web view, no
+      sign-in or VPN client of its own, no incident management, no hosted
+      or team mode, and no bundled <code>kubectl</code> or
+      <code>helm</code>. Skiff is meant to stay one small program you can
+      trust with cluster credentials. Helm releases and node drain are on
+      the roadmap.</p>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-row">
+    <div class="foot-brand">
+      <img src="img/icon-64.png" width="24" height="24" alt="">
+      <span>Skiff</span>
+      <span class="muted">MIT licence</span>
+    </div>
+    <nav aria-label="Project links">
+      <a href="https://github.com/TsenkoTsenkov/skiff">GitHub</a>
+      <a href="https://github.com/TsenkoTsenkov/skiff/tree/main/docs">Documentation</a>
+      <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/SECURITY.md">Report a security problem</a>
+      <a href="https://github.com/TsenkoTsenkov/skiff/issues">Issues</a>
+    </nav>
+  </div>
+  <div class="wrap">
+    <p class="legal">This page loads nothing from other sites and sets no cookies.
+    Kubernetes is a registered trademark of The Linux Foundation; Skiff is an
+    independent project and is not affiliated with it.</p>
+  </div>
+</footer>
+
+<script>
+// Offers the visitor's own system first. Everything works without this:
+// all downloads are listed in the Download section. Nothing is sent
+// anywhere; the browser's own description of the system is read.
+(function () {
+  var base = "https://github.com/TsenkoTsenkov/skiff/releases/latest/download/";
+  var ua = navigator.userAgent || "";
+  var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  var os = null;
+  if (/Android|iPhone|iPad|iPod/i.test(ua) || (/Mac/i.test(platform) && navigator.maxTouchPoints > 1)) os = "mobile";
+  else if (/Mac/i.test(platform)) os = "mac";
+  else if (/Win/i.test(platform)) os = "windows";
+  else if (/Linux|X11/i.test(platform) || /Linux/i.test(ua)) os = "linux";
+
+  var picks = {
+    mac: ["Download for macOS", "Universal .dmg · macOS 11 or newer", "Skiff-macos-universal.dmg"],
+    windows: ["Download for Windows", "Installer · 64-bit", "Skiff-windows-x64-setup.exe"],
+    linux: ["Download for Linux", "AppImage · x86_64", "Skiff-linux-x86_64.AppImage"]
+  };
+  var main = document.getElementById("dl-main");
+  var label = document.getElementById("dl-main-label");
+  var sub = document.getElementById("dl-main-sub");
+  if (os === "mobile") {
+    label.textContent = "Downloads";
+    sub.textContent = "Skiff is a desktop app";
+    document.getElementById("dl-other").hidden = true;
+    return;
+  }
+  var pick = picks[os];
+  if (!pick) return;
+  label.textContent = pick[0];
+  sub.textContent = pick[1];
+  main.href = base + pick[2];
+  document.getElementById("dl-other").textContent = "Other systems";
+  var card = document.querySelector('.os[data-os="' + os + '"]');
+  if (card) card.classList.add("yours");
+})();
+</script>
+</body>
+</html>

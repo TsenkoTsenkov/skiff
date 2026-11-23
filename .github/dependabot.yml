@@ -1,0 +1,33 @@
+# Dependabot opens pull requests for outdated dependencies; CI then says
+# whether the update builds and passes.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      # The UI stack is released together and only works together.
+      egui:
+        patterns: ["egui*", "eframe", "epaint*", "emath", "ecolor"]
+      kube:
+        patterns: ["kube*", "k8s-openapi"]
+      # Everything else that is only a patch release, in one pull request.
+      patches:
+        update-types: ["patch"]
+
+  # The workflows pin actions by commit; this keeps the pins current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

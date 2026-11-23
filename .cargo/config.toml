@@ -1,0 +1,5 @@
+# Windows (MSVC) builds link the C runtime statically, so skiff.exe runs on
+# a machine without the Visual C++ redistributable. Nothing else is linked
+# that would need the DLL runtime (TLS is rustls + ring, no OpenSSL).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

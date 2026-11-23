@@ -1,0 +1,23 @@
+name: Feature request
+description: Something Skiff should be able to do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task or problem, rather than the solution. What do you do today instead?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you imagine it working. A sketch or a screenshot from another tool is welcome.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      description: Skiff deliberately has no web view, no telemetry, no account and no plugin system, and does not bundle kubectl or helm.
+      options:
+        - label: This fits within that scope

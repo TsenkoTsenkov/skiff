@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in Skiff does not work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time. Please remove cluster names, tokens and anything else private from what you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what Skiff did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the Pods view of a namespace with ...
+        2. Click ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Skiff version
+      description: The output of `skiff --version`, or the version shown in the app.
+      placeholder: skiff 1.0.0 (build 123)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+        - Linux (Wayland)
+        - Linux (X11)
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: Operating system version and how Skiff was installed
+      placeholder: Ubuntu 24.04, AppImage
+  - type: input
+    id: cluster
+    attributes:
+      label: Kubernetes version and kind of cluster
+      description: For example 1.33 on EKS, kind, k3s. Leave empty if the problem has nothing to do with a cluster.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Messages or logs
+      description: Any error message Skiff showed, or what it printed when started from a terminal.
+      render: text

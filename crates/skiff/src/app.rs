@@ -1,8 +1,9 @@
 //! Application state and the top-level layout.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, FontId, Frame, Key, KeyboardShortcut, Layout, Margin, Modifiers, Panel,
@@ -12,15 +13,18 @@ use egui_material_icons::{icons, MaterialIcon};
 use serde::{Deserialize, Serialize};
 use skiff_core::kinds;
 use skiff_core::{
-    load_contexts, Category, ConnStatus, Contexts, Core, Job, LoadState, Metrics, Notifier, PortForward,
-    ResourceKey, Row, Session, Tone, BUILTINS,
+    Category, ConnStatus, Contexts, Core, Job, KubeconfigSources, LoadState, LoadedKubeconfig, Metrics, Notifier,
+    PortForward, ResourceKey, Row, Session, Snapshot, TableStore, Tone, BUILTINS,
 };
 
-use crate::detail::{Detail, DetailAction, DetailTab};
+use crate::config::{Config, Theme};
+use crate::detail::{Detail, DetailAction};
 use crate::dock::Dock;
 use crate::keymap::{Action, Keymap};
 use crate::overview;
+use crate::pages::{self, KubeconfigReport};
 use crate::palette::{self, Command, PaletteState};
+use crate::settings::{self, Section};
 use crate::table_view::{self, RowAction, TableUi, ViewCache};
 use crate::theme::{self, Palette, TOP_BAR_HEIGHT};
 use crate::widgets;
@@ -83,15 +87,28 @@ pub struct AppOptions {
     pub view: Option<String>,
     /// Start with the namespace filter set to this namespace.
     pub namespace: Option<String>,
+    /// Kubeconfig files from `--kubeconfig`, in the order given. When not
+    /// empty they are used instead of the configured or default ones.
+    pub kubeconfigs: Vec<std::path::PathBuf>,
 }
 
+// (`serde(default)`: state saved by an older version, which lacks the
+// newer fields, must still load.)
 #[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 struct Saved {
+    /// The theme as versions before the `theme` setting stored it: used
+    /// only while config.json names none.
     light: bool,
     context: Option<String>,
     namespaces: HashMap<String, Vec<String>>,
     sidebar_closed: bool,
+    /// The first-run hint about the palette and `?` has done its job.
+    hint_seen: bool,
 }
+
+/// How long a secret copied from Skiff stays on the clipboard.
+const SECRET_CLIPBOARD_TIME: Duration = Duration::from_secs(60);
 
 pub struct Toast {
     pub text: String,
@@ -108,6 +125,144 @@ enum Pending {
     /// `told`: the user has been told that it failed (it may be waiting for
     /// them to come back to that cluster).
     Apply { job: Job<Vec<String>>, text: String, context: String, told: bool },
+}
+
+/// A standing message under the top bar that stays until it is dismissed
+/// (a notification, by contrast, goes away by itself): something the user
+/// has to know about but that needs no answer now. Raise one with
+/// [`SkiffApp::notify`].
+#[derive(Clone, Debug)]
+pub struct Notice {
+    /// Identifies the notice: raising one with the same key replaces it.
+    pub key: String,
+    pub tone: Tone,
+    /// What it is about, in one line.
+    pub title: String,
+    /// The details, one per line.
+    pub lines: Vec<String>,
+    /// A button, with what it does.
+    pub action: Option<(String, NoticeAction)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum NoticeAction {
+    OpenUrl(String),
+}
+
+/// A question asked before something changes a cluster that is set to ask
+/// first (`confirm` in the config file). Shown on top of everything else,
+/// with Cancel as the default.
+pub struct Confirm {
+    /// The question: "Restart Deployment?".
+    pub title: String,
+    /// What it is about: `shop/web`.
+    pub object: String,
+    /// What will happen, in a sentence.
+    pub note: String,
+    /// The label of the button that goes ahead.
+    pub verb: String,
+    /// The cluster it was asked for; it is dropped when that changes.
+    pub context: String,
+    op: ConfirmOp,
+}
+
+enum ConfirmOp {
+    Row { action: RowAction, key: ResourceKey, ns: String, name: String },
+    Scale { key: ResourceKey, ns: String, name: String, replicas: i32 },
+    /// Apply the manifest in the open create dialog.
+    ApplyManifest { force: bool },
+    /// Apply the YAML edit in the detail panel.
+    ApplyEdit,
+}
+
+/// What a kubeconfig reload says about itself in a notification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Announce {
+    /// What was found, even if nothing changed (the user asked).
+    Always,
+    /// Only that contexts were added or removed.
+    Changes,
+    Never,
+}
+
+/// Size and modification time of a kubeconfig file (`None`: not there),
+/// to notice that it changed without reading it.
+type FileStamp = Option<(SystemTime, u64)>;
+
+fn file_stamps(sources: &KubeconfigSources) -> Vec<(PathBuf, FileStamp)> {
+    sources
+        .resolve()
+        .into_iter()
+        .map(|path| {
+            let stamp = std::fs::metadata(&path).ok().map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
+            (path, stamp)
+        })
+        .collect()
+}
+
+/// Where the config file says kubeconfigs are read from.
+fn config_sources(config: &Config) -> KubeconfigSources {
+    match config.kubeconfigs() {
+        Some(entries) => KubeconfigSources::explicit(entries.iter().cloned()),
+        None => KubeconfigSources::from_env(),
+    }
+}
+
+/// The `kubeconfigs` list to save when `entry` is added from the UI.
+///
+/// The first entry starts the list, and from then on only the list is
+/// read. So that the clusters shown until now stay, and keep following
+/// the environment, the list starts with
+/// [`skiff_core::kubeconfig::DEFAULT_ENTRY`] (`"$KUBECONFIG"`), which is
+/// resolved on every load to the files `$KUBECONFIG` lists, else
+/// `~/.kube/config`: nothing of this computer or this moment is written
+/// into the file.
+fn kubeconfigs_with_added(listed: Option<&[String]>, entry: &str) -> KubeconfigSources {
+    match listed {
+        Some(entries) => KubeconfigSources::explicit(entries.iter().cloned()),
+        None => KubeconfigSources::from_env(),
+    }
+    .with_entry(entry)
+}
+
+/// The text on the system clipboard, for [`SkiffApp::clipboard_reader`]:
+/// `Some("")` when it holds something that is not text (or nothing),
+/// `None` when it could not be read at all.
+fn system_clipboard_text() -> Option<String> {
+    match arboard::Clipboard::new().ok()?.get_text() {
+        Ok(text) => Some(text),
+        Err(arboard::Error::ContentNotAvailable) => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
+/// Whether a native "open file" dialog can be expected to appear. On
+/// Linux it comes from the desktop portal (over D-Bus) or `zenity`; with
+/// neither, asking for one does nothing at all.
+/// `clusters.<context>.prometheus` of the config file, as the endpoint the
+/// session should use instead of searching the cluster.
+fn prometheus_endpoint(config: &Config, context: &str) -> Option<skiff_core::PromEndpoint> {
+    config.cluster(context).prometheus.map(|p| skiff_core::PromEndpoint {
+        namespace: p.namespace,
+        service: p.service,
+        port: p.port,
+        scheme: p.scheme,
+        path_prefix: p.path_prefix,
+    })
+}
+
+fn native_file_dialog_available() -> bool {
+    if cfg!(any(target_os = "macos", windows)) {
+        return true;
+    }
+    let session_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| Path::new(&dir).join("bus").exists());
+    session_bus || skiff_core::find_executable("zenity").is_some()
+}
+
+/// "1 context", "3 contexts".
+fn contexts_text(n: usize) -> String {
+    widgets::plural(n, "context")
 }
 
 /// Modal dialogs.
@@ -131,6 +286,9 @@ pub enum Dialog {
     /// text the dialog opened with: untouched, it can be dismissed freely.
     /// `context` is the cluster it applies to (the one it was opened on).
     Create { text: String, pristine: String, context: String, job: Option<Job<Vec<String>>>, error: Option<String> },
+    /// Name a kubeconfig file by its path (where no native file dialog is
+    /// available, or it did not come up).
+    AddKubeconfig { path: String, error: Option<String>, focused: bool },
 }
 
 pub struct ForwardDialog {
@@ -148,7 +306,34 @@ pub struct SkiffApp {
     core: Core,
     pub pal: Palette,
     pub contexts: Contexts,
-    contexts_error: Option<String>,
+    /// The config file. Read it with [`SkiffApp::config`], change it with
+    /// [`SkiffApp::edit_config`] (which saves and applies it).
+    config: Config,
+    /// What the last kubeconfig load looked at and could not use.
+    kube: KubeconfigReport,
+    /// The kubeconfig files as they were at the last load, to notice a
+    /// change when the window gets the focus back.
+    kube_stamps: Vec<(PathBuf, FileStamp)>,
+    /// The kubeconfigs came from `--kubeconfig`, not the config file.
+    cli_kubeconfigs: bool,
+    /// The window had the focus during the previous frame.
+    window_focused: bool,
+    /// The native "open file" dialog is up: its answer, and when it was
+    /// asked for.
+    file_pick: Option<(std::sync::mpsc::Receiver<Option<PathBuf>>, Instant)>,
+    /// Whether "Add kubeconfig file…" asks the system for its file dialog;
+    /// otherwise (no desktop portal, or a headless run) it asks for the
+    /// path in a dialog of its own.
+    pub native_file_dialog: bool,
+    notices: Vec<Notice>,
+    /// A question on top of everything else (see [`Confirm`]).
+    pub confirm: Option<Confirm>,
+    /// Frames the current confirmation has been shown for.
+    confirm_frames: u32,
+    /// The window title last asked for.
+    title: String,
+    /// The failed update the user has been told about.
+    update_failure_told: Option<String>,
     sessions: HashMap<String, Arc<Session>>,
     pub active: Option<String>,
     pub view: View,
@@ -198,6 +383,50 @@ pub struct SkiffApp {
     sidebar_scroll: bool,
     /// Where the sidebar was drawn last frame.
     sidebar_rect: Option<egui::Rect>,
+    ctx: egui::Context,
+    /// Built without the user's own files (tests, headless rendering).
+    headless: bool,
+    /// `--light`: the theme for this run, until one is chosen in the app.
+    theme_override: Option<Theme>,
+    /// The theme a version before the `theme` setting had stored.
+    legacy_light: bool,
+    /// The Settings window, while it is open.
+    pub settings: Option<settings::State>,
+    /// The list of keyboard shortcuts is open.
+    pub help_open: bool,
+    /// The first-run hint has been dismissed or acted on.
+    hint_seen: bool,
+    /// Counts kubeconfig loads, for what is derived from one.
+    kube_generation: u64,
+    /// Size and time of config.json and keys.json when last read or
+    /// written, to notice an edit made outside the app.
+    settings_stamps: [FileStamp; 2],
+    /// A secret Skiff put on the clipboard is to be cleared at this time.
+    secret_clear_at: Option<Instant>,
+    /// A keyed hash of that secret (never its text), to tell at that time
+    /// whether the clipboard still holds it.
+    secret_hash: u64,
+    secret_hasher: std::collections::hash_map::RandomState,
+    /// Reads the system clipboard's text: `Some("")` when it holds no
+    /// text, `None` when it could not be read. With it, a copied secret
+    /// is left alone when the clipboard is known to hold something else
+    /// by then (copied in another app). Without it, or when the read
+    /// fails, nothing is known, and the clipboard is cleared whenever
+    /// nothing else was copied in Skiff: a secret is never left behind
+    /// because of a clipboard that would not answer.
+    pub clipboard_reader: Option<Box<dyn Fn() -> Option<String>>>,
+    /// A secret was copied during this frame.
+    secret_copied: bool,
+    /// How long a copied secret stays on the clipboard.
+    pub secret_clipboard_time: Duration,
+    /// Whether "Open config file" starts the system's editor (not in
+    /// headless runs).
+    pub open_files: bool,
+}
+
+fn stamp_of(path: Option<&Path>) -> FileStamp {
+    let meta = std::fs::metadata(path?).ok()?;
+    Some((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len()))
 }
 
 pub fn kind_icon(key: &ResourceKey) -> MaterialIcon {
@@ -304,6 +533,7 @@ fn nav_row(
             fg,
         );
     }
+    widgets::focus_ring(ui, &resp, 6, pal);
     let label = label.to_string();
     resp.widget_info(move || egui::WidgetInfo::selected(egui::Role::Button, true, selected, &label));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -311,6 +541,7 @@ fn nav_row(
 
 /// One cluster in the switcher: status dot and name, left-aligned, at a
 /// fixed width.
+#[allow(clippy::too_many_arguments)]
 fn cluster_row(
     ui: &mut Ui,
     pal: &Palette,
@@ -319,6 +550,8 @@ fn cluster_row(
     selected: bool,
     dot: Color32,
     room_for_button: bool,
+    // Small icons after the name (read-only, unverified TLS).
+    marks: &[(MaterialIcon, Color32)],
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     if ui.is_rect_visible(rect) {
@@ -332,7 +565,17 @@ fn cluster_row(
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::same(6), bg);
         p.circle_filled(egui::pos2(rect.left() + 14.0, rect.center().y), 4.0, dot);
-        let right = if room_for_button { 36.0 } else { 8.0 };
+        let mut right = if room_for_button { 36.0 } else { 8.0 };
+        for (ic, color) in marks.iter().rev() {
+            p.text(
+                egui::pos2(rect.right() - right, rect.center().y),
+                Align2::RIGHT_CENTER,
+                ic.codepoint,
+                FontId::new(14.0, ic.font_family()),
+                *color,
+            );
+            right += 20.0;
+        }
         let text_rect = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 28.0, rect.top()),
             egui::pos2(rect.right() - right, rect.bottom()),
@@ -344,6 +587,7 @@ fn cluster_row(
         let galley = ui.painter().layout_job(job);
         p.galley(egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0), galley, color);
     }
+    widgets::focus_ring(ui, &resp, 6, pal);
     let label = name.to_string();
     resp.widget_info(move || egui::WidgetInfo::selected(egui::Role::Button, true, selected, &label));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -355,8 +599,14 @@ impl SkiffApp {
             .storage
             .and_then(|s| eframe::get_value(s, "skiff"))
             .unwrap_or_default();
-        let mut app = Self::build(&cc.egui_ctx, opts, saved);
+        let (config, warnings) = Config::load();
+        let mut app = Self::build(&cc.egui_ctx, opts, saved, config, warnings);
         app.updater.enable();
+        app.native_file_dialog = native_file_dialog_available();
+        app.headless = false;
+        app.clipboard_reader = Some(Box::new(system_clipboard_text));
+        app.open_files = true;
+        app.settings_stamps = app.read_settings_stamps();
         let (keymap, error) = Keymap::load();
         app.keymap = keymap;
         if let Some(e) = error {
@@ -365,26 +615,55 @@ impl SkiffApp {
         app
     }
 
-    /// Construct without persisted settings (tests, headless rendering).
+    /// Construct without persisted settings (tests, headless rendering):
+    /// nothing is read from, or written to, the user's own files.
     pub fn headless(ctx: &egui::Context, opts: AppOptions) -> Self {
-        Self::build(ctx, opts, Saved::default())
+        Self::build(ctx, opts, Saved::default(), Config::default(), Vec::new())
     }
 
-    fn build(ctx: &egui::Context, opts: AppOptions, saved: Saved) -> Self {
+    /// Like [`SkiffApp::headless`], with a config file (as loaded by
+    /// `Config::load_from`, with its warnings).
+    pub fn headless_with_config(ctx: &egui::Context, opts: AppOptions, config: Config, warnings: Vec<String>) -> Self {
+        Self::build(ctx, opts, Saved::default(), config, warnings)
+    }
+
+    fn build(ctx: &egui::Context, opts: AppOptions, saved: Saved, config: Config, warnings: Vec<String>) -> Self {
         theme::install_fonts(ctx);
-        let pal = if opts.light || saved.light { Palette::light() } else { Palette::dark() };
+        // The theme: --light for this run, else config.json's, else the
+        // one an older version stored, else dark. (What "system" means is
+        // known from the first frame on.)
+        let theme_override = opts.light.then_some(Theme::Light);
+        let choice = theme_override.or(config.theme()).unwrap_or(if saved.light { Theme::Light } else { Theme::Dark });
+        let pal = if choice == Theme::Light { Palette::light() } else { Palette::dark() };
         theme::apply(ctx, &pal);
+        // Zoom is Skiff's own (saved in config.json), not egui's.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let repaint = ctx.clone();
         let core = Core::new(Notifier::new(move || repaint.request_repaint())).expect("failed to start I/O runtime");
-        let (contexts, contexts_error) = match load_contexts() {
-            Ok(c) => (c, None),
-            Err(e) => (Contexts::default(), Some(e)),
-        };
+        // Where clusters come from: --kubeconfig, else the config file's
+        // list, else what kubectl reads.
+        let cli_kubeconfigs = !opts.kubeconfigs.is_empty();
+        core.set_kubeconfig_sources(if cli_kubeconfigs {
+            KubeconfigSources::explicit(opts.kubeconfigs.iter().map(|p| p.to_string_lossy().into_owned()))
+        } else {
+            config_sources(&config)
+        });
         let mut app = SkiffApp {
             core,
             pal,
-            contexts,
-            contexts_error,
+            contexts: Contexts::default(),
+            config,
+            kube: KubeconfigReport::default(),
+            kube_stamps: Vec::new(),
+            cli_kubeconfigs,
+            window_focused: true,
+            file_pick: None,
+            native_file_dialog: false,
+            notices: Vec::new(),
+            confirm: None,
+            confirm_frames: 0,
+            title: "Skiff".to_string(),
+            update_failure_told: None,
             sessions: HashMap::new(),
             active: None,
             view: View::Overview,
@@ -420,7 +699,28 @@ impl SkiffApp {
             sidebar_cursor: None,
             sidebar_scroll: false,
             sidebar_rect: None,
+            ctx: ctx.clone(),
+            headless: true,
+            theme_override,
+            legacy_light: saved.light,
+            settings: None,
+            help_open: false,
+            hint_seen: saved.hint_seen,
+            kube_generation: 0,
+            settings_stamps: [None, None],
+            secret_clear_at: None,
+            secret_hash: 0,
+            secret_hasher: Default::default(),
+            clipboard_reader: None,
+            secret_copied: false,
+            secret_clipboard_time: SECRET_CLIPBOARD_TIME,
+            open_files: false,
         };
+        app.apply_config();
+        app.settings_stamps = app.read_settings_stamps();
+        app.report_config_warnings(&warnings);
+        let loaded = app.core.load_kubeconfig();
+        app.take_kubeconfig(loaded);
         let known = |name: &String| app.contexts.items.iter().any(|c| &c.name == name);
         let initial = opts
             .context
@@ -448,12 +748,809 @@ impl SkiffApp {
             context: self.active.clone(),
             namespaces: self.saved_ns.clone(),
             sidebar_closed: !self.sidebar_open,
+            hint_seen: self.hint_seen,
         };
         eframe::set_value(storage, "skiff", &saved);
     }
 
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.active.as_ref().and_then(|c| self.sessions.get(c))
+    }
+
+    // ------------------------------------------------------------------
+    // Config file
+    // ------------------------------------------------------------------
+
+    /// The config file's settings.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Changes the config file: `change` edits it, then it is saved (a
+    /// failure is reported as a notification) and applied to the running
+    /// app. This is the one way settings are changed from the UI.
+    pub fn edit_config(&mut self, change: impl FnOnce(&mut Config)) {
+        change(&mut self.config);
+        // (A headless run without a config file has nowhere to save to,
+        // and nothing to say about it.)
+        if !(self.headless && self.config.path().is_none()) {
+            if let Err(e) = self.config.save() {
+                self.toast(e, Tone::Err);
+            }
+        }
+        self.settings_stamps = self.read_settings_stamps();
+        self.apply_config();
+    }
+
+    /// Says which settings of the config file were not understood (and
+    /// takes that back when there are none any more).
+    fn report_config_warnings(&mut self, warnings: &[String]) {
+        if let Some(why) = self.config.unusable() {
+            // Only at startup is an unusable file taken as the config
+            // (there is no earlier one to keep): the defaults then, but
+            // not their "nothing is read-only".
+            let lines = vec![
+                "Default settings are in use, and every cluster is read-only until the file is fixed.".to_string(),
+                "Fix the file and come back to Skiff; it is read again then.".to_string(),
+            ];
+            self.report_unusable_config(why.to_string(), lines);
+            return;
+        }
+        if warnings.is_empty() {
+            self.notices.retain(|n| n.key != "config");
+            return;
+        }
+        let file = self.config.path().map(pages::short_path).unwrap_or_else(|| "the config file".to_string());
+        const SHOWN: usize = 5;
+        let mut lines: Vec<String> = warnings.iter().take(SHOWN).cloned().collect();
+        if warnings.len() > SHOWN {
+            lines.push(format!("… and {} more", warnings.len() - SHOWN));
+        }
+        self.notify(Notice {
+            key: "config".into(),
+            tone: Tone::Warn,
+            title: format!("Some settings in {file} were ignored"),
+            lines,
+            action: None,
+        });
+    }
+
+    /// Says that the config file cannot be used at all (`why` follows its
+    /// name: "is not valid JSON (...)") and what that means for now.
+    fn report_unusable_config(&mut self, why: String, lines: Vec<String>) {
+        let file = self.config.path().map(pages::short_path).unwrap_or_else(|| "The config file".to_string());
+        self.notify(Notice { key: "config".into(), tone: Tone::Err, title: format!("{file} {why}"), lines, action: None });
+    }
+
+    /// Whether Skiff refuses changes to the cluster behind `context`: the
+    /// config file says so, or it could not be used when Skiff started,
+    /// in which case what it says about protection is not known and
+    /// every cluster is held read-only until it can be read.
+    fn cluster_read_only(&self, context: &str) -> bool {
+        self.config.unusable().is_some() || self.config.cluster(context).read_only
+    }
+
+    /// Where the key bindings file is.
+    fn keys_path(&self) -> Option<PathBuf> {
+        if self.headless {
+            // Next to the config file the run was given, never the user's own.
+            self.config.path().and_then(Path::parent).map(|dir| dir.join("keys.json"))
+        } else {
+            crate::config::keymap_path()
+        }
+    }
+
+    fn read_settings_stamps(&self) -> [FileStamp; 2] {
+        [stamp_of(self.config.path()), stamp_of(self.keys_path().as_deref())]
+    }
+
+    /// Picks up config.json and keys.json again if they were edited
+    /// outside the app (checked when the window gets the focus back).
+    /// Returns whether anything was read.
+    pub fn reload_settings_if_changed(&mut self) -> bool {
+        let now = self.read_settings_stamps();
+        let before = std::mem::replace(&mut self.settings_stamps, now);
+        let mut reloaded = false;
+        if let Some(path) = self.config.path().map(Path::to_path_buf).filter(|_| now[0] != before[0]) {
+            let listed = self.config.kubeconfigs().map(<[String]>::to_vec);
+            // What the file says now, with its warnings; `Err` when it
+            // says nothing usable.
+            let read: Result<Vec<String>, Option<String>> = if self.config.is_dirty() {
+                // A change made here could not be saved earlier (the file
+                // was broken or could not be written). Saving reads the
+                // file as it is now and puts that change on top.
+                self.config.save().map(|_| self.config.warnings()).map_err(Some)
+            } else {
+                let (config, warnings) = Config::load_from(&path);
+                match config.unusable() {
+                    // A file that cannot be read says nothing, and above
+                    // all not "this cluster is no longer read-only": the
+                    // settings in use stay, kubeconfig list included.
+                    Some(why) => {
+                        let why = why.to_string();
+                        let lines = if self.config.unusable().is_some() {
+                            // (Still as broken as when Skiff started.)
+                            vec!["Default settings are in use, and every cluster is read-only until the file is fixed."
+                                .to_string()]
+                        } else {
+                            vec!["The settings in use are unchanged. Fix the file and come back to Skiff.".to_string()]
+                        };
+                        self.report_unusable_config(why, lines);
+                        Err(None)
+                    }
+                    None => {
+                        self.config = config;
+                        Ok(warnings)
+                    }
+                }
+            };
+            match read {
+                Ok(warnings) => {
+                    self.report_config_warnings(&warnings);
+                    if self.config.kubeconfigs() != listed.as_deref() && !self.cli_kubeconfigs {
+                        self.core.set_kubeconfig_sources(config_sources(&self.config));
+                        self.reload_kubeconfig_saying(Announce::Changes);
+                    }
+                    self.apply_config();
+                    // (Saving may have written the file.)
+                    self.settings_stamps[0] = self.read_settings_stamps()[0];
+                    self.toast("Settings reloaded from config.json", Tone::Normal);
+                    reloaded = true;
+                }
+                // Said once: the stamp is replaced, so the next try is at
+                // the file's next change, not at every return to the window.
+                Err(Some(e)) => self.toast(e, Tone::Err),
+                Err(None) => {}
+            }
+        }
+        if now[1] != before[1] && !self.headless {
+            let (keymap, error) = Keymap::load();
+            self.keymap = keymap;
+            match error {
+                Some(e) => self.toast(format!("Key bindings: {e}"), Tone::Warn),
+                None => self.toast("Key bindings reloaded from keys.json", Tone::Normal),
+            }
+            reloaded = true;
+        }
+        reloaded
+    }
+
+    /// Puts the config file's settings into effect (everything but the
+    /// kubeconfig list, which [`SkiffApp::set_kubeconfig_sources`] owns).
+    fn apply_config(&mut self) {
+        let updates = self.config.updates();
+        let channel = match updates.channel {
+            crate::config::Channel::Stable => crate::update::Channel::Stable,
+            crate::config::Channel::Nightly => crate::update::Channel::Nightly,
+        };
+        self.updater.configure(updates.check, channel);
+        crate::external::set_preferred_terminal(self.config.terminal());
+        for (name, session) in &self.sessions {
+            session.set_read_only(self.cluster_read_only(name));
+            session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
+        }
+        self.ctx.set_zoom_factor(self.zoom());
+        self.sync_theme();
+    }
+
+    // ------------------------------------------------------------------
+    // Appearance
+    // ------------------------------------------------------------------
+
+    /// The zoom factor in effect.
+    pub fn zoom(&self) -> f32 {
+        self.config.zoom().unwrap_or(1.0)
+    }
+
+    /// Sets the zoom factor (clamped) and saves it.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(crate::config::ZOOM_MIN, crate::config::ZOOM_MAX);
+        if (zoom - self.zoom()).abs() > 0.001 {
+            self.edit_config(|c| c.set_zoom(zoom));
+        }
+    }
+
+    /// One zoom step up or down, saying the new size.
+    fn zoom_by_step(&mut self, up: bool) {
+        let next = settings::zoom_step(self.zoom(), up);
+        self.set_zoom(next);
+        self.toast(format!("Zoom {}", settings::zoom_percent(self.zoom())), Tone::Normal);
+    }
+
+    /// The theme that is chosen: `--light` for this run, else the config
+    /// file's, else the one an older version stored, else dark.
+    pub fn theme_choice(&self) -> Theme {
+        self.theme_override
+            .or(self.config.theme())
+            .unwrap_or(if self.legacy_light { Theme::Light } else { Theme::Dark })
+    }
+
+    /// Chooses the theme and saves it in the config file.
+    pub fn choose_theme(&mut self, theme: Theme) {
+        self.theme_override = None;
+        self.legacy_light = false;
+        self.edit_config(|c| c.set_theme(theme));
+    }
+
+    /// Makes the palette the one the chosen theme asks for; "system" is
+    /// whatever the computer is set to now (dark when it does not say).
+    /// Returns whether the palette changed.
+    fn sync_theme(&mut self) -> bool {
+        let dark = match self.theme_choice() {
+            Theme::Dark => true,
+            Theme::Light => false,
+            Theme::System => self.ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark),
+        };
+        if dark == self.pal.dark {
+            return false;
+        }
+        self.pal = if dark { Palette::dark() } else { Palette::light() };
+        theme::apply(&self.ctx, &self.pal);
+        true
+    }
+
+    // ------------------------------------------------------------------
+    // Settings, shortcuts, clipboard
+    // ------------------------------------------------------------------
+
+    /// Opens the Settings window on a section.
+    pub fn open_settings(&mut self, section: Section) {
+        self.palette = None;
+        self.help_open = false;
+        match &mut self.settings {
+            Some(state) => state.section = section,
+            None => self.settings = Some(settings::State::new(section)),
+        }
+    }
+
+    /// Opens the list of keyboard shortcuts.
+    pub fn open_help(&mut self) {
+        self.palette = None;
+        self.settings = None;
+        self.help_open = true;
+        self.hint_seen = true;
+    }
+
+    /// Puts a secret on the clipboard, to be cleared again after
+    /// [`SkiffApp::secret_clipboard_time`] unless something else is
+    /// copied in Skiff first. `what` names it in the notification.
+    ///
+    /// (egui cannot read the clipboard back. Where there is a
+    /// [`SkiffApp::clipboard_reader`], the clipboard is left alone when
+    /// it is found to hold something else by then; where there is none,
+    /// or the read fails, it is cleared whenever nothing else was copied
+    /// from Skiff in the meantime. The notification says which.)
+    pub fn copy_secret(&mut self, ctx: &egui::Context, text: String, what: &str) {
+        use std::hash::BuildHasher;
+        self.secret_hash = self.secret_hasher.hash_one(&text);
+        ctx.copy_text(text);
+        self.secret_copied = true;
+        let secs = self.secret_clipboard_time.as_secs().max(1);
+        let unless = if self.clipboard_reader.is_some() { " if it still holds it" } else { "" };
+        self.toast(format!("Copied {what}. The clipboard will be cleared in {secs} s{unless}."), Tone::Normal);
+    }
+
+    /// Whether the secret copied last is still what the clipboard holds,
+    /// as far as that can be known: `None` without a reader, or when the
+    /// clipboard could not be read.
+    fn clipboard_holds_secret(&self) -> Option<bool> {
+        use std::hash::BuildHasher;
+        let text = (self.clipboard_reader.as_ref()?)()?;
+        Some(self.secret_hasher.hash_one(&text) == self.secret_hash)
+    }
+
+    /// Whether a copied secret is waiting to be cleared from the clipboard.
+    pub fn secret_on_clipboard(&self) -> bool {
+        self.secret_clear_at.is_some()
+    }
+
+    /// Run at the end of every frame: starts, cancels or carries out the
+    /// clearing of a copied secret.
+    fn guard_clipboard(&mut self, ctx: &egui::Context) {
+        // Everything Skiff copies goes out through egui's output, text
+        // fields and the terminal included.
+        let copied = ctx.output(|o| o.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_))));
+        if std::mem::take(&mut self.secret_copied) {
+            self.secret_clear_at = Some(Instant::now() + self.secret_clipboard_time);
+        } else if copied {
+            // Something else is on the clipboard now: not ours to clear.
+            self.secret_clear_at = None;
+        }
+        if let Some(at) = self.secret_clear_at {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.secret_clear_at = None;
+                // Read once, now, not every frame. Something copied in
+                // another app since is not ours to clear (nor to announce);
+                // a clipboard that cannot be read is cleared, as the
+                // secret may well still be on it.
+                if self.clipboard_holds_secret().unwrap_or(true) {
+                    ctx.copy_text(String::new());
+                    self.toast("Clipboard cleared", Tone::Normal);
+                }
+            } else {
+                // Wake up for it even if nothing else happens.
+                self.tick = self.tick.min(left);
+                ctx.request_repaint_after(left);
+            }
+        }
+    }
+
+    /// Opens config.json or keys.json in the system's editor, creating it
+    /// first when it does not exist: keys.json with the standard keys
+    /// spelled out, config.json empty (an example would switch settings
+    /// on, and JSON has no comments to put it in).
+    pub fn open_settings_file(&mut self, keys: bool) {
+        let (path, name, starter) = if keys {
+            (self.keys_path(), "keys.json", Keymap::starter_json())
+        } else {
+            (self.config.path().map(Path::to_path_buf), "config.json", "{}\n".to_string())
+        };
+        let Some(path) = path else {
+            self.toast(format!("No location is known for {name} on this computer."), Tone::Warn);
+            return;
+        };
+        let created = match settings::ensure_file(&path, &starter) {
+            Ok(created) => created,
+            Err(e) => {
+                self.toast(e, Tone::Err);
+                return;
+            }
+        };
+        // (Our own new file is not a change to pick up.)
+        self.settings_stamps = self.read_settings_stamps();
+        if self.open_files {
+            if let Err(e) = settings::open_in_default_app(&path) {
+                self.ctx.copy_text(path.display().to_string());
+                self.toast(e, Tone::Err);
+                return;
+            }
+        }
+        let shown = pages::short_path(&path);
+        let text = match (created, keys) {
+            (true, true) => format!("Created {shown} with the standard keys"),
+            (true, false) => format!("Created {shown}"),
+            (false, _) => format!("Opened {shown}"),
+        };
+        self.toast(text, Tone::Normal);
+    }
+
+    /// Which rule decided the kubeconfig files in effect.
+    fn kube_source(&self) -> settings::KubeSource {
+        if self.cli_kubeconfigs {
+            settings::KubeSource::CommandLine
+        } else if self.config.kubeconfigs().is_some() {
+            settings::KubeSource::ConfigFile
+        } else if std::env::var_os("KUBECONFIG").is_some_and(|v| !v.is_empty()) {
+            settings::KubeSource::Environment
+        } else {
+            settings::KubeSource::Default
+        }
+    }
+
+    /// Takes a kubeconfig entry off the list in the config file and
+    /// reloads. Clusters that are open stay open while their context
+    /// still exists.
+    pub fn remove_kubeconfig(&mut self, entry: &str) {
+        self.edit_config(|c| c.remove_kubeconfig(entry));
+        self.follow_config_kubeconfigs();
+    }
+
+    /// Removes the list of kubeconfigs from the config file: back to
+    /// `$KUBECONFIG` / `~/.kube/config`.
+    pub fn reset_kubeconfigs(&mut self) {
+        self.edit_config(|c| c.set_kubeconfigs(None));
+        self.follow_config_kubeconfigs();
+    }
+
+    fn follow_config_kubeconfigs(&mut self) {
+        if !self.cli_kubeconfigs {
+            self.core.set_kubeconfig_sources(config_sources(&self.config));
+        }
+        self.reload_kubeconfig_saying(Announce::Changes);
+    }
+
+    fn settings_model(&mut self) -> Option<settings::Model> {
+        let generation = self.kube_generation;
+        let removable = self.kube_source() == settings::KubeSource::ConfigFile;
+        let fresh = self.settings.as_ref()?.kube.as_ref().is_some_and(|(g, _)| *g == generation);
+        if !fresh {
+            let kube = settings::kube_model(&self.core.kubeconfig_sources(), &self.kube, &self.contexts, removable);
+            self.settings.as_mut()?.kube = Some((generation, Arc::new(kube)));
+        }
+        let kube = self.settings.as_ref()?.kube.as_ref()?.1.clone();
+        let clusters = self
+            .contexts
+            .items
+            .iter()
+            .map(|c| {
+                let cluster = self.config.cluster(&c.name);
+                settings::ClusterRow {
+                    name: c.name.clone(),
+                    active: self.active.as_deref() == Some(c.name.as_str()),
+                    read_only: self.cluster_read_only(&c.name),
+                    confirm: cluster.confirm,
+                    plugin: c.exec_command.clone(),
+                    plugin_missing: c.exec_missing,
+                }
+            })
+            .collect();
+        Some(settings::Model {
+            theme: self.theme_choice(),
+            system_dark: self.ctx.system_theme().map(|t| t == egui::Theme::Dark),
+            zoom: self.zoom(),
+            kube_source: self.kube_source(),
+            kube,
+            clusters,
+            picking: self.file_pick.is_some(),
+            updates: self.config.updates(),
+            update_state: self.updater.state(),
+            updates_off_by_env: std::env::var_os("SKIFF_NO_UPDATE_CHECK").is_some(),
+            terminal: self.config.terminal().map(str::to_string),
+            terminal_env: std::env::var("SKIFF_TERMINAL").ok().filter(|t| !t.trim().is_empty()),
+            config_path: self.config.path().map(Path::to_path_buf),
+            keys_path: self.keys_path(),
+            mac: self.ctx.os() == egui::os::OperatingSystem::Mac,
+        })
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let Some(model) = self.settings_model() else { return };
+        let pal = self.pal;
+        let Some(state) = &mut self.settings else { return };
+        // (A dialog or question on top of the window has the keyboard
+        // and the clicks; closing is for when it is the window's turn.)
+        let covered = self.dialog.is_some() || self.confirm.is_some();
+        for action in settings::show(ctx, &pal, state, &model) {
+            use settings::Action as A;
+            match action {
+                A::Close => {
+                    if !covered {
+                        self.settings = None;
+                    }
+                }
+                A::SetTheme(theme) => self.choose_theme(theme),
+                A::SetZoom(zoom) => self.set_zoom(zoom),
+                A::AddKubeconfig => self.ask_for_kubeconfig(ctx),
+                A::RemoveKubeconfig(entry) => self.remove_kubeconfig(&entry),
+                A::ResetKubeconfigs => self.reset_kubeconfigs(),
+                A::ReloadKubeconfig => self.reload_kubeconfig(true),
+                A::SetReadOnly(context, on) => self.set_read_only(&context, on),
+                A::SetConfirm(context, on) => self.set_confirm(&context, on),
+                A::SetUpdateCheck(on) => self.edit_config(|c| c.set_update_check(on)),
+                A::SetChannel(channel) => self.edit_config(|c| c.set_update_channel(channel)),
+                A::CheckForUpdates => self.run_command(ctx, Command::CheckForUpdates),
+                A::SetTerminal(name) => self.edit_config(|c| c.set_terminal(name.as_deref())),
+                A::OpenConfigFile => self.open_settings_file(false),
+                A::OpenKeysFile => self.open_settings_file(true),
+                A::ShowShortcuts => self.open_help(),
+                A::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                A::CopyVersionInfo => {
+                    ctx.copy_text(settings::version_info(self.config.updates().channel));
+                    self.toast("Copied the version info", Tone::Normal);
+                }
+            }
+        }
+    }
+
+    fn help_ui(&mut self, ctx: &egui::Context) {
+        if !self.help_open {
+            return;
+        }
+        let mac = ctx.os() == egui::os::OperatingSystem::Mac;
+        // The key that opens the list also closes it.
+        let again = ctx.input(|i| self.keymap.pressed(i, Action::Help));
+        if crate::help::show(ctx, &self.pal, &self.keymap, mac) || again {
+            self.help_open = false;
+        }
+    }
+
+    /// The first-run pointer at the two things worth knowing: the palette
+    /// and the list of shortcuts. Goes away once dismissed or used.
+    fn first_run_hint(&mut self, ui: &mut Ui) {
+        if self.hint_seen {
+            return;
+        }
+        let pal = self.pal;
+        let cmd = if ui.ctx().os() == egui::os::OperatingSystem::Mac { "Cmd+K" } else { "Ctrl+K" };
+        let help: Vec<String> = self.keymap.bindings(Action::Help).iter().take(1).map(|b| b.label(false)).collect();
+        Frame::new()
+            .fill(pal.tint(pal.accent, 0.08))
+            .stroke(Stroke::new(1.0, pal.tint(pal.accent, 0.28)))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(10, 5))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(widgets::icon(icons::ICON_LIGHTBULB, 16.0).color(pal.accent));
+                    ui.label(RichText::new("Press").color(pal.text));
+                    widgets::keycap(ui, cmd, &pal);
+                    ui.label(RichText::new("to search or jump to anything").color(pal.text));
+                    if let Some(key) = help.first() {
+                        ui.label(RichText::new("and").color(pal.text));
+                        widgets::keycap(ui, key, &pal);
+                        ui.label(RichText::new("to see every keyboard shortcut.").color(pal.text));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close = egui::Button::new(widgets::icon(icons::ICON_CLOSE, 15.0).color(pal.muted))
+                            .frame_when_inactive(false)
+                            .min_size(Vec2::new(24.0, 22.0));
+                        if widgets::named(ui.add(close), "Dismiss this hint").clicked() {
+                            self.hint_seen = true;
+                        }
+                    });
+                });
+            });
+        ui.add_space(10.0);
+    }
+
+    /// Whether the current cluster is read-only in Skiff.
+    pub fn read_only(&self) -> bool {
+        self.session().is_some_and(|s| s.is_read_only())
+    }
+
+    /// Why actions that change the current cluster are disabled, if they
+    /// are: the words for their tooltips.
+    fn locked_reason(&self) -> Option<String> {
+        let session = self.session().filter(|s| s.is_read_only())?;
+        Some(format!("{} is read-only in Skiff. Turn that off in the cluster menu to make changes.", session.context))
+    }
+
+    /// Whether changes to the current cluster are confirmed first.
+    fn asks_first(&self) -> bool {
+        self.active.as_ref().is_some_and(|c| self.config.cluster(c).confirm)
+    }
+
+    /// Makes a cluster read-only in Skiff (or writable again) and saves
+    /// that in the config file.
+    pub fn set_read_only(&mut self, context: &str, read_only: bool) {
+        if let (false, Some(why)) = (read_only, self.config.unusable()) {
+            // Not this switch's to lift: nothing is known about the
+            // file's settings, and nothing can be saved into it.
+            let file = self.config.path().map(pages::short_path).unwrap_or_else(|| "The config file".to_string());
+            self.toast(format!("{file} {why}. Every cluster is read-only until the file is fixed."), Tone::Err);
+            return;
+        }
+        self.edit_config(|c| c.set_read_only(context, read_only));
+        if read_only && self.active.as_deref() == Some(context) {
+            // Whatever was about to change the cluster is off.
+            self.confirm = None;
+            if !matches!(self.dialog, Some(Dialog::AddKubeconfig { .. })) {
+                self.dialog = None;
+            }
+        }
+        let text = if read_only {
+            format!("{context} is now read-only in Skiff")
+        } else {
+            format!("Changes to {context} are allowed again")
+        };
+        self.toast(text, Tone::Normal);
+    }
+
+    /// Sets whether changes to a cluster are confirmed first, and saves it.
+    pub fn set_confirm(&mut self, context: &str, confirm: bool) {
+        self.edit_config(|c| c.set_confirm(context, confirm));
+    }
+
+    // ------------------------------------------------------------------
+    // Kubeconfig
+    // ------------------------------------------------------------------
+
+    /// What the last kubeconfig load looked at.
+    pub fn kubeconfig_report(&self) -> &KubeconfigReport {
+        &self.kube
+    }
+
+    /// Takes over a freshly loaded kubeconfig: the context list, what was
+    /// searched, and the files' state for change detection.
+    fn take_kubeconfig(&mut self, loaded: LoadedKubeconfig) {
+        let sources = self.core.kubeconfig_sources();
+        self.kube_stamps = file_stamps(&sources);
+        self.kube_generation = self.kube_generation.wrapping_add(1);
+        // `kubectl` in a terminal must see the same clusters. The default
+        // sources are what it reads anyway.
+        let in_effect = (!sources.is_default())
+            .then(|| std::env::join_paths(&loaded.files).ok())
+            .flatten()
+            .map(|list| list.to_string_lossy().into_owned());
+        crate::external::set_kubeconfig(in_effect);
+        self.contexts = loaded.contexts;
+        self.kube = KubeconfigReport { searched: loaded.searched, files: loaded.files, problems: loaded.problems };
+    }
+
+    /// Reads the kubeconfig files again. Clusters that are open stay open
+    /// as long as their context still exists; `announce` says what was
+    /// found even when nothing changed (the user asked).
+    pub fn reload_kubeconfig(&mut self, announce: bool) {
+        self.reload_kubeconfig_saying(if announce { Announce::Always } else { Announce::Changes });
+    }
+
+    fn reload_kubeconfig_saying(&mut self, announce: Announce) {
+        let before: Vec<String> = self.contexts.items.iter().map(|c| c.name.clone()).collect();
+        let loaded = self.core.load_kubeconfig();
+        self.take_kubeconfig(loaded);
+        let now: Vec<String> = self.contexts.items.iter().map(|c| c.name.clone()).collect();
+        let added = now.iter().filter(|n| !before.contains(n)).count();
+        let removed = before.iter().filter(|n| !now.contains(n)).count();
+
+        // A cluster whose context is gone cannot reconnect: close it,
+        // unless that would throw away an edit.
+        let editing = self.detail.as_ref().is_some_and(|d| d.has_unsaved_edit());
+        let gone: Vec<String> = self.sessions.keys().filter(|n| !now.contains(n)).cloned().collect();
+        for name in gone {
+            let active = self.active.as_deref() == Some(name.as_str());
+            if active && editing {
+                continue;
+            }
+            self.disconnect(&name);
+            if active {
+                self.toast(format!("{name} is no longer in your kubeconfig"), Tone::Warn);
+            }
+        }
+        // A failed connection may have been waiting for exactly this.
+        for session in self.sessions.values() {
+            if session.failure().is_some() {
+                session.reconnect();
+            }
+        }
+        // The first clusters to appear: open the kubeconfig's current one.
+        if before.is_empty() && self.active.is_none() {
+            let known = |name: &String| now.contains(name);
+            if let Some(first) = self.contexts.current.clone().filter(known).or_else(|| now.first().cloned()) {
+                self.switch_context(&first);
+            }
+        }
+
+        let problems = self.kube.problems.len();
+        let trouble = match problems {
+            0 => String::new(),
+            n => format!(" ({} can't be used)", widgets::plural(n, "file")),
+        };
+        if announce == Announce::Always {
+            let tone = if problems > 0 { Tone::Warn } else { Tone::Normal };
+            self.toast(format!("Kubeconfig reloaded: {}{trouble}", contexts_text(now.len())), tone);
+        } else if announce == Announce::Changes && (added > 0 || removed > 0) {
+            let mut parts = Vec::new();
+            if added > 0 {
+                parts.push(format!("{} added", contexts_text(added)));
+            }
+            if removed > 0 {
+                parts.push(format!("{} removed", contexts_text(removed)));
+            }
+            self.toast(format!("Kubeconfig changed: {}", parts.join(", ")), Tone::Normal);
+        }
+    }
+
+    /// Reloads the kubeconfig if one of its files was changed, added or
+    /// removed since the last load (a `stat` per file; nothing is read
+    /// otherwise). Returns whether it reloaded.
+    pub fn reload_kubeconfig_if_changed(&mut self) -> bool {
+        if file_stamps(&self.core.kubeconfig_sources()) == self.kube_stamps {
+            return false;
+        }
+        self.reload_kubeconfig(false);
+        true
+    }
+
+    /// Adds a kubeconfig file (or folder) to the ones Skiff reads, saves
+    /// that in the config file and loads it. Refuses a file that has no
+    /// usable context, saying why.
+    pub fn add_kubeconfig(&mut self, path: &str) -> Result<(), String> {
+        let entry = path.trim().to_string();
+        if entry.is_empty() {
+            return Err("Enter the path of a kubeconfig file.".into());
+        }
+        let alone = skiff_core::kubeconfig::load(&KubeconfigSources::explicit([entry.clone()]));
+        if let Some(problem) = alone.problems.first() {
+            return Err(format!("{} can't be used: {}", pages::short_path(&problem.path), problem.message));
+        }
+        if alone.files.is_empty() {
+            return Err(format!("There is no file at {entry}."));
+        }
+        if alone.contexts.items.is_empty() {
+            return Err(format!("{entry} has no contexts, so there is no cluster in it to show."));
+        }
+        // Added to what is read today, so that the clusters from
+        // $KUBECONFIG / ~/.kube/config stay.
+        let starts_list = self.config.kubeconfigs().is_none();
+        let saved = kubeconfigs_with_added(self.config.kubeconfigs(), &entry);
+        let in_effect = if self.cli_kubeconfigs { self.core.kubeconfig_sources().with_entry(entry.clone()) } else { saved.clone() };
+        self.edit_config(|c| c.set_kubeconfigs(saved.entries()));
+        self.core.set_kubeconfig_sources(in_effect);
+        self.reload_kubeconfig_saying(Announce::Never);
+        let n = alone.contexts.items.len();
+        let mut text = format!("Added {} from {}", widgets::plural(n, "cluster"), pages::short_path(Path::new(&entry)));
+        if starts_list && self.config.kubeconfigs().is_some() {
+            // From now on the list decides, which is easy to miss.
+            text.push_str(
+                ". Skiff now reads the kubeconfig list in config.json: \"$KUBECONFIG\" (kubectl's own locations, still followed) and this file; see Settings > Clusters.",
+            );
+        }
+        self.toast(text, Tone::Ok);
+        Ok(())
+    }
+
+    /// Asks for a kubeconfig file: with the system's file dialog (which
+    /// runs beside the UI, never blocking it), or by path where there is
+    /// none.
+    pub fn ask_for_kubeconfig(&mut self, ctx: &egui::Context) {
+        if self.file_pick.is_some() {
+            return;
+        }
+        if !self.native_file_dialog {
+            self.ask_for_kubeconfig_path();
+            return;
+        }
+        let mut dialog = rfd::AsyncFileDialog::new().set_title("Add kubeconfig file");
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+        if let Some(dir) = home.map(|h| h.join(".kube")).filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        // Created here, on the UI thread (macOS wants that), and waited
+        // for on the I/O runtime.
+        let picking = dialog.pick_file();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        self.core.handle().spawn(async move {
+            let picked = picking.await.map(|file| file.path().to_path_buf());
+            let _ = tx.send(picked);
+            ctx.request_repaint();
+        });
+        self.file_pick = Some((rx, Instant::now()));
+    }
+
+    fn ask_for_kubeconfig_path(&mut self) {
+        self.confirm = None;
+        self.dialog = Some(Dialog::AddKubeconfig { path: String::new(), error: None, focused: false });
+    }
+
+    /// Takes the file dialog's answer, once there is one.
+    fn poll_file_pick(&mut self) {
+        let Some((rx, asked)) = &self.file_pick else { return };
+        let answer = match rx.try_recv() {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        // "Nothing chosen" faster than anyone can cancel a dialog means
+        // that none came up (no desktop portal answering): ask by path.
+        let never_shown = answer.is_none() && asked.elapsed() < Duration::from_millis(400);
+        self.file_pick = None;
+        match answer {
+            Some(path) => {
+                if let Err(e) = self.add_kubeconfig(&path.to_string_lossy()) {
+                    self.toast(e, Tone::Err);
+                }
+            }
+            None if never_shown && self.dialog.is_none() => self.ask_for_kubeconfig_path(),
+            None => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Notices
+    // ------------------------------------------------------------------
+
+    /// Shows a standing message under the top bar until it is dismissed.
+    pub fn notify(&mut self, notice: Notice) {
+        match self.notices.iter_mut().find(|n| n.key == notice.key) {
+            Some(existing) => *existing = notice,
+            None => self.notices.push(notice),
+        }
+    }
+
+    /// The standing messages currently shown.
+    pub fn notices(&self) -> &[Notice] {
+        &self.notices
+    }
+
+    /// What the window is called: the app, and the cluster it shows.
+    pub fn window_title(&self) -> String {
+        match &self.active {
+            Some(context) => format!("Skiff — {context}"),
+            None => "Skiff".to_string(),
+        }
     }
 
     fn remember_namespaces(&mut self) {
@@ -478,9 +1575,13 @@ impl SkiffApp {
         }
         // A dialog belongs to the cluster it was opened for.
         self.dialog = None;
+        self.confirm = None;
         self.remember_namespaces();
         if !self.sessions.contains_key(name) {
-            self.sessions.insert(name.to_string(), self.core.connect(name));
+            let session = self.core.connect(name);
+            session.set_read_only(self.cluster_read_only(name));
+            session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
+            self.sessions.insert(name.to_string(), session);
         }
         self.active = Some(name.to_string());
         self.ns_filter = self.saved_ns.get(name).map(|v| v.iter().cloned().collect()).unwrap_or_default();
@@ -501,6 +1602,7 @@ impl SkiffApp {
             self.active = None;
             self.detail = None;
             self.dialog = None;
+            self.confirm = None;
         }
     }
 
@@ -553,19 +1655,21 @@ impl SkiffApp {
         }
     }
 
-    pub fn set_theme(&mut self, ctx: &egui::Context, dark: bool) {
-        self.pal = if dark { Palette::dark() } else { Palette::light() };
-        theme::apply(ctx, &self.pal);
+    /// Switches to the dark or the light theme (and saves that choice).
+    pub fn set_theme(&mut self, _ctx: &egui::Context, dark: bool) {
+        self.choose_theme(if dark { Theme::Dark } else { Theme::Light });
     }
 
     fn poll(&mut self) {
+        self.poll_file_pick();
         let mut toasts = Vec::new();
         let sessions = &self.sessions;
         // A background apply that failed gets its dialog back, manifest and
         // error included: on the cluster it was meant for (never on another
         // one, where "Apply" would send it to the wrong place), and once no
         // dialog, palette or menu is in the way.
-        let dialog_free = self.dialog.is_none() && self.palette.is_none() && !self.overlay_at_start;
+        let dialog_free =
+            self.dialog.is_none() && self.confirm.is_none() && self.palette.is_none() && !self.overlay_at_start;
         let active = self.active.clone();
         let mut reopen: Option<(String, String, String)> = None;
         self.pending.retain_mut(|p| match p {
@@ -752,7 +1856,39 @@ impl SkiffApp {
         }
     }
 
+    /// Runs an action on an object, as chosen from a row's menu or the
+    /// detail panel: refused on a read-only cluster, and asked about first
+    /// on a cluster that is set to confirm changes.
     pub fn run_row_action(&mut self, ctx: &egui::Context, action: RowAction, key: &ResourceKey, ns: &str, name: &str) {
+        let Some(session) = self.session().cloned() else { return };
+        if let Some(reason) = self.locked_reason().filter(|_| action.mutates()) {
+            self.toast(reason, Tone::Warn);
+            return;
+        }
+        let question = match action {
+            RowAction::Restart => Some(("Restart", "Its pods are replaced, a few at a time.")),
+            RowAction::Cordon => Some(("Cordon", "No new pods will be scheduled on it.")),
+            RowAction::Uncordon => Some(("Uncordon", "Pods can be scheduled on it again.")),
+            RowAction::Suspend => Some(("Suspend", "No new jobs are started until it is resumed.")),
+            RowAction::Resume => Some(("Resume", "Jobs are started on schedule again.")),
+            _ => None,
+        };
+        if let (Some((verb, note)), true) = (question, self.asks_first()) {
+            self.confirm = Some(Confirm {
+                title: format!("{verb} {}?", key.kind),
+                object: if ns.is_empty() { name.to_string() } else { format!("{ns}/{name}") },
+                note: note.to_string(),
+                verb: verb.to_string(),
+                context: session.context.clone(),
+                op: ConfirmOp::Row { action, key: key.clone(), ns: ns.to_string(), name: name.to_string() },
+            });
+            return;
+        }
+        self.do_row_action(ctx, action, key, ns, name);
+    }
+
+    /// [`SkiffApp::run_row_action`] without the questions.
+    fn do_row_action(&mut self, ctx: &egui::Context, action: RowAction, key: &ResourceKey, ns: &str, name: &str) {
         let Some(session) = self.session().cloned() else { return };
         match action {
             RowAction::Logs => {
@@ -765,8 +1901,8 @@ impl SkiffApp {
             }
             RowAction::ShellExternal => {
                 // kubectl picks the pod's default container.
-                let cmd = crate::external::exec_command(&session.context, ns, name, None);
-                match crate::external::open(&cmd) {
+                let inv = crate::external::exec_invocation(&session.context, ns, name, None);
+                match crate::external::open_invocation(&inv) {
                     Ok(app) => self.toast(format!("Opened a shell in {app}"), Tone::Normal),
                     Err(e) => self.toast(e, Tone::Err),
                 }
@@ -847,7 +1983,38 @@ impl SkiffApp {
         }
     }
 
+    /// Goes ahead with what a confirmation was asked for.
+    fn run_confirmed(&mut self, ctx: &egui::Context, op: ConfirmOp) {
+        let Some(session) = self.session().cloned() else { return };
+        match op {
+            ConfirmOp::Row { action, key, ns, name } => self.do_row_action(ctx, action, &key, &ns, &name),
+            ConfirmOp::Scale { key, ns, name, replicas } => {
+                self.pending.push(Pending::Simple {
+                    job: session.scale(&key, &ns, &name, replicas),
+                    ok: format!("Scaled {name} to {replicas}"),
+                });
+            }
+            ConfirmOp::ApplyManifest { force } => {
+                if let Some(Dialog::Create { text, context, job, error, .. }) = &mut self.dialog {
+                    if *context == session.context && job.is_none() {
+                        *error = None;
+                        *job = Some(session.apply_manifest_with(text.clone(), force));
+                    }
+                }
+            }
+            ConfirmOp::ApplyEdit => {
+                if let Some(detail) = &mut self.detail {
+                    detail.apply_edit(&session);
+                }
+            }
+        }
+    }
+
     pub fn open_create_dialog(&mut self) {
+        if let Some(reason) = self.locked_reason() {
+            self.toast(reason, Tone::Warn);
+            return;
+        }
         let ns = self.ns_filter.iter().next().cloned().unwrap_or_else(|| "default".to_string());
         let template = format!(
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: example\n  namespace: {ns}\ndata:\n  key: value\n"
@@ -881,6 +2048,23 @@ impl SkiffApp {
                     s.reconnect();
                 }
             }
+            Command::ReloadKubeconfig => self.reload_kubeconfig(true),
+            Command::AddKubeconfig => self.ask_for_kubeconfig(ctx),
+            Command::SetReadOnly(on) => {
+                if let Some(context) = self.active.clone() {
+                    self.set_read_only(&context, on);
+                }
+            }
+            Command::Settings(section) => self.open_settings(section),
+            Command::Shortcuts => self.open_help(),
+            Command::ZoomIn => self.zoom_by_step(true),
+            Command::ZoomOut => self.zoom_by_step(false),
+            Command::ZoomReset => {
+                self.set_zoom(1.0);
+                self.toast("Zoom 100%", Tone::Normal);
+            }
+            Command::OpenConfigFile => self.open_settings_file(false),
+            Command::OpenKeysFile => self.open_settings_file(true),
         }
     }
 
@@ -892,6 +2076,11 @@ impl SkiffApp {
         let started = Instant::now();
         let ctx = ui.ctx().clone();
         self.tick = Duration::from_secs(30);
+        // "System" follows the computer, also when it changes while
+        // Skiff runs. (This frame's widgets take the new style at once.)
+        if self.sync_theme() {
+            ui.set_style(ctx.global_style());
+        }
         self.updater.tick(&ctx);
         // Sampled before anything is drawn: a key that closes a menu this
         // frame was meant for that menu, not for the table underneath.
@@ -910,11 +2099,17 @@ impl SkiffApp {
         }
         self.overlay_before = self.overlay_at_start;
         self.poll();
+        self.window_events(&ctx);
         self.shortcuts(&ctx);
 
         self.top_bar(ui);
+        self.notices_ui(ui);
         self.status_bar(ui);
-        self.sidebar(ui);
+        // (With no cluster to look at, its list of resource types would
+        // lead nowhere.)
+        if !self.contexts.items.is_empty() || self.active.is_some() {
+            self.sidebar(ui);
+        }
 
         // Bottom dock (logs, shells, port forwards).
         let sessions = self.sessions.clone();
@@ -935,7 +2130,11 @@ impl SkiffApp {
             });
 
         self.palette_ui(&ctx);
+        self.settings_ui(&ctx);
+        self.help_ui(&ctx);
         self.dialog_ui(&ctx);
+        self.confirm_ui(&ctx);
+        self.guard_clipboard(&ctx);
         self.toasts_ui(&ctx);
 
         // Background changes wake us through the notifier. Otherwise repaint
@@ -945,6 +2144,112 @@ impl SkiffApp {
         self.pointer_used = ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed() || i.pointer.any_released());
         self.last_ui = started.elapsed();
         self.trace_startup(&ctx);
+    }
+
+    /// What happens to the window as a whole: its title, coming back to
+    /// it, and files dropped onto it.
+    fn window_events(&mut self, ctx: &egui::Context) {
+        let title = self.window_title();
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+        // Back from the terminal, where `aws eks update-kubeconfig` or a
+        // login just ran: pick up what changed. Checked only at that
+        // moment, and by modification time, so it costs nothing.
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.window_focused {
+            self.reload_kubeconfig_if_changed();
+            self.reload_settings_if_changed();
+        }
+        self.window_focused = focused;
+
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        for path in dropped {
+            match self.add_kubeconfig(&path.to_string_lossy()) {
+                Ok(()) => {
+                    if matches!(self.dialog, Some(Dialog::AddKubeconfig { .. })) {
+                        self.dialog = None;
+                    }
+                }
+                Err(e) => self.toast(e, Tone::Err),
+            }
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let pal = self.pal;
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("file-drop")));
+            painter.rect_filled(screen, CornerRadius::ZERO, pal.tint(pal.bg, 0.86));
+            painter.rect_stroke(screen.shrink(12.0), CornerRadius::same(12), Stroke::new(2.0, pal.accent), egui::StrokeKind::Inside);
+            painter.text(
+                screen.center(),
+                Align2::CENTER_CENTER,
+                "Drop to add this kubeconfig",
+                FontId::new(18.0, theme::semibold()),
+                pal.text,
+            );
+        }
+    }
+
+    /// The standing messages, between the top bar and everything else.
+    fn notices_ui(&mut self, ui: &mut Ui) {
+        if self.notices.is_empty() {
+            return;
+        }
+        let pal = self.pal;
+        let mut dismiss: Option<usize> = None;
+        let mut act: Option<NoticeAction> = None;
+        Panel::top("notices")
+            .resizable(false)
+            .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 8 }))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (i, notice) in self.notices.iter().enumerate() {
+                    let color = if notice.tone == Tone::Normal { pal.accent } else { pal.tone(notice.tone) };
+                    let icon = if notice.tone == Tone::Err { icons::ICON_ERROR } else if notice.tone == Tone::Warn { icons::ICON_WARNING } else { icons::ICON_INFO };
+                    Frame::new()
+                        .fill(pal.tint(color, 0.10))
+                        .stroke(Stroke::new(1.0, pal.tint(color, 0.35)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
+                                ui.label(widgets::icon(icon, 16.0).color(color));
+                                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                    let close = egui::Button::new(widgets::icon(icons::ICON_CLOSE, 15.0).color(pal.muted))
+                                        .frame_when_inactive(false)
+                                        .min_size(Vec2::new(24.0, 22.0));
+                                    if widgets::named(ui.add(close), "Dismiss").clicked() {
+                                        dismiss = Some(i);
+                                    }
+                                    if let Some((label, action)) = &notice.action {
+                                        if ui.add(egui::Button::new(label.as_str()).min_size(Vec2::new(0.0, 22.0))).clicked() {
+                                            act = Some(action.clone());
+                                        }
+                                    }
+                                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.add(egui::Label::new(widgets::semibold(&notice.title, 13.0).color(pal.text)).wrap());
+                                        for line in &notice.lines {
+                                            ui.add(
+                                                egui::Label::new(RichText::new(line).color(pal.muted).size(12.5))
+                                                    .wrap()
+                                                    .selectable(true),
+                                            );
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                }
+            });
+        if let Some(NoticeAction::OpenUrl(url)) = act {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if let Some(i) = dismiss {
+            self.notices.remove(i);
+        }
     }
 
     fn trace_startup(&mut self, ctx: &egui::Context) {
@@ -975,16 +2280,53 @@ impl SkiffApp {
         } else {
             KeyboardShortcut::new(Modifiers::COMMAND, Key::K)
         };
-        if ctx.input_mut(|i| i.consume_shortcut(&open_palette)) && self.dialog.is_none() {
+        if ctx.input_mut(|i| i.consume_shortcut(&open_palette)) && self.dialog.is_none() && self.confirm.is_none() {
             self.palette = match self.palette {
                 Some(_) => None,
                 None => Some(PaletteState::default()),
             };
+            if self.palette.is_some() {
+                self.settings = None;
+                self.help_open = false;
+                self.hint_seen = true;
+            }
+        }
+        // Zoom, from anywhere but a shell on Linux and Windows (where
+        // Ctrl+- and friends are the remote program's).
+        if !in_shell {
+            let pressed = |ctx: &egui::Context, key: Key| {
+                ctx.input_mut(|i| {
+                    i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key))
+                        || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key))
+                })
+            };
+            if pressed(ctx, Key::Equals) || pressed(ctx, Key::Plus) {
+                self.zoom_by_step(true);
+            } else if pressed(ctx, Key::Minus) {
+                self.zoom_by_step(false);
+            } else if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0))) {
+                self.set_zoom(1.0);
+                self.toast("Zoom 100%", Tone::Normal);
+            }
+        }
+        let open_settings = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+        if ctx.input_mut(|i| i.consume_shortcut(&open_settings)) && self.dialog.is_none() && self.confirm.is_none() {
+            match self.settings {
+                Some(_) => self.settings = None,
+                None => self.open_settings(Section::default()),
+            }
         }
         // Keys belong to whatever is on top: a text field, the terminal, a
         // dialog, the palette, or an open menu / popup.
         let busy = self.overlay_open(ctx) || self.terminal_focused || ctx.text_edit_focused();
         if busy {
+            return;
+        }
+        if ctx.input(|i| self.keymap.pressed(i, Action::Help)) {
+            // (Taken, so that the list does not see it as "close".)
+            let keymap = &self.keymap;
+            ctx.input_mut(|i| i.events.retain(|e| !keymap.is_event(e, Action::Help)));
+            self.open_help();
             return;
         }
         // A click outside the sidebar takes the keyboard back to the table.
@@ -1019,7 +2361,7 @@ impl SkiffApp {
             return;
         }
         if let Some(d) = self.detail.as_mut() {
-            let tabs = [DetailTab::Overview, DetailTab::Yaml, DetailTab::Events];
+            let tabs = d.tabs();
             let at = tabs.iter().position(|t| *t == d.tab).unwrap_or(0);
             let step = ctx.input(|i| {
                 if self.keymap.pressed(i, Action::NextTab) {
@@ -1141,7 +2483,12 @@ impl SkiffApp {
 
     /// Whether a dialog, the palette or any menu / popup is open.
     fn overlay_open(&self, ctx: &egui::Context) -> bool {
-        self.palette.is_some() || self.dialog.is_some() || egui::Popup::is_any_open(ctx)
+        self.palette.is_some()
+            || self.dialog.is_some()
+            || self.confirm.is_some()
+            || self.settings.is_some()
+            || self.help_open
+            || egui::Popup::is_any_open(ctx)
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -1152,10 +2499,13 @@ impl SkiffApp {
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin::symmetric(10, 0)))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    if widgets::icon_button(ui, icons::ICON_MENU, "Toggle sidebar").clicked() {
+                    // (No sidebar on the welcome page, so nothing to toggle.)
+                    let has_sidebar = !self.contexts.items.is_empty() || self.active.is_some();
+                    if has_sidebar && widgets::icon_button(ui, icons::ICON_MENU, "Toggle sidebar").clicked() {
                         self.sidebar_open = !self.sidebar_open;
                     }
                     self.context_switcher(ui);
+                    self.cluster_badges(ui);
                     self.namespace_picker(ui);
                     ui.add_space(8.0);
 
@@ -1171,13 +2521,27 @@ impl SkiffApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let comma = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+                        if widgets::icon_button(ui, icons::ICON_SETTINGS, &format!("Settings  ({comma} ,)")).clicked() {
+                            self.open_settings(Section::default());
+                        }
                         let theme_icon = if pal.dark { icons::ICON_LIGHT_MODE } else { icons::ICON_DARK_MODE };
                         if widgets::icon_button(ui, theme_icon, "Toggle light / dark theme").clicked() {
                             let dark = !self.pal.dark;
                             self.set_theme(ui.ctx(), dark);
                         }
-                        if widgets::icon_button(ui, icons::ICON_ADD, "Create resource from YAML").clicked() {
-                            self.open_create_dialog();
+                        if self.session().is_some() {
+                            let locked = self.locked_reason();
+                            let add = ui.add_enabled_ui(locked.is_none(), |ui| {
+                                widgets::icon_button(ui, icons::ICON_ADD, "Create resource from YAML")
+                            });
+                            match locked {
+                                Some(reason) => {
+                                    add.inner.on_disabled_hover_text(reason);
+                                }
+                                None if add.inner.clicked() => self.open_create_dialog(),
+                                None => {}
+                            }
                         }
                         self.update_button(ui);
                         self.connection_badge(ui);
@@ -1195,7 +2559,11 @@ impl SkiffApp {
             match &state {
                 State::UpToDate => {
                     self.update_check_asked = false;
-                    self.toast(format!("Skiff is up to date (build {})", update::build_number()), Tone::Ok);
+                    let build = match update::build_number() {
+                        0 => String::new(),
+                        n => format!(", build {n}"),
+                    };
+                    self.toast(format!("Skiff is up to date ({}{build})", update::current_version()), Tone::Ok);
                 }
                 State::Failed(e) => {
                     self.update_check_asked = false;
@@ -1205,14 +2573,33 @@ impl SkiffApp {
                 _ => {}
             }
         }
-        let accent = |text: &str| {
-            egui::Button::new((
-                widgets::icon(icons::ICON_SYSTEM_UPDATE_ALT, 16.0).color(pal.bg),
-                RichText::new(text).color(pal.bg),
-            ))
-            .fill(pal.accent)
-            .min_size(Vec2::new(0.0, 28.0))
+        let accent_with = |ic: MaterialIcon, text: &str| {
+            egui::Button::new((widgets::icon(ic, 16.0).color(pal.bg), RichText::new(text).color(pal.bg)))
+                .fill(pal.accent)
+                .min_size(Vec2::new(0.0, 28.0))
         };
+        let accent = |text: &str| accent_with(icons::ICON_SYSTEM_UPDATE_ALT, text);
+        // A failed update comes with advice ("Move Skiff to Applications
+        // to enable updates"): say it where it is seen, once.
+        match &state {
+            State::DownloadFailed(r, e) => {
+                if self.update_failure_told.as_deref() != Some(e.as_str()) {
+                    self.update_failure_told = Some(e.clone());
+                    self.notify(Notice {
+                        key: "update".into(),
+                        tone: Tone::Warn,
+                        title: format!("{} could not be installed", r.title),
+                        lines: vec![e.clone()],
+                        action: Some(("Open release page".into(), NoticeAction::OpenUrl(r.page.clone()))),
+                    });
+                }
+            }
+            State::Downloading(_) | State::Ready { .. } => {
+                self.update_failure_told = None;
+                self.notices.retain(|n| n.key != "update");
+            }
+            _ => {}
+        }
         match state {
             State::Available(r) | State::DownloadFailed(r, _) => {
                 let failed = match self.updater.state() {
@@ -1227,11 +2614,17 @@ impl SkiffApp {
                 if let Some(e) = &failed {
                     tip.push_str(&format!("\n\nLast attempt failed: {e}"));
                 }
-                let label = if failed.is_some() { "Retry update" } else { "Update" };
-                if ui.add(accent(label)).on_hover_text(tip).clicked() {
-                    if update::can_install() {
+                if update::can_install() {
+                    let label = if failed.is_some() { "Retry update" } else { "Update" };
+                    if ui.add(accent(label)).on_hover_text(tip).clicked() {
                         self.updater.download(&ctx, r);
-                    } else {
+                    }
+                } else {
+                    // This copy cannot replace itself (Windows, Linux, or
+                    // not installed as an app): the release page has the
+                    // download.
+                    tip.push_str("\n\nOpens the release page, where the new version can be downloaded.");
+                    if ui.add(accent_with(icons::ICON_OPEN_IN_NEW, "New version")).on_hover_text(tip).clicked() {
                         ctx.open_url(egui::OpenUrl::new_tab(r.page));
                     }
                 }
@@ -1260,7 +2653,8 @@ impl SkiffApp {
         let Some(session) = self.session().cloned() else { return };
         match &*session.status() {
             ConnStatus::Connecting => {
-                ui.label(RichText::new("Connecting…").color(pal.muted));
+                let what = session.connecting_detail().unwrap_or_else(|| "Connecting…".to_string());
+                ui.label(RichText::new(what).color(pal.muted));
                 ui.spinner();
             }
             ConnStatus::Connected { version } => {
@@ -1269,14 +2663,30 @@ impl SkiffApp {
                 widgets::dot(ui, pal.ok);
             }
             ConnStatus::Failed(err) => {
+                let info = session.failure();
+                let tip = match &info {
+                    Some(info) => match &info.hint {
+                        Some(hint) => format!("{}\n{hint}", info.summary),
+                        None => info.summary.clone(),
+                    },
+                    None => err.clone(),
+                };
                 let resp = ui
                     .add(egui::Button::new((
                         widgets::icon(icons::ICON_REFRESH, 15.0).color(pal.err),
                         RichText::new("Reconnect").color(pal.err),
                     )))
-                    .on_hover_text(err);
+                    .on_hover_text(&tip);
                 if resp.clicked() {
                     session.reconnect();
+                }
+                // What went wrong, as far as there is room for it.
+                let summary = info.map(|i| i.summary).unwrap_or_else(|| err.clone());
+                let room = (ui.available_width() - 16.0).min(300.0);
+                if room > 80.0 {
+                    let mut job = egui::text::LayoutJob::simple_singleline(summary, FontId::proportional(12.0), pal.err);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+                    ui.add(egui::Label::new(job)).on_hover_text(tip);
                 }
             }
         }
@@ -1294,6 +2704,9 @@ impl SkiffApp {
             .on_hover_text("Switch cluster");
         let mut switch_to = None;
         let mut disconnect = None;
+        let mut read_only: Option<bool> = None;
+        let mut ask_first: Option<bool> = None;
+        let (mut add_file, mut reload) = (false, false);
         // The longest context name decides the width, within limits. The
         // width is fixed for the whole menu: rows that size themselves from
         // the space left over would make the popup grow on every frame.
@@ -1308,38 +2721,66 @@ impl SkiffApp {
                     .x
             })
             .fold(0.0_f32, f32::max);
-        let menu_width = (longest + 90.0).clamp(280.0, 520.0);
+        let menu_width = (longest + 130.0).clamp(280.0, 520.0);
         egui::Popup::menu(&resp)
             .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_width(menu_width);
                 widgets::caption(ui, "Clusters", &pal);
-                if let Some(err) = &self.contexts_error {
-                    ui.add(egui::Label::new(RichText::new(err).color(pal.err)).wrap());
+                if self.contexts.items.is_empty() {
+                    ui.label(RichText::new("No clusters yet. Add a kubeconfig file to see its clusters.").color(pal.muted));
                 }
-                if self.contexts.items.is_empty() && self.contexts_error.is_none() {
-                    ui.label(RichText::new("No contexts in kubeconfig").color(pal.muted));
+                if !self.kube.problems.is_empty() && !self.contexts.items.is_empty() {
+                    let text = format!("{} can't be used", widgets::plural(self.kube.problems.len(), "kubeconfig file"));
+                    let details: Vec<String> = self.kube.problems.iter().map(|p| p.to_string()).collect();
+                    ui.horizontal(|ui| {
+                        ui.label(widgets::icon(icons::ICON_WARNING, 14.0).color(pal.warn));
+                        ui.label(RichText::new(text).color(pal.warn).size(12.0));
+                    })
+                    .response
+                    .on_hover_text(details.join("\n"));
                 }
                 egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     let row_width = ui.available_width();
                     for c in &self.contexts.items {
                         let is_active = self.active.as_deref() == Some(c.name.as_str());
-                        let connected = self.sessions.get(&c.name).map(|s| s.status());
+                        let session = self.sessions.get(&c.name);
+                        let connected = session.map(|s| s.status());
                         let dot_color = match connected.as_deref() {
                             Some(ConnStatus::Connected { .. }) => pal.ok,
                             Some(ConnStatus::Connecting) => pal.warn,
                             Some(ConnStatus::Failed(_)) => pal.err,
                             None => pal.faint,
                         };
+                        // The same words as the top bar and the page.
                         let status = match connected.as_deref() {
-                            Some(ConnStatus::Connected { .. }) => "connected",
-                            Some(ConnStatus::Connecting) => "connecting",
-                            Some(ConnStatus::Failed(_)) => "failed to connect",
-                            None => "not connected",
+                            Some(ConnStatus::Connected { .. }) => "Connected".to_string(),
+                            Some(ConnStatus::Connecting) => session
+                                .and_then(|s| s.connecting_detail())
+                                .unwrap_or_else(|| "Connecting…".to_string()),
+                            Some(ConnStatus::Failed(err)) => match session.and_then(|s| s.failure()) {
+                                Some(info) => match info.hint {
+                                    Some(hint) => format!("{}\n{hint}", info.summary),
+                                    None => info.summary,
+                                },
+                                None => err.clone(),
+                            },
+                            None => "Not connected".to_string(),
                         };
-                        let r = cluster_row(ui, &pal, row_width, &c.name, is_active, dot_color, connected.is_some())
-                            .on_hover_text(format!("{}\n{}", c.server, status));
+                        let locked = self.cluster_read_only(&c.name);
+                        let mut marks = Vec::new();
+                        let mut tip = format!("{}\n{}", c.server, status);
+                        if c.insecure {
+                            marks.push((icons::ICON_GPP_BAD, pal.warn));
+                            tip.push_str("\nTLS certificate is not verified");
+                        }
+                        if locked {
+                            marks.push((icons::ICON_LOCK, pal.muted));
+                            tip.push_str("\nRead-only in Skiff");
+                        }
+                        let r = cluster_row(ui, &pal, row_width, &c.name, is_active, dot_color, connected.is_some(), &marks)
+                            .on_hover_text(tip);
                         if connected.is_some() {
                             // Drawn over the row's right end (and so
                             // clicked instead of it).
@@ -1363,12 +2804,108 @@ impl SkiffApp {
                         }
                     }
                 });
+                // Protection of the cluster that is open.
+                if let Some(active) = &self.active {
+                    let cluster = self.config.cluster(active);
+                    let locked = self.cluster_read_only(active);
+                    ui.separator();
+                    widgets::caption(ui, "Protection", &pal);
+                    if menu_toggle(ui, &pal, locked, "Read-only", true)
+                        .on_hover_text(format!(
+                            "Skiff will not change anything in {active}: no edits, deletes or scaling, and no new shells or port forwards. \
+                             Shells and port forwards that are already open keep running until you close them. Saved in the config file."
+                        ))
+                        .clicked()
+                    {
+                        read_only = Some(!locked);
+                    }
+                    // (Nothing to ask about while nothing can be changed.)
+                    if menu_toggle(ui, &pal, cluster.confirm, "Ask before changes", !locked)
+                        .on_hover_text(format!(
+                            "Restart, scale, cordon, suspend and applying YAML in {active} ask for confirmation first. Deleting always asks."
+                        ))
+                        .clicked()
+                    {
+                        ask_first = Some(!cluster.confirm);
+                    }
+                }
+                ui.separator();
+                let item = |ui: &mut Ui, ic: MaterialIcon, label: &str| {
+                    let atoms = (widgets::icon(ic, 15.0).color(pal.muted), RichText::new(label).color(pal.text));
+                    ui.add(egui::Button::new(atoms).frame(false))
+                };
+                if item(ui, icons::ICON_FILE_OPEN, "Add kubeconfig file…").clicked() {
+                    add_file = true;
+                    ui.close();
+                }
+                if item(ui, icons::ICON_SYNC, "Reload kubeconfig")
+                    .on_hover_text("Read the kubeconfig files again. Skiff also does this when you come back to its window and a file has changed.")
+                    .clicked()
+                {
+                    reload = true;
+                    ui.close();
+                }
             });
         if let Some(c) = switch_to {
             self.switch_context(&c);
         }
         if let Some(c) = disconnect {
             self.disconnect(&c);
+        }
+        if let (Some(on), Some(active)) = (read_only, self.active.clone()) {
+            self.set_read_only(&active, on);
+        }
+        if let (Some(on), Some(active)) = (ask_first, self.active.clone()) {
+            self.set_confirm(&active, on);
+        }
+        if add_file {
+            self.ask_for_kubeconfig(ui.ctx());
+        }
+        if reload {
+            self.reload_kubeconfig(true);
+        }
+    }
+
+    /// Standing conditions of the current cluster, next to its name.
+    fn cluster_badges(&mut self, ui: &mut Ui) {
+        let pal = self.pal;
+        let Some(active) = self.active.clone() else { return };
+        if self.read_only() {
+            widgets::badge(ui, icons::ICON_LOCK, "Read-only", pal.info, &pal).on_hover_text(format!(
+                "Skiff will not change anything in {active}: editing, deleting, scaling, new shells and new port forwards are off. \
+                 Shells and port forwards that are already open keep running until you close them. \
+                 Turn this off in the cluster menu."
+            ));
+        }
+        if let Some(info) = self.contexts.items.iter().find(|c| c.name == active).filter(|c| c.insecure) {
+            let file = info.file.as_deref().map(pages::short_path).unwrap_or_else(|| "your kubeconfig".to_string());
+            widgets::badge(ui, icons::ICON_GPP_BAD, "TLS not verified", pal.warn, &pal).on_hover_text(format!(
+                "This context sets insecure-skip-tls-verify, so the server's certificate is not checked: \
+                 someone on the network could read or change what is sent, credentials included. \
+                 Remove that setting from {file} once the cluster has a certificate your computer trusts."
+            ));
+        }
+        // Firing alerts, once the overview or a Metrics tab has found the
+        // cluster's Prometheus (the badge itself never goes looking).
+        let alerts = self.session().map(|s| s.alerts()).unwrap_or_default();
+        let (critical, warning) = alerts.counts();
+        if critical + warning > 0 {
+            let color = if critical > 0 { pal.err } else { pal.warn };
+            let text = widgets::plural(critical + warning, "alert");
+            let mut parts = Vec::new();
+            if critical > 0 {
+                parts.push(format!("{critical} critical"));
+            }
+            if warning > 0 {
+                parts.push(widgets::plural(warning, "warning"));
+            }
+            let badge = widgets::badge(ui, icons::ICON_NOTIFICATIONS_ACTIVE, &text, color, &pal)
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Firing in {active}: {}. Click to see them on the overview.", parts.join(", ")));
+            if badge.clicked() {
+                self.go(View::Overview);
+            }
         }
     }
 
@@ -1619,36 +3156,49 @@ impl SkiffApp {
             self.no_cluster(ui);
             return;
         };
+        if self.connection_page(ui, &session, true) {
+            return;
+        }
         self.tick = self.tick.min(Duration::from_secs(5));
-        if let Some(action) = overview::show(ui, &self.pal, &session, &self.ns_filter) {
+        self.first_run_hint(ui);
+        // An account confined to a namespace is refused the cluster-wide
+        // lists: the overview then covers the one selected namespace.
+        let (_, pods, limited_pods) = self.scoped_table(&session, &kinds::pods());
+        let (_, deploys, limited_deploys) = self.scoped_table(&session, &overview::deployments_key());
+        let (_, events, limited_events) = self.scoped_table(&session, &kinds::events());
+        let data = overview::Data {
+            nodes: session.table(&kinds::nodes()).snapshot(),
+            pods,
+            deploys,
+            events,
+            limited: limited_pods || limited_deploys || limited_events,
+            home_namespace: self
+                .contexts
+                .items
+                .iter()
+                .find(|c| c.name == session.context)
+                .and_then(|c| c.namespace.clone())
+                .filter(|ns| !ns.is_empty()),
+        };
+        if let Some(action) = overview::show(ui, &self.pal, &session, &self.ns_filter, &data) {
             match action {
                 overview::Action::Go(key) => self.go(View::Resource(key)),
                 overview::Action::Open { key, ns, name } => self.open_object(&key, &ns, &name),
+                overview::Action::UseNamespace(ns) => self.ns_filter = BTreeSet::from([ns]),
             }
         }
     }
 
-    fn no_cluster(&mut self, ui: &mut Ui) {
-        let detail = self
-            .contexts_error
-            .clone()
-            .unwrap_or_else(|| "Pick a cluster from the switcher in the top bar.".to_string());
-        widgets::empty_state(ui, icons::ICON_HUB, "No cluster selected", &detail, &self.pal);
-    }
-
-    fn resource_view(&mut self, ui: &mut Ui, key: &ResourceKey) {
-        let pal = self.pal;
-        let Some(session) = self.session().cloned() else {
-            self.no_cluster(ui);
-            return;
-        };
-        let ctx = ui.ctx().clone();
+    /// The table to show for a resource type, with its latest snapshot.
+    ///
+    /// Accounts confined to a namespace may not list cluster-wide. With a
+    /// single namespace selected, that namespace is watched instead. The
+    /// refusal is remembered: the cluster-wide table keeps retrying in the
+    /// background and briefly reports other states while it does. The
+    /// last value says whether the cluster-wide list is refused.
+    fn scoped_table(&mut self, session: &Arc<Session>, key: &ResourceKey) -> (Arc<TableStore>, Arc<Snapshot>, bool) {
         let mut store = session.table(key);
         let mut latest = store.snapshot();
-        // Accounts confined to a namespace may not list cluster-wide. With a
-        // single namespace selected, watch just that namespace instead.
-        // Remember the refusal: the cluster-wide table keeps retrying in the
-        // background and briefly reports other states while it does.
         let mark = (session.context.clone(), key.id());
         if latest.state == LoadState::Failed && latest.error_code == 403 && key.namespaced {
             self.forbidden.insert(mark.clone());
@@ -1662,6 +3212,69 @@ impl SkiffApp {
                 latest = store.snapshot();
             }
         }
+        (store, latest, forbidden)
+    }
+
+    /// While the cluster cannot be reached, draws the page that says so in
+    /// place of the view and returns true. `connecting` also covers the
+    /// time before the first answer.
+    fn connection_page(&mut self, ui: &mut Ui, session: &Arc<Session>, connecting: bool) -> bool {
+        let pal = self.pal;
+        if let Some(info) = session.failure() {
+            let context = self.contexts.items.iter().find(|c| c.name == session.context);
+            let server = context.map(|c| c.server.clone()).unwrap_or_default();
+            match pages::connection_failed(ui, &pal, &session.context, &server, &info) {
+                Some(pages::FailureAction::Retry) => session.reconnect(),
+                Some(pages::FailureAction::CopyDetails) => {
+                    let file = context.and_then(|c| c.file.as_deref());
+                    let plugin = context.and_then(|c| c.exec_command.as_deref());
+                    ui.ctx().copy_text(pages::failure_details(&session.context, &server, file, plugin, &info));
+                    self.toast("Copied the connection details", Tone::Normal);
+                }
+                None => {}
+            }
+            return true;
+        }
+        if connecting && matches!(&*session.status(), ConnStatus::Connecting) {
+            pages::connecting(ui, &pal, &session.context, session.connecting_detail().as_deref());
+            return true;
+        }
+        false
+    }
+
+    fn no_cluster(&mut self, ui: &mut Ui) {
+        if self.contexts.items.is_empty() {
+            // The first minute: nothing to show yet, so say where Skiff
+            // looked and how to go on.
+            let picking = self.file_pick.is_some();
+            match pages::welcome(ui, &self.pal, &self.kube, picking) {
+                Some(pages::WelcomeAction::AddFile) => self.ask_for_kubeconfig(ui.ctx()),
+                Some(pages::WelcomeAction::Reload) => self.reload_kubeconfig(true),
+                None => {}
+            }
+            return;
+        }
+        widgets::empty_state(
+            ui,
+            icons::ICON_HUB,
+            "No cluster selected",
+            "Pick a cluster from the switcher in the top bar.",
+            &self.pal,
+        );
+    }
+
+    fn resource_view(&mut self, ui: &mut Ui, key: &ResourceKey) {
+        let pal = self.pal;
+        let Some(session) = self.session().cloned() else {
+            self.no_cluster(ui);
+            return;
+        };
+        if self.connection_page(ui, &session, false) {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let locked = self.locked_reason();
+        let (store, latest, _) = self.scoped_table(&session, key);
         let metrics = if key.is("", "pods") || key.is("", "nodes") {
             session.metrics()
         } else {
@@ -1773,7 +3386,11 @@ impl SkiffApp {
                     });
                 }
                 LoadState::Connecting | LoadState::Loading => {
-                    widgets::empty_state(ui, icons::ICON_SYNC, "Loading…", "", &pal);
+                    if matches!(&*session.status(), ConnStatus::Connecting) {
+                        pages::connecting(ui, &pal, &session.context, session.connecting_detail().as_deref());
+                    } else {
+                        widgets::empty_state(ui, icons::ICON_SYNC, "Loading…", "", &pal);
+                    }
                 }
                 _ => {
                     let detail = if total > 0 {
@@ -1850,7 +3467,7 @@ impl SkiffApp {
 
         let cols = table_view::display_columns(key, &snap, tui, &metrics, ui.available_width());
         let now = skiff_core::now_unix();
-        let out = table_view::show(ui, &pal, key, &self.cache, tui, &cols, &metrics, now);
+        let out = table_view::show(ui, &pal, key, &self.cache, tui, &cols, &metrics, now, locked.as_deref());
         self.tick = self.tick.min(table_view::age_tick(out.youngest));
 
         let mut to_open: Option<Arc<Row>> = None;
@@ -1885,6 +3502,7 @@ impl SkiffApp {
     fn detail_panel(&mut self, ui: &mut Ui) {
         let pal = self.pal;
         let Some(session) = self.session().cloned() else { return };
+        let locked = self.locked_reason();
         let Some(detail) = &mut self.detail else { return };
         // Refresh when the watched row reports a newer version.
         let current_rv = match &self.view {
@@ -1896,6 +3514,9 @@ impl SkiffApp {
             _ => None,
         };
         detail.poll(&session, current_rv.as_deref());
+        detail.locked = locked;
+        detail.confirm_apply = self.config.cluster(&session.context).confirm;
+        detail.grafana_url = self.config.cluster(&session.context).grafana_url;
         let listed = matches!(&self.view, View::Resource(k) if k == &detail.key)
             && self.cache.snap.state == LoadState::Live;
         detail.set_gone(listed && current_rv.is_none());
@@ -1931,9 +3552,25 @@ impl SkiffApp {
                 DetailAction::Row(action) => self.run_row_action(&ctx, action, &key, &ns, &name),
                 DetailAction::Open { kind, ns, name } => self.open_by_kind(&kind, &ns, &name),
                 DetailAction::Toast(text, tone) => self.toast(text, tone),
+                DetailAction::CopySecret { text, what } => self.copy_secret(&ctx, text, &what),
                 DetailAction::LogsOf { container } => {
                     let targets = vec![skiff_core::LogTarget { namespace: ns.clone(), pod: name.clone(), container: container.clone() }];
                     self.dock.open_logs(&session, format!("{name} · {container}"), Job::done(Ok(targets)));
+                }
+                DetailAction::ConfirmApply => {
+                    self.confirm = Some(Confirm {
+                        title: format!("Apply changes to {}?", key.kind),
+                        object: if ns.is_empty() { name.clone() } else { format!("{ns}/{name}") },
+                        note: "The object is replaced with the YAML in the editor.".to_string(),
+                        verb: "Apply".to_string(),
+                        context: session.context.clone(),
+                        op: ConfirmOp::ApplyEdit,
+                    });
+                }
+                DetailAction::ShellIn { .. } | DetailAction::ForwardPort { .. } if session.is_read_only() => {
+                    if let Some(reason) = self.locked_reason() {
+                        self.toast(reason, Tone::Warn);
+                    }
                 }
                 DetailAction::ShellIn { container } => {
                     self.dock.open_shell_in(&session, &ns, &name, &container);
@@ -1966,6 +3603,13 @@ impl SkiffApp {
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
         let pal = self.pal;
+        if matches!(self.dialog, Some(Dialog::AddKubeconfig { .. })) {
+            // (The one dialog that needs no cluster.)
+            self.add_kubeconfig_dialog(ctx);
+            return;
+        }
+        let asks = self.asks_first();
+        let confirming = self.confirm.is_some();
         let Some(dialog) = &mut self.dialog else {
             self.dialog_frames = 0;
             return;
@@ -1992,14 +3636,17 @@ impl SkiffApp {
         };
         let mut close = false;
         let mut push: Option<Pending> = None;
+        let mut ask: Option<Confirm> = None;
         let resp = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
             ui.set_width(400.0);
             match dialog {
+                Dialog::AddKubeconfig { .. } => {}
                 Dialog::Delete { key, ns, name, force } => {
                     ui.label(widgets::semibold(format!("Delete {}?", key.kind), 15.0));
                     ui.add_space(4.0);
                     let target = if ns.is_empty() { name.clone() } else { format!("{ns}/{name}") };
                     ui.label(RichText::new(target).font(theme::mono(12.5)).color(pal.text));
+                    cluster_line(ui, &pal, &session.context);
                     ui.add_space(6.0);
                     ui.checkbox(force, "Force (grace period 0)");
                     ui.add_space(10.0);
@@ -2059,10 +3706,12 @@ impl SkiffApp {
                         }
                         // Stepping needs a number to step from.
                         let known: Option<i32> = replicas.trim().parse().ok();
-                        if ui.add_enabled(known.is_some(), egui::Button::new("−").small()).clicked() {
+                        let fewer = ui.add_enabled(known.is_some(), egui::Button::new("−").small());
+                        if widgets::named(fewer, "One replica fewer").clicked() {
                             *replicas = (known.unwrap_or(1) - 1).max(0).to_string();
                         }
-                        if ui.add_enabled(known.is_some(), egui::Button::new("+").small()).clicked() {
+                        let more = ui.add_enabled(known.is_some(), egui::Button::new("+").small());
+                        if widgets::named(more, "One replica more").clicked() {
                             *replicas = (known.unwrap_or(0) + 1).to_string();
                         }
                     });
@@ -2075,10 +3724,21 @@ impl SkiffApp {
                         let go = ui.add_enabled(parsed.is_some(), egui::Button::new("Scale")).clicked()
                             || (parsed.is_some() && submitted);
                         if let (true, Some(n)) = (go, parsed) {
-                            push = Some(Pending::Simple {
-                                job: session.scale(key, ns, name, n),
-                                ok: format!("Scaled {name} to {n}"),
-                            });
+                            if asks {
+                                ask = Some(Confirm {
+                                    title: format!("Scale {} to {}?", key.kind, widgets::plural(n as usize, "replica")),
+                                    object: if ns.is_empty() { name.clone() } else { format!("{ns}/{name}") },
+                                    note: String::new(),
+                                    verb: "Scale".to_string(),
+                                    context: session.context.clone(),
+                                    op: ConfirmOp::Scale { key: key.clone(), ns: ns.clone(), name: name.clone(), replicas: n },
+                                });
+                            } else {
+                                push = Some(Pending::Simple {
+                                    job: session.scale(key, ns, name, n),
+                                    ok: format!("Scaled {name} to {n}"),
+                                });
+                            }
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -2094,7 +3754,9 @@ impl SkiffApp {
                         ui.label(RichText::new(format!("on {context}")).color(pal.muted));
                     });
                     ui.label(
-                        RichText::new("Multiple documents separated by --- are applied in order. Existing objects are replaced.")
+                        // (One line in the smallest window: a second
+                        // one pushes the buttons out of it.)
+                        RichText::new("Documents separated by --- are applied in order. Existing objects are updated, not replaced.")
                             .color(pal.muted)
                             .size(12.0),
                     );
@@ -2131,22 +3793,54 @@ impl SkiffApp {
                                 .layouter(&mut layouter),
                         );
                     });
+                    // Fields another manager (Helm, Argo CD, a controller)
+                    // owns are not taken over silently: say which, and
+                    // offer to.
+                    let conflict = error.as_deref().is_some_and(skiff_core::ops::is_apply_conflict);
                     if let Some(err) = error {
                         ui.add_space(4.0);
                         // One line per document: a long manifest must not
                         // push the buttons below the window.
-                        egui::ScrollArea::vertical().id_salt("create-error").max_height(110.0).show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+                        egui::ScrollArea::vertical().id_salt("create-error").max_height(150.0).show(ui, |ui| {
+                            if conflict {
+                                apply_conflict_report(ui, &pal, err);
+                            } else {
+                                ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+                            }
                         });
                     }
                     ui.add_space(10.0);
                     let busy = job.is_some();
                     ui.horizontal(|ui| {
                         let go = ui.add_enabled(!busy, egui::Button::new("Apply")).clicked()
-                            || (!busy && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)));
-                        if go {
-                            *error = None;
-                            *job = Some(session.apply_manifest(text.clone()));
+                            || (!busy && !confirming && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)));
+                        let anyway = conflict
+                            && ui
+                                .add_enabled(!busy, egui::Button::new(RichText::new("Apply anyway").color(pal.warn)))
+                                .on_hover_text(
+                                    "Applies the manifest and takes these fields over from their managers \
+                                     (kubectl apply --server-side --force-conflicts). The other manager may set them back.",
+                                )
+                                .clicked();
+                        if go || anyway {
+                            if asks {
+                                let documents = text.lines().filter(|l| l.trim_end() == "---").count() + 1;
+                                ask = Some(Confirm {
+                                    title: if anyway { "Apply this manifest anyway?" } else { "Apply this manifest?" }.to_string(),
+                                    object: widgets::plural(documents, "document"),
+                                    note: if anyway {
+                                        "Fields owned by other managers are taken over.".to_string()
+                                    } else {
+                                        "Objects in it are created, or updated where they exist.".to_string()
+                                    },
+                                    verb: if anyway { "Apply anyway" } else { "Apply" }.to_string(),
+                                    context: session.context.clone(),
+                                    op: ConfirmOp::ApplyManifest { force: anyway },
+                                });
+                            } else {
+                                *error = None;
+                                *job = Some(session.apply_manifest_with(text.clone(), anyway));
+                            }
                         }
                         // Always a way out, even when the server has stopped
                         // answering: a running request keeps going and
@@ -2235,8 +3929,122 @@ impl SkiffApp {
         if let Some(p) = push {
             self.pending.push(p);
         }
-        if close || (resp.should_close() && !sticky) {
+        if close || (resp.should_close() && !sticky && !confirming) {
             self.dialog = None;
+        }
+        if let Some(question) = ask {
+            self.confirm = Some(question);
+        }
+    }
+
+    /// Naming a kubeconfig file by its path.
+    fn add_kubeconfig_dialog(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
+        self.dialog_frames = self.dialog_frames.saturating_add(1);
+        let Some(Dialog::AddKubeconfig { path, error, focused }) = &mut self.dialog else { return };
+        let (mut add, mut close) = (false, false);
+        let resp = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(widgets::semibold("Add kubeconfig file", 15.0));
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Enter the path of a kubeconfig file, or of a folder of them. You can also drop the file onto this window.")
+                        .color(pal.muted)
+                        .size(12.0),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(path)
+                    .hint_text("~/.kube/config")
+                    .font(theme::mono(12.5))
+                    .desired_width(f32::INFINITY),
+            );
+            if !*focused {
+                *focused = true;
+                edit.request_focus();
+            }
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if let Some(err) = error {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(&*err).color(pal.err)).wrap().selectable(true));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let ready = !path.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Add")).clicked() || (ready && enter) {
+                    add = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if add {
+            let entered = path.clone();
+            match self.add_kubeconfig(&entered) {
+                Ok(()) => close = true,
+                Err(e) => {
+                    if let Some(Dialog::AddKubeconfig { error, .. }) = &mut self.dialog {
+                        *error = Some(e);
+                    }
+                }
+            }
+        }
+        if (close || resp.should_close()) && matches!(self.dialog, Some(Dialog::AddKubeconfig { .. })) {
+            self.dialog = None;
+        }
+    }
+
+    /// The question asked before a change to a cluster that is set to ask
+    /// first. Cancel has the focus: a key held a moment too long never
+    /// confirms.
+    fn confirm_ui(&mut self, ctx: &egui::Context) {
+        let pal = self.pal;
+        let Some(confirm) = &self.confirm else {
+            self.confirm_frames = 0;
+            return;
+        };
+        if self.active.as_deref() != Some(confirm.context.as_str()) {
+            self.confirm = None;
+            return;
+        }
+        let fresh = self.confirm_frames == 0;
+        self.confirm_frames = self.confirm_frames.saturating_add(1);
+        let (mut go, mut close) = (false, false);
+        let resp = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(widgets::semibold(&confirm.title, 15.0));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(&confirm.object).font(theme::mono(12.5)).color(pal.text)).wrap());
+            cluster_line(ui, &pal, &confirm.context);
+            if !confirm.note.is_empty() {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(&confirm.note).color(pal.muted)).wrap());
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let yes = egui::Button::new(RichText::new(&confirm.verb).color(pal.bg)).fill(pal.accent);
+                if ui.add(yes).clicked() {
+                    go = true;
+                }
+                let cancel = ui.button("Cancel");
+                if fresh {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    close = true;
+                }
+            });
+        });
+        if go {
+            if let Some(confirm) = self.confirm.take() {
+                self.run_confirmed(ctx, confirm.op);
+            }
+        } else if close || resp.should_close() {
+            self.confirm = None;
         }
     }
 
@@ -2291,6 +4099,103 @@ impl SkiffApp {
     }
 }
 
+/// A setting in a menu that is on or off: a check box drawn so that it
+/// shows on the menu's background, and its label.
+fn menu_toggle(ui: &mut Ui, pal: &Palette, on: bool, label: &str, enabled: bool) -> Response {
+    let (ic, color) = if on {
+        (icons::ICON_CHECK_BOX, pal.accent)
+    } else {
+        (icons::ICON_CHECK_BOX_OUTLINE_BLANK, pal.muted)
+    };
+    let atoms = (widgets::icon(ic, 17.0).color(color), RichText::new(label).color(pal.text));
+    let resp = ui.add_enabled(enabled, egui::Button::new(atoms).frame(false));
+    let label = label.to_string();
+    resp.widget_info(move || egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, &label));
+    resp
+}
+
+/// "on cluster <name>": which cluster a dialog's action goes to.
+fn cluster_line(ui: &mut Ui, pal: &Palette, context: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(RichText::new("on cluster").color(pal.muted).size(12.5));
+        ui.label(widgets::icon(icons::ICON_HUB, 14.0).color(pal.accent));
+        ui.add(egui::Label::new(widgets::semibold(context, 13.0).color(pal.text)).truncate());
+    });
+}
+
+/// One object of an apply report that was left alone because other
+/// managers own fields of it: (field, manager) pairs.
+struct ConflictedObject {
+    object: String,
+    fields: Vec<(String, String)>,
+}
+
+/// Splits an apply report (see `skiff_core::ops::apply_manifest_with`)
+/// into the objects with field conflicts and the remaining lines.
+fn apply_conflicts(report: &str) -> (Vec<ConflictedObject>, Vec<String>) {
+    let mut objects: Vec<ConflictedObject> = Vec::new();
+    let mut rest = Vec::new();
+    let mut in_object = false;
+    for line in report.lines() {
+        if let Some(field) = line.strip_prefix("    ").filter(|_| in_object) {
+            // (A manager's name may itself hold brackets; a field path
+            // has no " (".)
+            let (field, manager) = match field.split_once(" (") {
+                Some((field, manager)) => (field.to_string(), manager.strip_suffix(')').unwrap_or(manager).to_string()),
+                // ("and 3 more")
+                None => (field.to_string(), String::new()),
+            };
+            if let Some(object) = objects.last_mut() {
+                object.fields.push((field, manager));
+            }
+            continue;
+        }
+        in_object = skiff_core::ops::is_apply_conflict(line);
+        match line.split_once(": not applied") {
+            Some((object, _)) if in_object => objects.push(ConflictedObject { object: object.to_string(), fields: Vec::new() }),
+            _ => rest.push(line.to_string()),
+        }
+    }
+    (objects, rest)
+}
+
+/// An apply report with field conflicts: which fields of which objects
+/// belong to which manager, then whatever else the report says.
+fn apply_conflict_report(ui: &mut Ui, pal: &Palette, report: &str) {
+    let (objects, rest) = apply_conflicts(report);
+    Frame::new()
+        .fill(pal.tint(pal.warn, 0.10))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(widgets::icon(icons::ICON_WARNING, 15.0).color(pal.warn));
+                ui.label(widgets::semibold("Not applied: some fields belong to another manager", 13.0).color(pal.text));
+            });
+            for object in &objects {
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&object.object).color(pal.muted).size(12.0)).wrap().selectable(true));
+                for (field, manager) in &object.fields {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(RichText::new(field).font(theme::mono(12.0)).color(pal.text)).selectable(true));
+                        if !manager.is_empty() {
+                            ui.label(RichText::new("managed by").color(pal.muted).size(12.0));
+                            ui.label(widgets::semibold(manager, 12.5).color(pal.text));
+                        }
+                    });
+                }
+            }
+        });
+    if !rest.is_empty() {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(rest.join("\n")).color(pal.muted).size(12.5)).wrap().selectable(true));
+    }
+}
+
 /// What a successful apply did, short enough for a notification however
 /// many documents the manifest had.
 fn apply_summary(lines: &[String]) -> String {
@@ -2310,5 +4215,69 @@ impl eframe::App for SkiffApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         SkiffApp::save(self, storage);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_reports_are_split_into_fields_and_managers() {
+        let report = "configmaps/a: configured\n\
+                      deployments.apps/web: not applied, 2 fields are owned by another manager:\n    \
+                      .spec.replicas (helm)\n    .spec.template.spec.containers[name=\"web\"].image (argocd-controller)\n\
+                      configmaps/b: not applied, 21 fields are owned by another manager:\n    .data.mode (kubectl (legacy))\n    and 20 more\n\
+                      secrets/c: forbidden (403)";
+        let (objects, rest) = apply_conflicts(report);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].object, "deployments.apps/web");
+        assert_eq!(objects[0].fields[0], (".spec.replicas".to_string(), "helm".to_string()));
+        assert_eq!(objects[0].fields[1].1, "argocd-controller");
+        assert_eq!(objects[1].fields[0], (".data.mode".to_string(), "kubectl (legacy)".to_string()));
+        assert_eq!(objects[1].fields[1], ("and 20 more".to_string(), String::new()));
+        assert_eq!(rest, ["configmaps/a: configured", "secrets/c: forbidden (403)"]);
+    }
+
+    #[test]
+    fn config_decides_where_kubeconfigs_come_from() {
+        let (config, _) = Config::from_json(r#"{"kubeconfigs": ["~/a", "/b/*.yaml"]}"#);
+        assert_eq!(config_sources(&config).entries(), Some(&["~/a".to_string(), "/b/*.yaml".to_string()][..]));
+        assert!(config_sources(&Config::default()).is_default());
+    }
+
+    #[test]
+    fn the_first_added_kubeconfig_keeps_what_was_read_before() {
+        let entries = |s: KubeconfigSources| s.entries().map(<[String]>::to_vec).unwrap_or_default();
+        // No list yet: the default by name (resolved at every load, so a
+        // $KUBECONFIG that changes later is still followed), not the
+        // files it holds today or this user's home directory.
+        assert_eq!(entries(kubeconfigs_with_added(None, "/x/staging.yaml")), ["$KUBECONFIG", "/x/staging.yaml"]);
+        // A list that exists is added to, and not twice.
+        let listed = ["~/a".to_string()];
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), "/b")), ["~/a", "/b"]);
+        assert_eq!(entries(kubeconfigs_with_added(Some(&listed), "~/a")), ["~/a"]);
+        // What is saved reads back as the same sources.
+        let mut config = Config::default();
+        config.set_kubeconfigs(kubeconfigs_with_added(None, "/x/staging.yaml").entries());
+        assert_eq!(entries(config_sources(&config)), ["$KUBECONFIG", "/x/staging.yaml"]);
+    }
+
+    #[test]
+    fn a_changed_or_new_kubeconfig_file_changes_the_stamps() {
+        let dir = std::env::temp_dir().join(format!("skiff-stamps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.yaml");
+        let sources = KubeconfigSources::explicit([file.to_string_lossy().into_owned(), format!("{}/*.conf", dir.display())]);
+        let missing = file_stamps(&sources);
+        assert_eq!(missing, vec![(file.clone(), None)]);
+        std::fs::write(&file, "a").unwrap();
+        let present = file_stamps(&sources);
+        assert_ne!(present, missing, "a searched file that appears is a change");
+        std::fs::write(&file, "ab").unwrap();
+        assert_ne!(file_stamps(&sources), present, "new content is a change");
+        std::fs::write(dir.join("two.conf"), "x").unwrap();
+        assert_eq!(file_stamps(&sources).len(), 2, "a new file matching a wildcard is a change");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

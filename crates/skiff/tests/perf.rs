@@ -11,7 +11,7 @@ use egui_kittest::Harness;
 use skiff::{AppOptions, SkiffApp};
 
 fn harness(context: &str, view: &str) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None, ..Default::default() };
     Harness::builder()
         .with_size([1440.0, 900.0])
         .with_pixels_per_point(1.0)
@@ -63,14 +63,22 @@ fn large_cluster() {
     h.key_press(egui::Key::Slash);
     h.step();
     let mut worst = Duration::ZERO;
-    for ch in ["a", "p", "i", "-", "1"] {
+    // (The scale cluster's pods are named app-N-...: a filter that narrows
+    // the table without emptying it, which is what is worth timing.)
+    for ch in ["a", "p", "p", "-", "1"] {
         h.get_by_role(Role::TextInput).type_text(ch);
         let t = Instant::now();
         h.step();
         worst = worst.max(t.elapsed());
     }
+    // (The table is filtered at the start of a frame: the last character
+    // takes effect in the next one.)
+    let t = Instant::now();
+    h.step();
+    worst = worst.max(t.elapsed());
     let (shown, _) = h.state().table_stats();
-    println!("filter 'api-1': {shown} rows match; slowest keystroke frame {worst:?}; last recompute {:?}", h.state().last_table_cost());
+    assert!(shown > 0 && shown < rows, "the filter 'app-1' must narrow the table: {shown} of {rows} rows match");
+    println!("filter 'app-1': {shown} rows match; slowest keystroke frame {worst:?}; last recompute {:?}", h.state().last_table_cost());
 
     h.key_press(egui::Key::Escape);
     h.step();

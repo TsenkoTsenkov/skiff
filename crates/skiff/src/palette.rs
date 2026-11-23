@@ -9,6 +9,7 @@ use skiff_core::kinds;
 use skiff_core::{Contexts, ResourceKey, Session, BUILTINS};
 
 use crate::app::{kind_icon, kind_title, View};
+use crate::settings::Section;
 use crate::theme::{self, Palette};
 
 #[derive(Default)]
@@ -35,6 +36,19 @@ pub enum Command {
     CreateResource,
     Reconnect,
     CheckForUpdates,
+    ReloadKubeconfig,
+    AddKubeconfig,
+    /// Makes the current cluster read-only in Skiff, or writable again.
+    SetReadOnly(bool),
+    /// Opens the Settings window on a section.
+    Settings(Section),
+    /// Shows the list of keyboard shortcuts.
+    Shortcuts,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    OpenConfigFile,
+    OpenKeysFile,
 }
 
 pub enum Outcome {
@@ -97,6 +111,7 @@ pub fn fuzzy(query: &str, text: &str) -> Option<i32> {
 }
 
 fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Option<&Arc<Session>>) -> Vec<Item> {
+    let read_only = session.is_some_and(|s| s.is_read_only());
     let mut items: Vec<Item> = Vec::new();
     let mut push = |icon, title: String, subtitle: String, cmd, bonus: i32, extra_terms: &[&str]| {
         let mut best = fuzzy(query, &title);
@@ -164,11 +179,31 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
     push(icons::ICON_DARK_MODE, "Toggle light / dark theme".into(), "Action".into(), Command::ToggleTheme, 0, &[]);
     push(icons::ICON_MENU, "Toggle sidebar".into(), "Action".into(), Command::ToggleSidebar, 0, &[]);
     push(icons::ICON_SWAP_HORIZ, "Port forwards".into(), "Action".into(), Command::PortForwards, 0, &[]);
-    push(icons::ICON_ADD, "Create resource from YAML".into(), "Action".into(), Command::CreateResource, 0, &["apply", "new"]);
-    push(icons::ICON_REFRESH, "Reconnect to cluster".into(), "Action".into(), Command::Reconnect, 0, &[]);
-    if cfg!(target_os = "macos") {
-        push(icons::ICON_SYSTEM_UPDATE_ALT, "Check for updates".into(), "Action".into(), Command::CheckForUpdates, 0, &["upgrade", "version"]);
+    if let Some(s) = session {
+        // (Nothing can be created on a read-only cluster.)
+        if !read_only {
+            push(icons::ICON_ADD, "Create resource from YAML".into(), "Action".into(), Command::CreateResource, 0, &["apply", "new"]);
+        }
+        push(icons::ICON_REFRESH, "Reconnect to cluster".into(), "Action".into(), Command::Reconnect, 0, &[]);
+        let (icon, title) = if read_only {
+            (icons::ICON_LOCK_OPEN, format!("Allow changes to {}", s.context))
+        } else {
+            (icons::ICON_LOCK, format!("Make {} read-only", s.context))
+        };
+        push(icon, title, "Protection".into(), Command::SetReadOnly(!read_only), 0, &["read-only", "readonly", "lock", "protect"]);
     }
+    push(icons::ICON_FILE_OPEN, "Add kubeconfig file…".into(), "Action".into(), Command::AddKubeconfig, 0, &["cluster", "open", "import"]);
+    push(icons::ICON_SYNC, "Reload kubeconfig".into(), "Action".into(), Command::ReloadKubeconfig, 0, &["refresh", "clusters", "contexts"]);
+    push(icons::ICON_SYSTEM_UPDATE_ALT, "Check for updates".into(), "Action".into(), Command::CheckForUpdates, 0, &["upgrade", "version"]);
+    push(icons::ICON_SETTINGS, "Settings".into(), "Skiff".into(), Command::Settings(Section::Appearance), 0, &["preferences", "options", "theme"]);
+    push(icons::ICON_HUB, "Cluster settings".into(), "Settings".into(), Command::Settings(Section::Clusters), 0, &["kubeconfig files", "protection"]);
+    push(icons::ICON_INFO, "About Skiff".into(), "Skiff".into(), Command::Settings(Section::About), 0, &["version", "licence", "license", "build"]);
+    push(icons::ICON_KEYBOARD, "Keyboard shortcuts".into(), "Help".into(), Command::Shortcuts, 0, &["keys", "bindings", "help", "hotkeys"]);
+    push(icons::ICON_ZOOM_IN, "Zoom in".into(), "View".into(), Command::ZoomIn, 0, &["bigger", "larger", "font size"]);
+    push(icons::ICON_ZOOM_OUT, "Zoom out".into(), "View".into(), Command::ZoomOut, 0, &["smaller", "font size"]);
+    push(icons::ICON_SEARCH, "Actual size".into(), "View".into(), Command::ZoomReset, 0, &["reset zoom", "100%"]);
+    push(icons::ICON_DESCRIPTION, "Open config file".into(), "Settings".into(), Command::OpenConfigFile, 0, &["config.json", "edit settings"]);
+    push(icons::ICON_KEYBOARD, "Open keys file".into(), "Settings".into(), Command::OpenKeysFile, 0, &["keys.json", "key bindings", "keymap"]);
 
     // Objects in tables that are already loaded: instant, no extra requests.
     if let (Some(s), true) = (session, query.len() >= 2) {
@@ -228,8 +263,12 @@ pub fn show(
             s.active_tables()
                 .iter()
                 .fold(s.discovered().len() as u64, |acc, t| acc.wrapping_mul(31).wrapping_add(t.peek().generation))
+                .wrapping_mul(2)
+                .wrapping_add(u64::from(s.is_read_only()))
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .wrapping_mul(31)
+        .wrapping_add(contexts.items.len() as u64);
     let wanted = (state.query.trim().to_string(), stamp, active.map(str::to_string));
     if state.cached_for.as_ref() != Some(&wanted) {
         state.items = collect(&wanted.0, contexts, active, session);
@@ -369,5 +408,30 @@ mod tests {
         assert_eq!(items[0].title, "Services");
         let items = collect("", &Contexts::default(), None, None);
         assert!(items.len() > 10);
+    }
+
+    #[test]
+    fn commands_that_need_no_cluster_are_always_there() {
+        for (query, title) in [
+            ("reload kube", "Reload kubeconfig"),
+            ("add kubeconfig", "Add kubeconfig file…"),
+            ("check for updates", "Check for updates"),
+            ("settings", "Settings"),
+            ("about", "About Skiff"),
+            ("keyboard", "Keyboard shortcuts"),
+            ("zoom in", "Zoom in"),
+            ("zoom out", "Zoom out"),
+            ("reset zoom", "Actual size"),
+            ("config file", "Open config file"),
+            ("keys file", "Open keys file"),
+        ] {
+            let items = collect(query, &Contexts::default(), None, None);
+            assert_eq!(items[0].title, title, "query {query:?}");
+        }
+        // Without a cluster there is nothing to create in, reconnect to or protect.
+        let items = collect("", &Contexts::default(), None, None);
+        for absent in ["Create resource from YAML", "Reconnect to cluster"] {
+            assert!(!items.iter().any(|i| i.title == absent), "{absent} offered without a cluster");
+        }
     }
 }

@@ -24,7 +24,11 @@ pub struct Palette {
     pub selected: Color32,
     pub border: Color32,
     pub text: Color32,
+    /// Secondary text.
     pub muted: Color32,
+    /// The quietest text (hints, units, counts) and small icons. Like
+    /// `text` and `muted` it keeps a contrast of 4.5:1 on the surfaces
+    /// text sits on (see the tests); for hairlines use [`Palette::outline`].
     pub faint: Color32,
     pub accent: Color32,
     pub ok: Color32,
@@ -48,8 +52,8 @@ impl Palette {
             selected: rgb(0x1B2B47),
             border: rgb(0x242933),
             text: rgb(0xD5DAE3),
-            muted: rgb(0x8A93A3),
-            faint: rgb(0x5C6473),
+            muted: rgb(0x9BA3B2),
+            faint: rgb(0x848D9D),
             accent: rgb(0x5B9DFF),
             ok: rgb(0x3FB97A),
             warn: rgb(0xE3A545),
@@ -68,13 +72,13 @@ impl Palette {
             selected: rgb(0xDCE8FF),
             border: rgb(0xDFE2E8),
             text: rgb(0x1C2330),
-            muted: rgb(0x5E6878),
-            faint: rgb(0x9AA3B2),
-            accent: rgb(0x2F6FEB),
-            ok: rgb(0x1E9E5A),
-            warn: rgb(0xB7791F),
-            err: rgb(0xD43F4E),
-            info: rgb(0x1E88C8),
+            muted: rgb(0x4F5968),
+            faint: rgb(0x626C7D),
+            accent: rgb(0x2367EA),
+            ok: rgb(0x187F48),
+            warn: rgb(0x98651A),
+            err: rgb(0xD13041),
+            info: rgb(0x1A75AC),
         }
     }
 
@@ -89,6 +93,12 @@ impl Palette {
         }
     }
 
+    /// A line that only decorates (the edge of a hovered control): quieter
+    /// than any text colour, which a hairline may be.
+    pub fn outline(&self) -> Color32 {
+        rgb(if self.dark { 0x5C6473 } else { 0x9AA3B2 })
+    }
+
     /// A translucent tint of `c`, for badges and subtle fills.
     pub fn tint(&self, c: Color32, alpha: f32) -> Color32 {
         let a = alpha.clamp(0.0, 1.0);
@@ -99,9 +109,37 @@ impl Palette {
     /// Stable colour for a log source / label index.
     pub fn series(&self, i: usize) -> Color32 {
         const DARK: [u32; 8] = [0x5B9DFF, 0x3FB97A, 0xE3A545, 0xC792EA, 0x58B4E8, 0xF78C6C, 0x89DDFF, 0xF07178];
-        const LIGHT: [u32; 8] = [0x2F6FEB, 0x1E9E5A, 0xB7791F, 0x8250DF, 0x1E88C8, 0xC2410C, 0x0E7490, 0xBE123C];
+        const LIGHT: [u32; 8] = [0x2367EA, 0x187F48, 0x98651A, 0x8250DF, 0x1A75AC, 0xC2410C, 0x0E7490, 0xBE123C];
         rgb(if self.dark { DARK[i % 8] } else { LIGHT[i % 8] })
     }
+}
+
+/// Width of the outline around the control that has the keyboard.
+pub const FOCUS_WIDTH: f32 = 2.0;
+
+/// The outline around the control that has the keyboard focus.
+pub fn focus_stroke(p: &Palette) -> Stroke {
+    Stroke::new(FOCUS_WIDTH, p.accent)
+}
+
+/// Relative luminance of a colour (WCAG 2.x), 0 for black to 1 for white.
+pub fn luminance(c: Color32) -> f32 {
+    let channel = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+}
+
+/// WCAG contrast ratio of two opaque colours, from 1 (the same) to 21
+/// (black on white). Body text needs 4.5.
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 pub fn semibold() -> FontFamily {
@@ -186,7 +224,8 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
         v.warn_fg_color = p.warn;
         v.error_fg_color = p.err;
         v.selection.bg_fill = p.selected;
-        v.selection.stroke = Stroke::new(1.0, p.accent);
+        // Also the frame of the text field that has the keyboard.
+        v.selection.stroke = focus_stroke(p);
         v.override_text_color = None;
         v.weak_text_color = Some(p.muted);
         v.indent_has_left_vline = false;
@@ -210,21 +249,23 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
 
         w.hovered.bg_fill = p.hover;
         w.hovered.weak_bg_fill = p.hover;
-        w.hovered.bg_stroke = Stroke::new(1.0, p.faint);
+        w.hovered.bg_stroke = Stroke::new(1.0, p.outline());
         w.hovered.fg_stroke = Stroke::new(1.0, p.text);
         w.hovered.corner_radius = radius;
         w.hovered.expansion = 0.0;
 
         w.active.bg_fill = p.selected;
         w.active.weak_bg_fill = p.selected;
-        w.active.bg_stroke = Stroke::new(1.0, p.accent);
+        // "Active" is what egui draws a control with while it is pressed
+        // and while it has the keyboard focus: the focus outline.
+        w.active.bg_stroke = focus_stroke(p);
         w.active.fg_stroke = Stroke::new(1.0, p.text);
         w.active.corner_radius = radius;
         w.active.expansion = 0.0;
 
         w.open.bg_fill = p.hover;
         w.open.weak_bg_fill = p.hover;
-        w.open.bg_stroke = Stroke::new(1.0, p.faint);
+        w.open.bg_stroke = Stroke::new(1.0, p.outline());
         w.open.fg_stroke = Stroke::new(1.0, p.text);
         w.open.corner_radius = radius;
     });
@@ -233,6 +274,56 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrast_is_the_wcag_ratio() {
+        let (black, white) = (Color32::BLACK, Color32::WHITE);
+        assert!((contrast(black, white) - 21.0).abs() < 0.01);
+        assert!((contrast(white, white) - 1.0).abs() < 0.001);
+        // A pair with a published ratio: #767676 on white is 4.54.
+        assert!((contrast(rgb(0x767676), white) - 4.54).abs() < 0.01);
+        assert_eq!(contrast(black, white), contrast(white, black));
+    }
+
+    /// Text must be readable: WCAG AA asks for 4.5:1.
+    #[test]
+    fn text_colours_have_enough_contrast_in_both_themes() {
+        const AA: f32 = 4.5;
+        for p in [Palette::dark(), Palette::light()] {
+            let name = if p.dark { "dark" } else { "light" };
+            let check = |what: &str, fg: Color32, on: &str, bg: Color32| {
+                let ratio = contrast(fg, bg);
+                assert!(ratio >= AA, "{name}: {what} on {on} is {ratio:.2}:1, below {AA}:1");
+            };
+            // The three greys of text, on every surface text is written
+            // on, a hovered row included.
+            for (what, fg) in [("text", p.text), ("muted", p.muted), ("faint", p.faint)] {
+                for (on, bg) in [("bg", p.bg), ("panel", p.panel), ("raised", p.raised), ("hover", p.hover)] {
+                    check(what, fg, on, bg);
+                }
+            }
+            // A selected row carries names and secondary text.
+            check("text", p.text, "selected", p.selected);
+            check("muted", p.muted, "selected", p.selected);
+            // Status words and links, on the plain surfaces.
+            for (what, fg) in [("accent", p.accent), ("ok", p.ok), ("warn", p.warn), ("err", p.err), ("info", p.info)] {
+                for (on, bg) in [("bg", p.bg), ("panel", p.panel), ("raised", p.raised)] {
+                    check(what, fg, on, bg);
+                }
+            }
+            // Log source names.
+            for i in 0..8 {
+                check(&format!("series {i}"), p.series(i), "bg", p.bg);
+            }
+            // The focus outline has to stand out from what is around it
+            // (3:1 for a graphical object).
+            for (on, bg) in [("bg", p.bg), ("panel", p.panel), ("raised", p.raised)] {
+                let ratio = contrast(p.accent, bg);
+                assert!(ratio >= 3.0, "{name}: focus outline on {on} is {ratio:.2}:1");
+            }
+        }
+        const { assert!(FOCUS_WIDTH >= 2.0) };
+    }
 
     #[test]
     fn tint_blends_toward_background() {

@@ -6,6 +6,7 @@ source "$(dirname "$0")/lib.sh"
 "$HACK_DIR/churn.sh" stop
 daemon_stop logsim
 daemon_stop pf-target
+daemon_stop fake-prometheus
 for c in demo scale; do
   if cluster_exists "$c"; then
     if [ "${1:-}" = "--delete" ]; then

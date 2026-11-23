@@ -407,6 +407,15 @@ pub enum RowAction {
     Resume,
 }
 
+impl RowAction {
+    /// Whether the action changes the cluster (or, for a shell and a port
+    /// forward, opens a way to): these are not offered on a cluster that
+    /// is read-only in Skiff.
+    pub fn mutates(self) -> bool {
+        !matches!(self, RowAction::Logs | RowAction::CopyName)
+    }
+}
+
 /// Which actions make sense for a resource type.
 pub fn actions_for(key: &ResourceKey) -> Vec<(RowAction, egui_material_icons::MaterialIcon, &'static str)> {
     let mut v = Vec::new();
@@ -457,6 +466,8 @@ pub fn show(
     cols: &[DCol],
     metrics: &Metrics,
     now: i64,
+    // Why actions that change the cluster are disabled, when they are.
+    locked: Option<&str>,
 ) -> TableOutput {
     let snap = &cache.snap;
     let mut out = TableOutput::default();
@@ -645,7 +656,11 @@ pub fn show(
                         }
                         let color = if matches!(action, RowAction::Delete) { pal.err } else { pal.text };
                         let atoms = (widgets::icon(*ic, 15.0).color(color), RichText::new(*label).color(color));
-                        if ui.add(egui::Button::new(atoms).frame(false)).clicked() {
+                        let reason = locked.filter(|_| action.mutates());
+                        let item = ui.add_enabled(reason.is_none(), egui::Button::new(atoms).frame(false));
+                        if let Some(reason) = reason {
+                            item.on_disabled_hover_text(reason);
+                        } else if item.clicked() {
                             out.menu = Some((*action, row.clone()));
                             ui.close();
                         }

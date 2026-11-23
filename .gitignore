@@ -2,3 +2,17 @@
 *.swp
 .DS_Store
 /dist/
+
+# Signing material and local secrets must never be committed.
+*.p12
+*.p8
+*.pfx
+*.cer
+*.keychain-db
+.env
+.env.*
+
+# Packaging leftovers
+*.AppImage
+*.dmg
+/packaging/**/*.exe

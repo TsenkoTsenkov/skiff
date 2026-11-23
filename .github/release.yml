@@ -1,0 +1,15 @@
+# How GitHub groups merged pull requests in the generated notes of a
+# stable release (gh release create --generate-notes).
+changelog:
+  exclude:
+    labels: ["skip-changelog"]
+    authors: ["dependabot[bot]"]
+  categories:
+    - title: New
+      labels: ["feature", "enhancement"]
+    - title: Fixed
+      labels: ["bug", "fix"]
+    - title: Security
+      labels: ["security"]
+    - title: Other changes
+      labels: ["*"]
