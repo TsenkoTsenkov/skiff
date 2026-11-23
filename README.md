@@ -1,311 +1,176 @@
-# Skiff
+<p align="center">
+  <img src="crates/skiff/assets/icons/skiff-128.png" width="96" height="96" alt="Skiff icon">
+</p>
+<h1 align="center">Skiff</h1>
+<p align="center">
+  A fast, native desktop app for looking after Kubernetes clusters.<br>
+  One program, no web view, no account, no telemetry. It reads your kubeconfig and talks to the API server the way <code>kubectl</code> does.
+</p>
+<p align="center">
+  <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest"><img src="https://img.shields.io/github/v/release/TsenkoTsenkov/skiff?label=release" alt="Latest release"></a>
+  <a href="https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml"><img src="https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licence-MIT-blue" alt="MIT licence"></a>
+</p>
 
-A fast, native Kubernetes cluster browser. Think Lens, without Electron: one
-Rust binary, GPU-rendered UI, no account, no telemetry, no background
-services. It talks to the API server directly, exactly like `kubectl` does,
-using your existing kubeconfig.
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/img/overview-light.png">
+  <img src="docs/img/overview.png" alt="The cluster overview: counts, resource usage, firing alerts and what needs attention">
+</picture>
 
-Measured on a 4-core cloud VM against a local cluster with 100 nodes and
-5,415 pods (release build; see [Development](#development) to reproduce):
+## Download
 
-| | |
-| --- | --- |
-| First frame after launch | 60–120 ms |
-| All 5,415 pods listed and live | 0.4–0.5 s after launch |
-| Frame cost with the pods table open | about 1 ms |
-| Re-filter / re-sort 5,415 rows | 1–5 ms |
-| Open an object's details | about 20 ms |
-| Switch to another resource type (3,000 rows) | about 0.1 s |
-| Memory held per pod row | under 1 KB (about 4 MB for 5,415 pods) |
-| CPU while idle on that table | under 1% of one core |
-| Binary | 35 MB, no runtime dependencies beyond a GPU driver |
+| System | File | Notes |
+| --- | --- | --- |
+| macOS 11 or newer, Apple Silicon and Intel | [Skiff-macos-universal.dmg](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-macos-universal.dmg) | Open it and drag Skiff to Applications |
+| Windows 10 or 11, 64-bit | [Skiff-windows-x64-setup.exe](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64-setup.exe) | Installs for your user, no administrator rights. Portable: [Skiff-windows-x64.zip](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64.zip) |
+| Linux x86_64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-x86_64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_amd64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-x86_64.tar.gz) | glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, …) |
+| Linux arm64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-aarch64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_arm64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-aarch64.tar.gz) | |
 
-That machine has no GPU, so rendering was done by a CPU rasterizer; process
-memory there was about 165 MB, most of it the rasterizer. Numbers on real
-hardware have not been measured yet.
+Checksums: [SHA256SUMS](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/SHA256SUMS).
+[docs/install.md](docs/install.md) has the details for each system, how to
+check a download, and how to build from source.
 
-## Why it is fast
+**First launch.** The builds are not yet signed by Apple or Microsoft, so
+both systems ask before running Skiff the first time:
 
-- **Native, immediate-mode UI** (egui). There is no web view, no DOM and no
-  JavaScript. A frame is about a millisecond of CPU, and the app repaints
-  only when data changes or a relative time on screen would tick over.
-- **Watches only what you look at.** A resource type is listed and watched
-  when you open it and stops three minutes after you leave it. Lens-style
-  "watch everything up front" is what makes large clusters painful.
-- **Server-side tables.** Lists use the same Table API as `kubectl get`: the
-  API server renders the columns (including CRD printer columns) and ships
-  object metadata instead of full objects. Every resource type works with no
-  client-side schema, secrets values never leave the server for a list, and a
-  pod costs well under 1 KB of memory. Full objects are fetched only when you
-  open one.
-- **Streaming everything.** The first page of a list paints while the rest
-  loads; watch events are applied in batches and published as immutable
-  snapshots, so the UI thread never waits on the network or on a lock.
-- **Small core.** `skiff-core` (the data layer) knows nothing about the UI
-  and runs on two I/O threads.
+- **macOS** says the app cannot be opened. Go to System Settings → Privacy &
+  Security, scroll to the message about Skiff and choose **Open Anyway**.
+- **Windows** shows "Windows protected your PC". Choose **More info**, then
+  **Run anyway**.
 
-What runs in a container is not trusted with the app's health: a shell's
-output is taken in a few milliseconds per frame however fast it arrives,
-queues between the app and the cluster are bounded in both directions, and
-the terminal emulator runs behind a guard, so output it cannot digest costs
-that one screen a reset rather than the whole app.
+Each release's notes say whether that build is signed; once it is, these
+steps go away.
+
+## Quick start
+
+1. Install Skiff and open it. It lists the clusters `kubectl` knows about:
+   the files in `$KUBECONFIG`, or `~/.kube/config`.
+2. No clusters yet? Get one into your kubeconfig with your cloud's command
+   line (`aws eks update-kubeconfig`, `gcloud container clusters
+   get-credentials`, `az aks get-credentials`), or choose **Add kubeconfig
+   file…** on the welcome page. You can also drop a file onto the window.
+3. Pick a cluster from the menu at the top left. The overview shows what is
+   broken right now.
+4. Press `Ctrl+K` (`Cmd+K` on a Mac) to jump to any resource type, object,
+   namespace or action, and `?` for every keyboard shortcut.
+
+EKS, GKE, AKS, OIDC and other sign-in setups work through the credential
+plugins your kubeconfig already names: see [docs/clusters.md](docs/clusters.md).
 
 ## Features
 
-- Every resource type the cluster serves, including custom resources, with
-  live updates, instant filter (`/`), sortable columns, a column chooser and
-  columns that adapt to the available width
-- Multi-cluster: switch kubeconfig contexts instantly; connections stay warm
-- Namespace filter (one or many), remembered per cluster
-- Detail panel with tailored summaries (pods and containers, workloads,
-  services, ingresses, nodes, config maps, secrets with reveal/copy, PVCs,
-  cron jobs, events, …), conditions, related pods, object events, and links
-  between objects
-- YAML view with syntax highlighting; edit and apply with conflict detection
-  (the editor follows the object until you type, and tells you if it changed
-  underneath your edits); create or update objects from a manifest
-  (server-side apply, any number of documents)
-- Pod and workload logs: follow, multi-pod merge, timestamps, wrap,
-  previous container, level and ANSI colouring; find with matches highlighted
-  (Enter / Shift+Enter step through them), showing only matching lines or all
-  lines
-- Shells and log tails can also open in your own terminal app via `kubectl`
-  (iTerm if installed, else Terminal on macOS; `$TERMINAL` or a common
-  terminal on Linux; override with `SKIFF_TERMINAL`)
-- A shell in any container: a real terminal emulator in the dock (colours,
-  full-screen programs such as `vi` and `top`, 10,000 lines of scrollback,
-  mouse selection, copy and paste, resizing with the dock)
-- Port forwarding for pods and services, with a list of active forwards
-- Scale, rollout restart, cordon / uncordon, suspend / resume cron jobs,
-  delete (optionally forced)
-- CPU / memory columns and cluster usage from metrics-server (no Prometheus)
-- Cluster overview: what is broken right now and recent warnings
-- Command palette (`Ctrl/Cmd+K`): jump to any kind (kubectl short names
-  work: `po`, `deploy`, `svc`, …), any loaded object by name, namespace,
-  cluster or action
-- Dark and light themes
+- **Every resource type** the cluster serves, custom resources included,
+  with live updates, instant filter (`/`), sortable columns and a column
+  chooser
+- **Several clusters**: switch between kubeconfig contexts; connections
+  stay warm. Namespace filter, one or many, remembered per cluster
+- **Details** for each object: tailored summaries, conditions, related
+  pods, events and links between objects
+- **YAML**: view, edit and apply, with a warning when the object changed
+  underneath your edit; create or update from a manifest with server-side
+  apply, which reports field conflicts instead of overriding them
+- **Logs**: follow, merge the pods of a workload, timestamps, previous
+  container, find with highlighted matches
+- **Shell** in any container, in a built-in terminal or in your own
+  terminal app; **port forwarding** for pods and services
+- **Metrics**: CPU, memory, network and restart charts for pods, workloads
+  and nodes from the Prometheus already in your cluster, with no extra
+  credentials; a short history from metrics-server where there is none
+- **Alerts**: the alerts firing in Prometheus, on the overview and on the
+  object each one is about. Links into your Grafana if you set its address
+- **Read-only clusters**: mark a cluster read-only and Skiff refuses every
+  change to it, or have it ask before each change
+- **Actions**: scale, restart, cordon and uncordon, suspend and resume
+  cron jobs, delete
+- **Settings** window (`Ctrl/Cmd+,`): theme (dark, light or follow the
+  system), zoom, kubeconfig files, update channel, terminal app
+- Vim-style keyboard navigation with [custom bindings](docs/configuration.md#keyboard)
 
-## When the network misbehaves
-
-- A watch that goes silent is treated as dead after 150 seconds and
-  re-established; waking from sleep triggers an immediate refresh; a request
-  that gets no answer is abandoned after 15 seconds and retried with backoff.
-  The table says so (`reconnecting`, `polling`) instead of showing stale rows
-  as live.
-- If something between you and the API server cuts watches short, or your
-  account may list but not watch, the table falls back to polling every ten
-  seconds and tries watching again later.
-- A proxy or load balancer that drops idle connections after 30 or 45
-  seconds is not mistaken for that: a quiet table keeps its watch, and an
-  occasional list confirms that nothing was missed. Only if that list shows
-  changes the watch never delivered does the table switch to polling.
-- Log following survives dropped connections and container restarts without
-  losing or repeating lines, and follows a reconnect to new credentials.
-- Closing a log tab, a shell or a port-forward closes its connection on the
-  server too; the tests check this against the API server's own metrics.
-
-## Build and run
-
-Requirements: Rust 1.95 or newer.
-
-```bash
-cargo build --release
-```
-
-```bash
-./target/release/skiff
-```
-
-Options: `--context <name>`, `--namespace <name>`, `--view <resource>` (e.g.
-`--view pods`), `--light`. Clusters come from `$KUBECONFIG` or `~/.kube/config`; exec-based
-auth plugins (EKS, GKE, …) and OIDC are supported.
-
-Linux needs a Vulkan or OpenGL driver and `libxkbcommon` (on Debian/Ubuntu:
-`libxkbcommon-x11-0`, plus `mesa-vulkan-drivers` if you have no GPU driver).
-Windows needs nothing extra.
-
-### macOS
-
-A Mac build has to be made on a Mac (the linker needs Apple's own system
-libraries). With the Xcode command line tools (`xcode-select --install`) and
-Rust installed:
-
-```bash
-hack/macos-app.sh --install
-```
-
-builds the app and puts `Skiff.app` into `/Applications`; without `--install`
-it stays in `target/release/`, and `--dmg` also makes a disk image.
-`cargo build --release` and `./target/release/skiff` from a terminal work
-as on Linux.
-
-Without a Mac toolchain at hand, GitHub can build it: the workflow in
-`.github/workflows/macos.yml` produces the disk image on an Apple Silicon
-runner when a branch named `release/…` or a tag such as `v0.1.0` is pushed
-(or when the workflow is started by hand); the image is an artifact of the
-run and, for a tag, attached to a release. Such a downloaded copy is
-not notarized by Apple, so the first launch has to be allowed once: System
-Settings → Privacy & Security → Open Anyway, or
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Skiff.app
-```
-
-#### Updates
-
-Every push to `main` that changes the app makes the workflow publish a
-release named `build-<n>` with the zipped app. A copy installed from one of
-those releases (or from a `v…` tag) checks GitHub every few hours and shows
-an **Update** button in the top bar when a newer build exists. Clicking it
-downloads the new version next to the installed one, and **Restart to
-update** swaps them and reopens Skiff. "Check for updates" is also in the
-command palette (`Cmd+K`). For a private repository it uses the token from
-`$GITHUB_TOKEN`, `$GH_TOKEN` or `gh auth token`. `SKIFF_NO_UPDATE_CHECK=1`
-turns the check off. What the swap did is logged to
-`~/Library/Logs/Skiff-update.log`.
-
-Opened from the Finder or the Dock, the app asks your login shell for its
-`PATH`, so that the credential helpers your kubeconfig calls (`aws`,
-`gke-gcloud-auth-plugin`, `kubelogin`, …) are found.
-
-That workflow also checks the build on its Apple Silicon runner: the app
-starts, opens a window and draws. Beyond that it has not been used on a Mac
-yet.
-
-## Keyboard
-
-Moving around is vim-style by default, and every movement key can be
-changed (see below).
-
-| Key | Action |
+| | |
 | --- | --- |
-| `Ctrl/Cmd+K` | Command palette |
-| `/` | Focus the table filter |
-| `j` `k` or `↓` `↑` | Move the selection (table rows, or sidebar entries) |
-| `Ctrl+d` `Ctrl+u` or `PgDn` `PgUp` | Move further |
-| `g` `G` or `Home` `End` | Go to the first / last entry |
-| `h` or `←` | Move to the sidebar |
-| `l` or `→` | From the sidebar: open the entry and go back to the table. From the table: open details |
-| `Enter` | Open (details, or a sidebar entry) |
-| `]` `[` | Next / previous tab of the details panel |
-| `Esc` | Leave the sidebar / close details / clear the filter |
-| `Ctrl/Cmd+S` | Apply (while editing YAML) |
+| ![A pod's details next to the pods table](docs/img/pod-details.png) | ![CPU, memory and network charts of a pod](docs/img/metrics.png) |
+| ![Following a pod's logs](docs/img/logs.png) | ![A shell in a container](docs/img/shell.png) |
+| ![The command palette](docs/img/palette.png) | ![The Settings window](docs/img/settings.png) |
 
-Right-click a row for its actions.
+More: [observability](docs/observability.md) ·
+[clusters and sign-in](docs/clusters.md) ·
+[configuration and keyboard](docs/configuration.md)
 
-In the sidebar, the entry under the keyboard is outlined; moving over
-entries does not switch views until you open one. A click anywhere else
-gives the keyboard back to the table.
+## How it compares
 
-### Custom key bindings
+We publish only what we measured, and so far we have measured only Skiff.
+The launched 0.1.0 Linux binary against a local test cluster with 100
+nodes and 5,415 pods, on a 4-vCPU VM **without a GPU** (every frame drawn
+by a software rasterizer):
 
-Bindings are read at startup from `~/.config/skiff/keys.json` (or
-`$XDG_CONFIG_HOME/skiff/keys.json`, or the file named by `$SKIFF_KEYMAP`).
-It maps actions to lists of keys; actions it leaves out keep their
-defaults, and `[]` unbinds one. For example, to use the Colemak home row
-and keep the arrows:
+| | Measured |
+| --- | --- |
+| First frame built after launch | 118 ms (86 ms when started from a terminal) |
+| Window visible | 160 ms |
+| All 5,415 pods listed and live | 0.58 s |
+| Memory with that table open (PSS) | 162 MiB, at least 92 MiB of it the software Vulkan stack |
+| Processes / threads | 1 / 18 |
+| CPU while idle | 0.5% of one core |
+| Listening sockets | none |
+| Size | executable 39.2 MB; .deb 11.3 MB; AppImage 15.4 MB |
 
-```json
-{
-  "down": ["n", "ArrowDown"],
-  "up": ["e", "ArrowUp"],
-  "focus_left": ["h", "ArrowLeft"],
-  "focus_right": ["i", "ArrowRight"]
-}
-```
+Medians; the ranges, the method, the caveats and how to measure another
+tool on your own machine with the same script are in
+[docs/benchmarks.md](docs/benchmarks.md). Numbers on a real GPU, on macOS
+and on Windows have not been measured.
 
-Actions: `down`, `up`, `page_down`, `page_up`, `top`, `bottom`, `open`,
-`focus_left`, `focus_right`, `next_tab`, `prev_tab`, `filter`.
+## Security model
 
-Keys are written as `j`, `ArrowDown`, `PageUp`, `Home`, `Enter`, `Space`,
-`/`, `[`, `F5` and so on, optionally after modifiers joined with `+`:
-`Ctrl+d`, `Shift+g`, `Alt+j`, `Cmd+j` (`Cmd` is `Ctrl` on Linux and
-Windows). A single capital letter includes Shift: `G` is `Shift+g`. A key
-binds only with exactly the modifiers given, so `j` does not also fire on
-`Ctrl+j`. If the file has mistakes, Skiff says so when it starts and uses
-the parts it understood.
+- **Your credentials stay where they are.** Skiff reads your kubeconfig and
+  runs the credential plugins it names, as `kubectl` does. It has no
+  account and stores no cluster credentials of its own.
+- **Two network destinations.** The API server of the cluster you open,
+  and `api.github.com` for the update check (anonymous; off with one
+  setting). Prometheus is reached through the API server, not directly.
+- **No telemetry**, no crash reporting and no analytics.
+- **Lists do not fetch secret values.** Tables ask the server for rows,
+  not objects; a Secret is fetched in full only when you open it, and a
+  copied value is cleared from the clipboard after 60 seconds.
+- **What a cluster sends is not trusted.** Log lines, object sizes and
+  terminal output are bounded; escape sequences in logs are removed; a
+  program in a container cannot write to your clipboard.
+- **Updates.** On Windows and Linux Skiff only tells you a new version
+  exists and opens the release page. On macOS it installs an update only
+  after the download's code signature verifies.
 
-In a shell, keys go to the shell and nowhere else (including `Esc`, `Tab`,
-`Ctrl+K` and `Ctrl+S`). `Ctrl+Shift+C` copies the selection and
-`Ctrl+Shift+V` (or `Ctrl+V`) pastes; on macOS `Cmd+C` / `Cmd+V`.
-`Shift+PageUp` / `Shift+PageDown` page through the scrollback; double-click
-selects a word, triple-click a line. From a shell the command palette is on
-`Ctrl+Shift+K` (`Cmd+K` on macOS), and the keyboard returns to the shell
-when the palette closes. Click outside the terminal to give the keyboard
-back to the rest of the app; choosing a shell's tab gives it to that shell.
+Details, limits and how to report a problem: [docs/security.md](docs/security.md)
+and [SECURITY.md](SECURITY.md).
 
-Because `Ctrl+V` pastes, programs that use it themselves need their other
-binding (in vim, `Ctrl+Q` starts a visual block).
+## Deliberately not included
 
-## Layout
+Skiff stays one small program. It has no plugin system, no embedded
+Grafana or other web view, no sign-in or VPN client of its own, no
+incident management (acknowledging or silencing alerts), no hosted or team
+mode, and it bundles neither `kubectl` nor `helm`. The reasons are in
+[docs/observability.md](docs/observability.md#deliberately-not-there) and
+[CONTRIBUTING.md](CONTRIBUTING.md#what-gets-in).
 
-```
-crates/skiff-core   Kubernetes data layer: sessions, the list/watch engine,
-                    logs, exec, port-forward, object operations. No UI code.
-crates/skiff-term   The terminal widget used for shells (egui +
-                    alacritty's terminal emulation; no PTY, no networking).
-crates/skiff        The egui application.
-hack/               Local test clusters (kwok) and seed data for development.
-```
+## Roadmap
 
-## Development
+Not there yet:
 
-`hack/cluster-up.sh` starts two local clusters without Docker (real
-kube-apiserver + etcd with [kwok](https://kwok.sigs.k8s.io) simulating
-nodes and pods): `demo`, a small varied cluster with broken workloads and a
-churn loop, and `scale`, with 100 nodes and ~5,400 pods.
-
-```bash
-hack/cluster-up.sh
-```
-
-```bash
-KUBECONFIG=hack/kubeconfig cargo run --release -- --context demo
-```
-
-Tests:
-
-```bash
-cargo test
-```
-
-The unit tests need nothing; the watch engine's are run against a small
-in-process fake API server. The UI tests in `crates/skiff/tests/ui.rs` drive
-the real app headlessly against the `demo` cluster and write screenshots to
-`target/shots/`, and `crates/skiff-core/tests/live.rs` checks that
-background work really stops and reconnects really recover. Both are skipped
-when the cluster is not running; rendering uses a software Vulkan driver
-(`mesa-vulkan-drivers` on Linux). One UI test covers an account confined to
-a namespace; it runs when `SKIFF_TEST_RESTRICTED_KUBECONFIG` points at a
-kubeconfig made by `hack/restricted-kubeconfig.sh`.
-`crates/skiff/tests/qa_flows.rs` holds a larger, slower set of exploratory
-flows that is opt-in (see the note at the top of that file).
-
-Performance numbers come from:
-
-```bash
-cargo test --release -p skiff --test perf -- --ignored --nocapture
-```
-
-## Not there yet
-
+- Signed and notarized builds, then Homebrew and winget packages
 - Helm releases
-- In the terminal: mouse support for programs that ask for it (vim, htop:
-  the wheel works, clicks are not passed on), input methods for CJK text,
-  and glyphs outside the bundled fonts (CJK and emoji show as boxes)
-- Node drain, cron job trigger, bulk actions on multiple rows
-- Merging your YAML edits into a newer version of the object: when it
-  changed while you were typing you are told, and can load the latest
-  version, but your changes have to be made again
-- Logs while a node's clock is being corrected: after a backwards step,
-  lines can be missed until the clock catches up; after a jump ahead of more
-  than a few seconds that is later undone, a reconnect can show a block of
-  lines a second time
-- Accounts limited to a namespace: tables work once that one namespace is
-  selected (`-n <namespace>` or the picker), but the overview page and
-  selecting several namespaces still need cluster-wide list rights
+- Node drain, triggering a cron job, actions on several rows at once
+- Log search across history (Loki, Elasticsearch)
+- In the built-in terminal: mouse clicks for programs that ask for them,
+  input methods for CJK text, and CJK and emoji glyphs
+- Merging your YAML edits into a newer version of the object
 
-## License
+## Contributing
 
-MIT. Bundled fonts: Inter and JetBrains Mono (SIL Open Font License), Material
-Symbols (Apache 2.0).
+Bug reports and pull requests are welcome: see
+[CONTRIBUTING.md](CONTRIBUTING.md) and
+[docs/development.md](docs/development.md). `hack/cluster-up.sh` starts
+two local test clusters, without Docker, to develop against. Changes are
+listed in [CHANGELOG.md](CHANGELOG.md).
+
+## Licence
+
+[MIT](LICENSE). Bundled fonts and the crates Skiff is built from are
+listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
