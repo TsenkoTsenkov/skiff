@@ -56,7 +56,7 @@ fn open_switcher(h: &Harness<'static, SkiffApp>, current: &str) {
 fn cluster_menu_keeps_its_size() {
     // SAFETY: the only test in this binary.
     unsafe { std::env::set_var("KUBECONFIG", fake_kubeconfig()) };
-    let opts = AppOptions { context: Some(NAMES[8].to_string()), view: None, light: false, namespace: None };
+    let opts = AppOptions { context: Some(NAMES[8].to_string()), view: None, light: false, namespace: None, ..Default::default() };
     let mut h = Harness::builder()
         .with_size([1400.0, 800.0])
         .with_pixels_per_point(1.0)

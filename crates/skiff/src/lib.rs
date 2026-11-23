@@ -1,6 +1,7 @@
 //! Skiff: a fast, native Kubernetes cluster browser.
 
 pub mod app;
+pub mod config;
 pub mod detail;
 pub mod dock;
 pub mod external;

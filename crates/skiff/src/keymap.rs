@@ -180,20 +180,12 @@ impl Keymap {
         }
     }
 
-    /// `$SKIFF_KEYMAP`, else `skiff/keys.json` in `$XDG_CONFIG_HOME` or
-    /// `~/.config` (on every platform).
+    /// `$SKIFF_KEYMAP`, else `keys.json` in the config directory shared with
+    /// `config.json`: `$XDG_CONFIG_HOME/skiff` or `~/.config/skiff` on Linux
+    /// and macOS, `%APPDATA%\skiff` on Windows (where a file that is only at
+    /// the old `%USERPROFILE%\.config\skiff` location is still used).
     pub fn path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("SKIFF_KEYMAP").filter(|p| !p.is_empty()) {
-            return Some(PathBuf::from(p));
-        }
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })?;
-        Some(base.join("skiff").join("keys.json"))
+        crate::config::keymap_path()
     }
 
     /// Defaults overridden by the file's entries, and what was wrong with it.

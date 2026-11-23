@@ -51,7 +51,7 @@ fn test_context() -> Option<String> {
 }
 
 fn harness(context: &str, view: &str, size: [f32; 2]) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None, ..Default::default() };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -190,7 +190,7 @@ fn logs_dock_streams_and_filters() {
 }
 
 fn harness_with(context: &str, view: &str, size: [f32; 2], light: bool) -> Harness<'static, SkiffApp> {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None, ..Default::default() };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -329,7 +329,7 @@ fn restricted_account_can_work_in_its_namespace() {
 
     // Without a namespace the cluster-wide list is refused, and the app
     // says what to do about it.
-    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: None };
+    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: None, ..Default::default() };
     let mut h = Harness::builder()
         .with_size([1280.0, 800.0])
         .with_pixels_per_point(1.0)
@@ -340,7 +340,7 @@ fn restricted_account_can_work_in_its_namespace() {
     shot(&mut h, "17_restricted_all_namespaces");
 
     // With the namespace selected, the table loads from a namespaced watch.
-    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: Some(ns.clone()) };
+    let opts = AppOptions { context: Some("restricted".into()), view: Some("pods".into()), light: false, namespace: Some(ns.clone()), ..Default::default() };
     let mut h = Harness::builder()
         .with_size([1280.0, 800.0])
         .with_pixels_per_point(1.0)

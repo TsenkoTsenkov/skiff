@@ -83,6 +83,9 @@ pub struct AppOptions {
     pub view: Option<String>,
     /// Start with the namespace filter set to this namespace.
     pub namespace: Option<String>,
+    /// Kubeconfig files from `--kubeconfig`, in the order given. When not
+    /// empty they are used instead of the configured or default ones.
+    pub kubeconfigs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
