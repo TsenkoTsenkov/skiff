@@ -173,6 +173,10 @@ fn native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
         Ok(icon) => viewport.with_icon(icon),
         Err(_) => viewport,
     };
+    // Without an icon eframe puts its own egui logo in the Dock while the
+    // app runs. An empty one tells it to leave the bundle's .icns alone.
+    #[cfg(target_os = "macos")]
+    let viewport = viewport.with_icon(Arc::new(egui::IconData::default()));
     eframe::NativeOptions {
         viewport,
         renderer,
@@ -496,6 +500,13 @@ mod tests {
         let icon = eframe::icon_data::from_png_bytes(ICON_PNG).expect("valid PNG");
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_dock_keeps_the_bundle_icon() {
+        let options = native_options(eframe::Renderer::Wgpu);
+        assert_eq!(options.viewport.icon.as_deref(), Some(&egui::IconData::default()));
     }
 
     #[test]
