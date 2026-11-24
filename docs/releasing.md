@@ -245,12 +245,34 @@ searched.
   has to be read on TSDR, not on an aggregator.
 - Notion may hold unregistered rights or registrations outside the US.
 
-Still to do, by someone with a browser:
+**Register check, 2026-11-24** (USPTO TSDR and trademark search; TMview,
+which covers EUIPO, the UK IPO and the national offices; WIPO Global
+Brand Database). Still not legal advice.
 
-- [ ] Look up serials 99185738 and 90887371 on
-      <https://tsdr.uspto.gov> (status, goods and services, assignments).
-- [ ] Search SKIFF in classes 9 and 42 on EUIPO eSearch, the WIPO Global
-      Brand Database and the UK IPO.
+- US: Corsair's 99185738 is now **registered** (2026-10-20), for
+  computer keyboards and gaming keyboards only. 90887371 (Skiff World) is
+  dead, abandoned 2023. No other live SKIFF mark in class 9 or 42.
+- **EU: EUIPO 008131807, word mark SKIFF, registered, owner NC
+  Transaction, Inc. (News Corp, from its 2009 Skiff e-reader).** Class 9
+  includes "computer software in the field of text, image and sound
+  transmission, manipulation and display". Renewed to 2029-03-02; the
+  file was last updated in July 2026. The same owner holds UK
+  UK00908131807 and UK00002509584 (classes 9, 35, 38), China 7190553,
+  and Skiff LLC holds Italy and Japan registrations. The e-reader was
+  discontinued in 2010, so these may be open to revocation for non-use,
+  but they are on the register.
+- Brazil: 501655133, Skiff, class 42, registered, Nightwatch, Inc. (from
+  Skiff World's international registration 1655133, which has ended).
+- Similar, not identical, in the EU: SKIFFER (Tutus Data AB, EUIPO
+  018370988, classes 9, 38, 42).
+
+The owner decided to launch as Skiff with this known. If NC Transaction
+objects, the rename candidates below are the fallback.
+
+Still to do:
+
+- [x] Look up serials 99185738 and 90887371 on TSDR.
+- [x] Search SKIFF in classes 9 and 42 on EUIPO, WIPO and the UK IPO.
 - [ ] Look at `manifests/s/Skiff` in `microsoft/winget-pkgs`, and at
       WHOIS for any domain you want.
 - [ ] If the name has to change: Shallop and Umiak were free on
