@@ -80,6 +80,9 @@ Section "Skiff" SecMain
   ; is locked. Retry after closing it.)
   File "/oname=skiff.exe" "${EXE}"
   File "/oname=LICENSE.txt" "${LICENSE}"
+!ifdef NOTICES
+  File "/oname=THIRD-PARTY-NOTICES.md" "${NOTICES}"
+!endif
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   CreateShortcut "$SMPROGRAMS\Skiff.lnk" "$INSTDIR\skiff.exe"
@@ -122,6 +125,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Skiff.lnk"
   Delete "$INSTDIR\skiff.exe"
   Delete "$INSTDIR\LICENSE.txt"
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
   Delete "$INSTDIR\uninstall.exe"
   ; Only removes the folder when nothing else is in it.
   RMDir "$INSTDIR"

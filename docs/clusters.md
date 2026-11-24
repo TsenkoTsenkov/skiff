@@ -48,7 +48,7 @@ Things worth knowing:
 - **A plugin that needs you** (one that opens a browser for a first OIDC
   login, for example) is started by Skiff as kubectl would start it. While
   Skiff waits it shows
-  "Waiting for <plugin>…". A plugin that has not answered after 60 seconds
+  `Waiting for <plugin>…`. A plugin that has not answered after 60 seconds
   is given up on, with the advice to run your login command in a terminal.
 - **Tokens expire.** When a plugin reports an expired session, Skiff shows
   the last lines of what the plugin said and, where it recognises it, the
@@ -105,8 +105,8 @@ Two switches per cluster, in the cluster menu (top left) under
   request is sent: no edit, apply, create, delete, scale, restart, cordon,
   suspend, no new shell, and no new port-forward. The actions are disabled and say
   why, and a lock badge shows in the top bar. Looking, logs, metrics and
-  YAML viewing work as usual. The palette has "Make <cluster> read-only"
-  and "Allow changes to <cluster>".
+  YAML viewing work as usual. The palette has `Make <cluster> read-only`
+  and `Allow changes to <cluster>`.
 - **Ask before changes.** Restart, scale, cordon, suspend and applying
   YAML ask for confirmation first, naming the cluster. (Deleting always
   asks.)

@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "conditions": {
+    "date": "2026-11-23",
+    "machine": "a 4-vCPU cloud VM (KVM, Intel Xeon 2.10 GHz, 15.7 GiB RAM, no GPU)",
+    "os": "Ubuntu 24.04.5, Linux 6.18, x86_64",
+    "rendering": "software rendering (Mesa 25.2.8 lavapipe on Xvfb 1440x900), which inflates memory and CPU",
+    "cluster": "Local kwok cluster, context scale: kube-apiserver 1.37.2, 100 nodes, 5,415 pods",
+    "state": "The list of all pods in all namespaces is open and loaded; nothing else was opened",
+    "notes": "hack/bench/run.sh skiff --runs 10 --xvfb; churn loop stopped; raw results in target/bench/2026-11-23 (not checked in)."
+  },
+  "rows": [
+    {
+      "label": "Skiff 0.1.0",
+      "category": "native",
+      "subject": true,
+      "version": "0.1.0, commit 65653da7bcf010df860f1d3ea6873bd00647032a, cargo build --release, x86_64-unknown-linux-gnu",
+      "launch": "skiff --context scale --view pods; empty config and state directories; update check off (SKIFF_NO_UPDATE_CHECK=1)",
+      "ready_by": "printed line",
+      "metrics": {
+        "memory_pss_bytes": {"value": 170314752, "min": 168426496, "max": 171121664, "n": 5},
+        "processes": {"value": 1, "min": 1, "max": 1, "n": 5},
+        "download_bytes": {"value": 15727036, "note": "the .tar.gz; the .deb is 11.3 MB and the AppImage 15.4 MB"},
+        "window_visible_s": {"value": 0.1606625009999334, "min": 0.14914536000105727, "max": 0.25669948200084036, "n": 10},
+        "idle_cpu_percent": {"value": 0.49992199792053893, "min": 0.46658186940895224, "max": 0.5499402924966611, "n": 5}
+      }
+    }
+  ]
+}

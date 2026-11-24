@@ -4,7 +4,7 @@ Everything here is done once by the owner of the repository, in GitHub's
 settings or with an account elsewhere; none of it is in the code. The
 pipeline itself, each secret in detail, and the Homebrew and winget steps
 are in [packaging/README.md](../packaging/README.md). This page is the
-order to do things in.
+order to do things in. The check of the name is [at the end](#the-name).
 
 Nothing below is required for a release to come out: with no secrets
 configured the pipeline publishes complete, **unsigned** builds, and the
@@ -12,32 +12,85 @@ release notes say so.
 
 ## 1. Before making the repository public
 
+Going public cannot be undone in any useful sense: history, pull
+requests, branches and Actions logs become readable and get copied. A
+review of all of that was done on 2026-11-24 (every remote head, tag and
+`refs/pull/*`, 46 commits). It found no token, private key, real
+kubeconfig, cloud account id or Apple Team ID, in the tree or in history.
+What it did find is the list below.
+
+Decide:
+
+- [ ] **Your e-mail address in history.** Four commits (the merge commits
+      made on github.com) carry a personal address and a misspelt name;
+      the others use `dev@skiff.invalid` or a bot address. Either accept
+      that, or rewrite those four before the switch. A rewrite that keeps
+      the number of commits does not disturb the build number. For future
+      merges: github.com → Settings → Emails → **Keep my email addresses
+      private**.
+- [ ] **Session links in commit messages.** 38 commit messages and pull
+      request bodies contain `Claude-Session:` links and co-author lines.
+      They reveal nothing by themselves; keep or rewrite with the item
+      above.
+- [ ] **The name.** See [The name](#the-name) below. No live trademark for
+      software was found, but no official register could be searched from
+      where the check ran. Look at the four registers named there before
+      paying for signing certificates.
+
+Fix:
+
+- [ ] **Font licence files.**
+      `crates/skiff/assets/fonts/LICENSE-JetBrainsMono.txt` is a Debian
+      packaging file that does not contain the OFL text which
+      `THIRD-PARTY-NOTICES.md` says it is; `LICENSE-Inter.txt` has the OFL
+      text among unrelated paragraphs. Replace both with the upstream
+      `OFL.txt` of each font.
+- [ ] **Notices in the packages.** `hack/linux-package.sh`,
+      `hack/windows-package.ps1` and `packaging/windows/skiff.nsi` ship `LICENSE`
+      only. Add `THIRD-PARTY-NOTICES.md` next to it.
+- [ ] **Stale branches and pull requests.** Delete merged `claude/*`,
+      `release/*` and Dependabot branches; close or merge what is open.
+      They all become public.
+- [ ] Commit the removal of `hack/bench/__pycache__/` (`.gitignore` now
+      excludes `__pycache__/`).
+
+Check:
+
 - [ ] Read the README, `docs/` and `site/index.html` once as a stranger
       would. They describe unsigned builds; that stays true until step 5.
-- [ ] Decide about the name. "Skiff" was also the name of an e-mail and
-      documents product that was shut down in 2024, and the crates.io name
-      `skiff` is taken by another project. The app's identifiers already
-      avoid the bare name (`io.github.tsenkotsenkov.skiff`, winget
-      `TsenkoTsenkov.Skiff`). A trademark search before paying for
-      signing certificates is worth the hour; it has not been done.
-- [ ] Check that no secret was ever committed: `git log -p | grep -iE
-      'BEGIN (RSA|EC|OPENSSH|PRIVATE)|ghp_|AKIA'` should print nothing.
-      `.gitignore` already excludes certificate and key files.
-- [ ] Do not rewrite the history of `main` from here on: the build number
-      is the number of commits and must only grow.
+- [ ] Build the documentation pages, `python3 hack/site-build.py`, and
+      click through them (`python3 -m http.server -d site`).
+- [ ] Run the secret search yourself once more: `git log -p --all | grep
+      -iE 'BEGIN (RSA|EC|OPENSSH|PRIVATE)|ghp_|github_pat_|AKIA'` should
+      print nothing. `.gitignore` excludes certificate and key files.
+- [ ] The download links and the release badge lead nowhere until a
+      stable release exists: the three releases so far are prereleases,
+      and `/releases/latest` answers 404 for those. The README and the
+      site say so. Plan [step 6](#6-cut-v010) for the same day, or accept
+      the gap.
+- [ ] After a rewrite, if any: do not rewrite the history of `main` from
+      here on. The build number is the number of commits and must only
+      grow.
 
 ## 2. Make it public and switch features on
 
 - [ ] Settings → General → Danger Zone → Change visibility → Public.
 - [ ] Settings → General → Features: enable **Discussions** (the issue
-      chooser links to it).
+      chooser links to it) and **Sponsorships**: `.github/FUNDING.yml`
+      then puts a **Sponsor** button on the repository page, leading to
+      Buy Me a Coffee.
 - [ ] Settings → Code security: enable **Private vulnerability
       reporting**. `SECURITY.md` and the issue chooser send reporters
       there; without it the link leads nowhere.
-- [ ] Settings → Code security: enable Dependabot alerts (the update
-      configuration is already in `.github/dependabot.yml`).
+- [ ] Settings → Code security: enable **Secret scanning** with **push
+      protection**, and Dependabot alerts (the update configuration is
+      already in `.github/dependabot.yml`).
 - [ ] Settings → Branches (or Rules): protect `main`: require the CI
-      checks, and forbid force pushes.
+      checks, forbid force pushes and deletion.
+- [ ] Settings → Actions → General: workflow permissions **Read
+      repository contents**; do not allow Actions to create or approve
+      pull requests; require approval for workflows from outside
+      contributors' forks.
 - [ ] About (the gear on the repository page): description, topics, and
       the site's address as the website.
 
@@ -48,15 +101,19 @@ minutes for macOS and Windows runners are free.
 
 - [ ] Settings → Pages → Build and deployment → Source: **GitHub
       Actions**.
-- [ ] Actions → Site → Run workflow (or push a change under `site/`).
-      `.github/workflows/pages.yml` publishes the `site/` folder to
-      `https://tsenkotsenkov.github.io/skiff/`.
+- [ ] Actions → Site → Run workflow (or push a change under `site/` or
+      `docs/`). `.github/workflows/pages.yml` builds the documentation
+      pages from `docs/*.md` with `hack/site-build.py`, then publishes the
+      `site/` folder to `https://tsenkotsenkov.github.io/skiff/`.
 - [ ] Open the page; check the download buttons after the first stable
       release exists (before that they lead to a 404, because
       `/releases/latest/download/…` needs a release marked latest).
 
-The site makes no external requests and has no build step: what is in
-`site/` is what is served.
+The site makes no external requests; the workflow checks that on every
+run. The landing page is served as it is in `site/`. The pages under
+`/docs/` are generated in the workflow and are not committed. The
+"Support" buttons are plain links to Buy Me a Coffee: nothing is loaded
+from there.
 
 ## 4. The release environment
 
@@ -94,9 +151,9 @@ After adding secrets:
       copies of unsigned builds update to it normally; signed copies then
       refuse anything not signed by the same team.
 - [ ] When builds are notarized and signed, remove the "first launch"
-      notes from `README.md`, `docs/install.md` and the FAQ in
-      `site/index.html`, and update the "Current limit" paragraph in
-      `docs/security.md`.
+      notes from `README.md`, `docs/install.md`,
+      `docs/troubleshooting.md` and the FAQ in `site/index.html`, and
+      update the "Current limit" paragraph in `docs/security.md`.
 
 ## 6. Cut v0.1.0
 
@@ -108,11 +165,11 @@ After adding secrets:
       start a new empty "Unreleased" section. Merge that.
 - [ ] Tag the merged commit and push the tag:
 
-      ```bash
-      git tag v0.1.0 && git push origin v0.1.0
-      ```
+  ```bash
+  git tag v0.1.0 && git push origin v0.1.0
+  ```
 
-      The tag must equal the version in `Cargo.toml`, or the run stops
+  The tag must equal the version in `Cargo.toml`, or the run stops
       before building.
 - [ ] Watch Actions → Release. When it finishes, the release `v0.1.0` is
       marked "Latest" and carries the eleven files and `SHA256SUMS`.
@@ -123,6 +180,9 @@ After adding secrets:
       authors beyond what CI does; the first release is the first real
       test of the installers and of the macOS updater.
 - [ ] Open the site and click each download button.
+- [ ] Remove the "until the first stable release" notes from the Install
+      section of `README.md` and the Download section of
+      `site/index.html`.
 
 ## 7. After the release
 
@@ -135,3 +195,67 @@ After adding secrets:
 - [ ] For every later release: version in `Cargo.toml`, changelog, tag.
       Nightlies need nothing; every push to `main` that touches the code
       or the packaging publishes one, and the newest ten are kept.
+
+## The name
+
+A quick check of the name "Skiff" was made on 2026-11-24. It is not legal
+advice, and it is not a register search: the official trademark registers
+(USPTO TSDR, EUIPO, WIPO Global Brand Database, UK IPO) could not be
+reached from where the check ran. The trademark lines below come from
+search-result summaries of aggregator pages, which were not opened; the
+package-registry and GitHub lines were read directly.
+
+**Trademarks found for SKIFF (United States)**
+
+| Owner | Serial | Classes | Status as listed | Source |
+| --- | --- | --- | --- | --- |
+| Skiff World, Inc. (the e-mail and documents product) | 90887371 | 42 | filed 2021-08-17; dead, never registered | <https://markinton.com/trademark/skiff-90887371> |
+| Corsair Memory, Inc. | 99185738 | 9, 28 | filed 2025-05-14; pending. Goods listed: computer keyboards, not software | <https://markinton.com/trademark/skiff-99185738> |
+| Templeton Ventures | 86414237 | 9, 42 | abandoned | <https://trademarks.justia.com/864/14/skiff-86414237.html> |
+| Alesia Holdings | 77786904 | 9 | dead | <https://markinton.com/trademark/skiff-77786904> |
+
+No live registration or application for SKIFF covering software was
+found. Notion bought Skiff World's product in February 2024 and shut it
+down that year (<https://en.wikipedia.org/wiki/Skiff_(email_service)>); no
+assignment of the mark to Notion was found. Nothing surfaced for the EU,
+the UK or WIPO, which says little, because those registers were not
+searched.
+
+**Other software called Skiff**
+
+- Package names that are taken: crates.io `skiff` (a scripting language,
+  last updated 2021), npm `skiff` (Raft for Node.js), PyPI `skiff` (a
+  DigitalOcean library), and winget `Skiff.Skiff` (Skiff World's desktop
+  app; from a search result). Homebrew has neither a cask nor a formula
+  named `skiff`.
+- On GitHub: `skiff-org/skiff-apps`, `skiffos/SkiffOS`,
+  `basecamp/kamal-skiff`, and several small desktop tools, among them a
+  disk-cleanup tool and an SSH manager. In the Kubernetes space only two
+  projects with a handful of stars.
+- A Mac App Store listing "Skiff Desktop" by Skiff World existed; whether
+  it is still live was not confirmed.
+
+**What follows from it**
+
+- The app's identifiers already avoid the bare name:
+  `io.github.tsenkotsenkov.skiff`, winget `TsenkoTsenkov.Skiff`. Keep it
+  that way; do not publish a crate named `skiff`.
+- The open question is Corsair's pending class 9 application. Keyboards
+  are far from a Kubernetes client, but the wording of the application
+  has to be read on TSDR, not on an aggregator.
+- Notion may hold unregistered rights or registrations outside the US.
+
+Still to do, by someone with a browser:
+
+- [ ] Look up serials 99185738 and 90887371 on
+      <https://tsdr.uspto.gov> (status, goods and services, assignments).
+- [ ] Search SKIFF in classes 9 and 42 on EUIPO eSearch, the WIPO Global
+      Brand Database and the UK IPO.
+- [ ] Look at `manifests/s/Skiff` in `microsoft/winget-pkgs`, and at
+      WHOIS for any domain you want.
+- [ ] If the name has to change: Shallop and Umiak were free on
+      crates.io, npm, PyPI and Homebrew and had no notable GitHub
+      project on the same day; Pinnace, Sampan and Catboat were free on
+      crates.io and PyPI but taken on npm. Dory, Wherry, Skerry and Proa
+      were rejected: each collides with an existing tool, two of them
+      Kubernetes tools. None of these was checked for trademarks.

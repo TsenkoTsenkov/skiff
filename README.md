@@ -1,36 +1,61 @@
-<p align="center">
-  <img src="crates/skiff/assets/icons/skiff-128.png" width="96" height="96" alt="Skiff icon">
-</p>
-<h1 align="center">Skiff</h1>
-<p align="center">
-  A fast, native desktop app for looking after Kubernetes clusters.<br>
-  One program, no web view, no account, no telemetry. It reads your kubeconfig and talks to the API server the way <code>kubectl</code> does.
-</p>
-<p align="center">
-  <a href="https://github.com/TsenkoTsenkov/skiff/releases/latest"><img src="https://img.shields.io/github/v/release/TsenkoTsenkov/skiff?label=release" alt="Latest release"></a>
-  <a href="https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml"><img src="https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/licence-MIT-blue" alt="MIT licence"></a>
-</p>
+# Skiff
 
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/img/overview-light.png">
-  <img src="docs/img/overview.png" alt="The cluster overview: counts, resource usage, firing alerts and what needs attention">
-</picture>
+[![CI](https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml/badge.svg)](https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/TsenkoTsenkov/skiff?label=release)](https://github.com/TsenkoTsenkov/skiff/releases)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+![Platforms: macOS, Windows, Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue.svg)
+[![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/tsenkotsenkov)
 
-## Download
+**A fast, native desktop app for looking after Kubernetes clusters: every
+resource, live, with logs, shells, metrics and alerts, in one program
+with no web view, no account and no telemetry. It reads your kubeconfig
+and talks to the API server the way `kubectl` does.**
 
-| System | File | Notes |
+**Who it is for:** you look after one or many clusters, you already have
+a working kubeconfig, and you want a window that opens at once, stays
+quick on a cluster with thousands of pods, and does nothing with your
+credentials that `kubectl` would not do.
+
+[![Skiff demo: the cluster overview with firing alerts; the command palette jumping to pods and a filter typed into the table; a pod's CPU and memory charts; logs followed live; a shell in a container; a cluster made read-only, after which Delete is greyed out; the settings switching between light and dark](docs/demo/skiff-demo.gif)](docs/demo/skiff-demo.mp4)
+
+A 43-second tour, recorded from the real app against a local test
+cluster. Click it for the video.
+
+- **Native.** One Rust program that draws its own interface. One process,
+  no background service, and nothing listening on a port unless you
+  start a port-forward.
+- **Your kubeconfig, as it is.** EKS, GKE, AKS and OIDC work through the
+  credential plugins your kubeconfig already names. Skiff has no sign-in
+  of its own and stores no cluster credentials.
+- **Only what you look at.** A resource type is listed and watched when
+  you open it, and dropped a few minutes after you leave it.
+- **Metrics and alerts from the Prometheus you already run**, reached
+  through the Kubernetes API server: no second login, no port-forward.
+- **Guard rails.** Mark a cluster read-only and Skiff refuses every
+  change to it.
+
+[Install](#install) · [Quick start](#quick-start) · [Common setups](#common-setups) · [Features](#features) · [How it compares](#how-it-compares) · [Docs](#documentation) · [Security](#security) · [Support](#support)
+
+## Install
+
+| System | Download | Notes |
 | --- | --- | --- |
 | macOS 11 or newer, Apple Silicon and Intel | [Skiff-macos-universal.dmg](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-macos-universal.dmg) | Open it and drag Skiff to Applications |
 | Windows 10 or 11, 64-bit | [Skiff-windows-x64-setup.exe](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64-setup.exe) | Installs for your user, no administrator rights. Portable: [Skiff-windows-x64.zip](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-windows-x64.zip) |
 | Linux x86_64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-x86_64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_amd64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-x86_64.tar.gz) | glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, …) |
 | Linux arm64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-aarch64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_arm64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-aarch64.tar.gz) | |
 
+> [!NOTE]
+> These links always point at the latest **stable** release, and 0.1.0 is
+> not out yet: until it is, they lead nowhere. Builds of the main branch
+> are on the [releases page](https://github.com/TsenkoTsenkov/skiff/releases), marked as pre-releases.
+
 Checksums: [SHA256SUMS](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/SHA256SUMS).
 [docs/install.md](docs/install.md) has the details for each system, how to
-check a download, and how to build from source.
+check a download, and how to build from source (`cargo build --release`,
+Rust 1.95 or newer). There is no Homebrew or winget package yet.
 
-**First launch.** The builds are not yet signed by Apple or Microsoft, so
+**First launch.** The builds are not signed by Apple or Microsoft, so
 both systems ask before running Skiff the first time:
 
 - **macOS** says the app cannot be opened. Go to System Settings → Privacy &
@@ -38,8 +63,11 @@ both systems ask before running Skiff the first time:
 - **Windows** shows "Windows protected your PC". Choose **More info**, then
   **Run anyway**.
 
-Each release's notes say whether that build is signed; once it is, these
-steps go away.
+Each release's notes say whether that build is signed.
+
+**Updating.** Skiff tells you when a new version exists. On macOS it can
+install it after verifying the download's code signature; on Windows and
+Linux it opens the release page. One setting turns the check off.
 
 ## Quick start
 
@@ -56,6 +84,66 @@ steps go away.
 
 EKS, GKE, AKS, OIDC and other sign-in setups work through the credential
 plugins your kubeconfig already names: see [docs/clusters.md](docs/clusters.md).
+
+## Common setups
+
+**EKS, GKE, AKS, OIDC.** Put the cluster into your kubeconfig with your
+cloud's own command; Skiff then runs the credential plugin that entry
+names, as `kubectl` does. Switch back to Skiff and the cluster is listed.
+
+```bash
+aws eks update-kubeconfig --name <cluster> --region <region>
+gcloud container clusters get-credentials <cluster> --region <region>
+az aks get-credentials --resource-group <group> --name <cluster>
+```
+
+The plugin (`aws`, `gke-gcloud-auth-plugin`, `kubelogin`, an OIDC helper)
+must be installed. When one is missing or a login has expired, Skiff says
+which, and what to run: [docs/clusters.md](docs/clusters.md).
+
+**Several kubeconfig files.** `$KUBECONFIG` with several paths works as it
+does for `kubectl`. Or list files, folders and wildcards in Settings →
+Clusters, which writes `config.json`:
+
+```json
+{ "kubeconfigs": ["$KUBECONFIG", "~/.kube/conf.d/*.yaml", "~/work/clusters"] }
+```
+
+`"$KUBECONFIG"` in that list stands for kubectl's own locations. For one
+run, `skiff --kubeconfig a.yaml --kubeconfig b.yaml`.
+
+**Read-only production clusters.** One switch per cluster, in the cluster
+menu under Protection, in Settings → Clusters, or in the file:
+
+```json
+{ "clusters": { "production": { "read_only": true } } }
+```
+
+Skiff then refuses every change to that cluster before any request is
+sent: no edit, apply, delete, scale or restart, no new shell and no new
+port-forward. `"confirm": true` instead makes it ask before each change.
+This guards against a slip of the hand in Skiff; it is not access
+control.
+
+**A Prometheus that is not found automatically.** Skiff looks for the
+Prometheus Service by the names and labels of the common installations.
+If yours is named differently, name it:
+
+```json
+{
+  "clusters": {
+    "production": {
+      "prometheus": { "namespace": "monitoring", "service": "prometheus-operated", "port": 9090 }
+    }
+  }
+}
+```
+
+It is reached through the API server, so your account needs `get` on
+`services/proxy` for that Service: [docs/observability.md](docs/observability.md).
+
+`production` in these examples is the kubeconfig context name. Every key
+of `config.json` is in [docs/configuration.md](docs/configuration.md).
 
 ## Features
 
@@ -84,7 +172,7 @@ plugins your kubeconfig already names: see [docs/clusters.md](docs/clusters.md).
   cron jobs, delete
 - **Settings** window (`Ctrl/Cmd+,`): theme (dark, light or follow the
   system), zoom, kubeconfig files, update channel, terminal app
-- Vim-style keyboard navigation with [custom bindings](docs/configuration.md#keyboard)
+- Vim-style keyboard navigation with [custom bindings](docs/keyboard.md#changing-the-keys)
 
 | | |
 | --- | --- |
@@ -92,13 +180,21 @@ plugins your kubeconfig already names: see [docs/clusters.md](docs/clusters.md).
 | ![Following a pod's logs](docs/img/logs.png) | ![A shell in a container](docs/img/shell.png) |
 | ![The command palette](docs/img/palette.png) | ![The Settings window](docs/img/settings.png) |
 
-More: [observability](docs/observability.md) ·
-[clusters and sign-in](docs/clusters.md) ·
-[configuration and keyboard](docs/configuration.md)
-
 ## How it compares
 
-We publish only what we measured, and so far we have measured only Skiff.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/compare-dark.svg">
+  <img src="docs/img/compare-light.svg" width="880" alt="Skiff 0.1.0, measured: memory 162 MiB (whole process tree, PSS, pod list loaded), 1 process, download 15.7 MB, window visible 161 ms after a warm launch, idle CPU 0.50% of one core. Measured 2026-11-23 on a 4-vCPU cloud VM without a GPU, with software rendering, against a local cluster of 5,415 simulated pods.">
+</picture>
+
+We publish only what we measured, and so far we have measured only Skiff,
+so the figure holds one row and there is no table against similar
+software. The figure is drawn from a results file; a second row is added
+when a similar program has been measured with the same script on the same
+machine, the same cluster and the same day.
+[docs/benchmarks.md](docs/benchmarks.md#comparison-with-similar-software)
+says how.
+
 The launched 0.1.0 Linux binary against a local test cluster with 100
 nodes and 5,415 pods, on a 4-vCPU VM **without a GPU** (every frame drawn
 by a software rasterizer):
@@ -106,20 +202,41 @@ by a software rasterizer):
 | | Measured |
 | --- | --- |
 | First frame built after launch | 118 ms (86 ms when started from a terminal) |
-| Window visible | 160 ms |
+| Window visible | 161 ms |
 | All 5,415 pods listed and live | 0.58 s |
 | Memory with that table open (PSS) | 162 MiB, at least 92 MiB of it the software Vulkan stack |
 | Processes / threads | 1 / 18 |
 | CPU while idle | 0.5% of one core |
 | Listening sockets | none |
-| Size | executable 39.2 MB; .deb 11.3 MB; AppImage 15.4 MB |
+| Size | executable 39.2 MB; .deb 11.3 MB; AppImage 15.4 MB; .tar.gz 15.7 MB |
 
-Medians; the ranges, the method, the caveats and how to measure another
-tool on your own machine with the same script are in
+Medians; the ranges, the method and the caveats are in
 [docs/benchmarks.md](docs/benchmarks.md). Numbers on a real GPU, on macOS
 and on Windows have not been measured.
 
-## Security model
+What differs by design rather than by measurement: Skiff is one native
+process without an embedded browser, it has no account and no telemetry,
+and it has no plugin system. What it leaves out is listed under
+[Deliberately not included](#deliberately-not-included).
+
+## Documentation
+
+| | |
+| --- | --- |
+| [Install and update](docs/install.md) | Files per system, first launch, update channels, checking a download, building from source |
+| [Clusters and sign-in](docs/clusters.md) | Credential plugins, connection errors, proxies, read-only clusters, limited accounts |
+| [Configuration](docs/configuration.md) | Every key of `config.json`, kubeconfig files, command-line options, environment variables |
+| [Keyboard](docs/keyboard.md) | Every shortcut, the command palette, changing the keys |
+| [Metrics and alerts](docs/observability.md) | The Metrics tab, firing alerts, how Prometheus is found, Grafana links |
+| [Troubleshooting and FAQ](docs/troubleshooting.md) | First-launch warnings, no clusters shown, a plugin that is not found, graphics problems, where files live |
+| [Security](docs/security.md) | What Skiff connects to and what it does with your access |
+| [Benchmarks](docs/benchmarks.md) | What was measured, how, and how to repeat it |
+| [Development](docs/development.md) | Code layout, local test clusters, tests |
+
+The same pages, with navigation, are on the site:
+<https://tsenkotsenkov.github.io/skiff/docs/>.
+
+## Security
 
 - **Your credentials stay where they are.** Skiff reads your kubeconfig and
   runs the credential plugins it names, as `kubectl` does. It has no
@@ -170,6 +287,14 @@ Bug reports and pull requests are welcome: see
 [docs/development.md](docs/development.md). `hack/cluster-up.sh` starts
 two local test clusters, without Docker, to develop against. Changes are
 listed in [CHANGELOG.md](CHANGELOG.md).
+
+## Support
+
+Skiff is free and MIT-licensed. If it saves you time, you can
+[buy me a coffee](https://buymeacoffee.com/tsenkotsenkov). Bug reports and
+pull requests help just as much.
+
+[![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-tsenkotsenkov-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge)](https://buymeacoffee.com/tsenkotsenkov)
 
 ## Licence
 

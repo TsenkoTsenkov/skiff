@@ -15,6 +15,15 @@ released as 0.1.0.
 
 ### Added
 
+- **Documentation site** at <https://tsenkotsenkov.github.io/skiff/docs/>:
+  the pages in `docs/` with navigation, built by `hack/site-build.py`.
+  New pages: a [keyboard reference](docs/keyboard.md) and
+  [troubleshooting and FAQ](docs/troubleshooting.md).
+- **A demo film** of the app on the README and the site, recorded from
+  the real program against the local test cluster.
+- **Support Skiff** link in Settings → About, and a Sponsor button on the
+  repository: both lead to Buy Me a Coffee. The app itself contacts
+  nothing new; the link opens in your browser.
 - **Downloads for Windows and Linux**, next to macOS: a per-user Windows
   installer and a portable zip; AppImage, `.deb` and `.tar.gz` for x86_64
   and arm64. The macOS app is now one universal build for Apple Silicon

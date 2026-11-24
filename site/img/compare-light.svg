@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="281" viewBox="0 0 880 281" role="img" aria-labelledby="t d" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title id="t">Skiff 0.1.0, measured</title>
+<desc id="d">Skiff 0.1.0: memory 162 MiB, processes 1, download 15.7 MB, window visible 161 ms, idle cpu 0.50%. Measured 2026-11-23 on a 4-vCPU cloud VM (KVM, Intel Xeon 2.10 GHz, 15.7 GiB RAM, no GPU); software rendering (Mesa 25.2.8 lavapipe on Xvfb 1440x900), which inflates memory and CPU. Local kwok cluster, context scale: kube-apiserver 1.37.2, 100 nodes, 5,415 pods. The list of all pods in all namespaces is open and loaded; nothing else was opened.</desc>
+<rect x="0.5" y="0.5" width="879" height="280" rx="10" fill="#F5F6F8" stroke="#DFE2E8"/>
+<text x="24" y="36"><tspan font-size="17" fill="#1C2330" font-weight="600">Skiff 0.1.0</tspan><tspan font-size="13" fill="#4F5968" font-weight="400" dx="10">measured on the launched app</tspan></text>
+<rect x="24" y="64" width="3" height="11" rx="1.5" fill="#2367EA"/>
+<text x="34" y="74" font-size="12.5" fill="#4F5968" font-weight="600">Memory</text>
+<text x="24" y="114"><tspan font-size="32" fill="#1C2330" font-weight="600">162</tspan><tspan font-size="15" fill="#4F5968" font-weight="600" dx="6">MiB</tspan></text>
+<text x="24" y="134" font-size="11.5" fill="#626C7D">whole process tree,</text>
+<text x="24" y="149" font-size="11.5" fill="#626C7D">PSS, pod list loaded</text>
+<line x1="189.9" y1="62" x2="189.9" y2="154" stroke="#DFE2E8"/>
+<rect x="208.4" y="64" width="3" height="11" rx="1.5" fill="#2367EA"/>
+<text x="218.4" y="74" font-size="12.5" fill="#4F5968" font-weight="600">Processes</text>
+<text x="208.4" y="114"><tspan font-size="32" fill="#1C2330" font-weight="600">1</tspan></text>
+<text x="208.4" y="134" font-size="11.5" fill="#626C7D">in the tree, pod list</text>
+<text x="208.4" y="149" font-size="11.5" fill="#626C7D">loaded</text>
+<line x1="356.3" y1="62" x2="356.3" y2="154" stroke="#DFE2E8"/>
+<rect x="374.8" y="64" width="3" height="11" rx="1.5" fill="#2367EA"/>
+<text x="384.8" y="74" font-size="12.5" fill="#4F5968" font-weight="600">Download</text>
+<text x="374.8" y="114"><tspan font-size="32" fill="#1C2330" font-weight="600">15.7</tspan><tspan font-size="15" fill="#4F5968" font-weight="600" dx="6">MB</tspan></text>
+<text x="374.8" y="134" font-size="11.5" fill="#626C7D">size of the file you</text>
+<text x="374.8" y="149" font-size="11.5" fill="#626C7D">download</text>
+<line x1="522.7" y1="62" x2="522.7" y2="154" stroke="#DFE2E8"/>
+<rect x="541.2" y="64" width="3" height="11" rx="1.5" fill="#2367EA"/>
+<text x="551.2" y="74" font-size="12.5" fill="#4F5968" font-weight="600">Window visible</text>
+<text x="541.2" y="114"><tspan font-size="32" fill="#1C2330" font-weight="600">161</tspan><tspan font-size="15" fill="#4F5968" font-weight="600" dx="6">ms</tspan></text>
+<text x="541.2" y="134" font-size="11.5" fill="#626C7D">after launch, warm start</text>
+<line x1="689.1" y1="62" x2="689.1" y2="154" stroke="#DFE2E8"/>
+<rect x="707.6" y="64" width="3" height="11" rx="1.5" fill="#2367EA"/>
+<text x="717.6" y="74" font-size="12.5" fill="#4F5968" font-weight="600">Idle CPU</text>
+<text x="707.6" y="114"><tspan font-size="32" fill="#1C2330" font-weight="600">0.50</tspan><tspan font-size="15" fill="#4F5968" font-weight="600" dx="3">%</tspan></text>
+<text x="707.6" y="134" font-size="11.5" fill="#626C7D">of one core, over 60 idle</text>
+<text x="707.6" y="149" font-size="11.5" fill="#626C7D">seconds</text>
+<text x="24" y="188" font-size="11.5" fill="#626C7D">Measured 2026-11-23 on a 4-vCPU cloud VM (KVM, Intel Xeon 2.10 GHz, 15.7 GiB RAM, no GPU); software rendering (Mesa 25.2.8 lavapipe on</text>
+<text x="24" y="205" font-size="11.5" fill="#626C7D">Xvfb 1440x900), which inflates memory and CPU.</text>
+<text x="24" y="222" font-size="11.5" fill="#626C7D">Local kwok cluster, context scale: kube-apiserver 1.37.2, 100 nodes, 5,415 pods. The list of all pods in all namespaces is open and loaded;</text>
+<text x="24" y="239" font-size="11.5" fill="#626C7D">nothing else was opened.</text>
+<text x="24" y="256" font-size="11.5" fill="#626C7D">Download: the .tar.gz; the .deb is 11.3 MB and the AppImage 15.4 MB.</text>
+</svg>

@@ -18,7 +18,8 @@ hack/               Local test clusters, seed data, packaging scripts,
                     screenshots, benchmarks.
 packaging/          Installer and package metadata; packaging/README.md
                     explains releases and signing.
-site/               The project's web page (static HTML and CSS).
+site/               The project's web page (static HTML, CSS and one small
+                    script); its docs/ pages are generated from docs/.
 docs/               These documents.
 ```
 
@@ -147,6 +148,25 @@ Pillow). To publish a different view, add it to the `picks` or `crops`
 list in the script. When you change
 how something looks, look at the affected files in `target/shots/` in
 both themes; the names say which test wrote them.
+
+## The site and these pages
+
+`site/` is the landing page, served as it is. The documentation pages of
+the site are generated from `docs/*.md`:
+
+```bash
+python3 hack/site-build.py                # writes site/docs/ (not committed)
+python3 -m http.server -d site 8000
+```
+
+The script needs only Python 3. Its Markdown converter covers what these
+files use, not all of Markdown; it stops when a link between pages or to
+a heading leads nowhere, and when prose contains something GitHub would
+read as an HTML tag. The header and footer of every page are the ones in
+`site/index.html`, between its `shared:` comments. Nothing on the site
+may be loaded from another host; `.github/workflows/pages.yml` checks
+that before publishing. A new page appears in the sidebar by itself; give
+it a place and a short name in `SIDEBAR` at the top of the script.
 
 ## Benchmarks
 
