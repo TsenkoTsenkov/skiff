@@ -13,9 +13,14 @@ Run from the repository root (the CI job "packaging" does):
    or a packaging script in the mode that builds.
 3. In release.yml only the publish job may write, it never runs for a build
    that is not to be published, and it is never cancelled half-way.
+4. In release.yml every action is pinned to a commit, and a file is only
+   sent away to be signed (SignPath) by a step that a build which is not
+   published never reaches; what is sent is stored under a name that the
+   publish job does not gather.
 
 Needs PyYAML (python3-yaml).
 """
+import fnmatch
 import glob
 import re
 import subprocess
@@ -123,12 +128,73 @@ def check_release_permissions(path, workflow):
                 error(f"{path}: job '{job_id}' always uses the 'release' environment, also for builds that are not published")
 
 
+# ---- 4. pinned actions; files sent away for signing ------------------------
+
+PINNED = re.compile(r"^[^@]+@[0-9a-f]{40}$")
+SUBMITS = "signpath/github-action-submit-signing-request@"
+ARTIFACT_OF = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.artifact-id")
+UPLOADS = "actions/upload-artifact@"
+DOWNLOADS = "actions/download-artifact@"
+
+
+def check_actions_and_signing_requests(path, workflow):
+    jobs = workflow["jobs"]
+    for job_id, job in jobs.items():
+        for step in job.get("steps", []):
+            uses = step.get("uses")
+            if uses and not uses.startswith("./") and not PINNED.match(uses):
+                error(f"{path}: job '{job_id}' uses '{uses}', which is not pinned to a full commit SHA")
+
+    # What the publish job gathers from the run's artifacts.
+    gathered = [
+        (step.get("with") or {}).get("pattern") or (step.get("with") or {}).get("name") or "*"
+        for step in jobs.get("publish", {}).get("steps", [])
+        if str(step.get("uses", "")).startswith(DOWNLOADS)
+    ]
+    if not gathered:
+        error(f"{path}: the publish job downloads no artifacts any more: update this check")
+
+    for job_id, job in jobs.items():
+        steps = job.get("steps", [])
+        by_id = {step["id"]: step for step in steps if "id" in step}
+        for step in steps:
+            if not str(step.get("uses", "")).startswith(SUBMITS):
+                continue
+            name = step.get("name") or step["uses"]
+            condition = str(step.get("if", ""))
+            guard = re.search(r"env\.(HAVE_[A-Z0-9_]+) == 'true'", condition)
+            if not guard:
+                error(f"{path}: job '{job_id}', step '{name}' must only run if a HAVE_... value of the job's env is 'true'")
+            elif "channel != 'none' &&" not in str((job.get("env") or {}).get(guard.group(1), "")):
+                error(
+                    f"{path}: job '{job_id}': {guard.group(1)} must be false when the channel is 'none', "
+                    f"or step '{name}' could run for a build that is not published"
+                )
+            source = ARTIFACT_OF.search(str((step.get("with") or {}).get("github-artifact-id", "")))
+            upload = by_id.get(source.group(1)) if source else None
+            if not upload or not str(upload.get("uses", "")).startswith(UPLOADS):
+                error(f"{path}: job '{job_id}', step '{name}' must sign the artifact of an upload-artifact step of the same job")
+                continue
+            if steps.index(upload) > steps.index(step):
+                error(f"{path}: job '{job_id}', step '{name}' comes before the upload it signs")
+            if str(upload.get("if", "")) != condition:
+                error(f"{path}: job '{job_id}', step '{name}' and the upload it signs must have the same 'if'")
+            artifact = str((upload.get("with") or {}).get("name", "artifact"))
+            for pattern in gathered:
+                if fnmatch.fnmatchcase(artifact, pattern):
+                    error(
+                        f"{path}: job '{job_id}': the artifact '{artifact}' is sent away to be signed, but the "
+                        f"publish job gathers '{pattern}' and would publish the unsigned file too"
+                    )
+
+
 def main():
     check_toolchain_sed()
     release = ".github/workflows/release.yml"
     workflow = load(release)
     check_no_compiling_near_secrets(release, workflow)
     check_release_permissions(release, workflow)
+    check_actions_and_signing_requests(release, workflow)
     for message in errors:
         print(f"error: {message}", file=sys.stderr)
     if errors:

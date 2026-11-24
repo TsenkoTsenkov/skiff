@@ -45,25 +45,29 @@ cluster. Click it for the video.
 | Linux x86_64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-x86_64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_amd64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-x86_64.tar.gz) | glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, …) |
 | Linux arm64 | [AppImage](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-linux-aarch64.AppImage) · [.deb](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff_arm64.deb) · [.tar.gz](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/skiff-linux-aarch64.tar.gz) | |
 
-> [!NOTE]
-> These links always point at the latest **stable** release, and 0.1.0 is
-> not out yet: until it is, they lead nowhere. Builds of the main branch
-> are on the [releases page](https://github.com/TsenkoTsenkov/skiff/releases), marked as pre-releases.
+These links always point at the latest **stable** release. Builds of the
+main branch are on the [releases page](https://github.com/TsenkoTsenkov/skiff/releases),
+marked as pre-releases.
 
 Checksums: [SHA256SUMS](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/SHA256SUMS).
 [docs/install.md](docs/install.md) has the details for each system, how to
 check a download, and how to build from source (`cargo build --release`,
 Rust 1.95 or newer). There is no Homebrew or winget package yet.
 
-**First launch.** The builds are not signed by Apple or Microsoft, so
-both systems ask before running Skiff the first time:
+**Is it signed?**
 
-- **macOS** says the app cannot be opened. Go to System Settings → Privacy &
-  Security, scroll to the message about Skiff and choose **Open Anyway**.
-- **Windows** shows "Windows protected your PC". Choose **More info**, then
-  **Run anyway**.
+- **macOS:** signed with an Apple Developer ID and notarized by Apple. It
+  opens like any other downloaded app.
+- **Windows:** not signed yet. Windows shows "Windows protected your PC":
+  choose **More info**, then **Run anyway**.
+- **Linux:** the packages carry no signature.
 
-Each release's notes say whether that build is signed.
+On every system a download can be checked against `SHA256SUMS` and its
+build provenance attestation (`gh attestation verify <file> -R
+TsenkoTsenkov/skiff`). Who may change and release Skiff, where the
+binaries are built and what the program sends over the network is in the
+[code signing policy](CODE_SIGNING_POLICY.md). Each release's notes say
+whether that build is signed.
 
 **Updating.** Skiff tells you when a new version exists. On macOS it can
 install it after verifying the download's code signature; on Windows and
@@ -187,13 +191,21 @@ of `config.json` is in [docs/configuration.md](docs/configuration.md).
   <img src="docs/img/compare-light.svg" width="880" alt="Skiff 0.1.0, measured: memory 162 MiB (whole process tree, PSS, pod list loaded), 1 process, download 15.7 MB, window visible 161 ms after a warm launch, idle CPU 0.50% of one core. Measured 2026-11-23 on a 4-vCPU cloud VM without a GPU, with software rendering, against a local cluster of 5,415 simulated pods.">
 </picture>
 
-We publish only what we measured, and so far we have measured only Skiff,
-so the figure holds one row and there is no table against similar
-software. The figure is drawn from a results file; a second row is added
-when a similar program has been measured with the same script on the same
-machine, the same cluster and the same day.
-[docs/benchmarks.md](docs/benchmarks.md#comparison-with-similar-software)
-says how.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/compare-macos-dark.svg">
+  <img src="docs/img/compare-macos-light.svg" width="880" alt="Measured on macOS, Apple M1 Pro: Skiff 146 MiB of memory, 1 process, 0.1% idle CPU; a terminal UI client 397 MiB, 2 processes, 16.2% idle CPU; an Electron-based client 893 MiB, 6 processes, 7.9% idle CPU. Memory is the physical footprint Activity Monitor shows.">
+</picture>
+
+On macOS (an Apple M1 Pro) Skiff was measured next to a terminal UI
+client and an Electron-based client: 146, 397 and 893 MiB of memory, 1, 2
+and 6 processes, and 0.1, 16.2 and 7.9% of a core while idle; memory
+there is the physical footprint Activity Monitor shows, a different
+quantity from the PSS in the Linux figures, so the two are not
+comparable. The method and caveats are in
+[docs/benchmarks.md](docs/benchmarks.md#comparison-with-similar-software).
+
+The first figure, measured on Linux, holds only Skiff. Both are drawn
+from results files; we publish only what we measured.
 
 The launched 0.1.0 Linux binary against a local test cluster with 100
 nodes and 5,415 pods, on a 4-vCPU VM **without a GPU** (every frame drawn
@@ -211,8 +223,8 @@ by a software rasterizer):
 | Size | executable 39.2 MB; .deb 11.3 MB; AppImage 15.4 MB; .tar.gz 15.7 MB |
 
 Medians; the ranges, the method and the caveats are in
-[docs/benchmarks.md](docs/benchmarks.md). Numbers on a real GPU, on macOS
-and on Windows have not been measured.
+[docs/benchmarks.md](docs/benchmarks.md). Start-up times on macOS and
+anything on Windows have not been measured.
 
 What differs by design rather than by measurement: Skiff is one native
 process without an embedded browser, it has no account and no telemetry,
@@ -228,8 +240,9 @@ and it has no plugin system. What it leaves out is listed under
 | [Configuration](docs/configuration.md) | Every key of `config.json`, kubeconfig files, command-line options, environment variables |
 | [Keyboard](docs/keyboard.md) | Every shortcut, the command palette, changing the keys |
 | [Metrics and alerts](docs/observability.md) | The Metrics tab, firing alerts, how Prometheus is found, Grafana links |
-| [Troubleshooting and FAQ](docs/troubleshooting.md) | First-launch warnings, no clusters shown, a plugin that is not found, graphics problems, where files live |
+| [Troubleshooting and FAQ](docs/troubleshooting.md) | The Windows first-launch warning, no clusters shown, a plugin that is not found, graphics problems, where files live |
 | [Security](docs/security.md) | What Skiff connects to and what it does with your access |
+| [Code signing policy](docs/code-signing-policy.md) | Who may release Skiff, where the binaries are built, what is signed, what is sent over the network |
 | [Benchmarks](docs/benchmarks.md) | What was measured, how, and how to repeat it |
 | [Development](docs/development.md) | Code layout, local test clusters, tests |
 
@@ -272,7 +285,7 @@ mode, and it bundles neither `kubectl` nor `helm`. The reasons are in
 
 Not there yet:
 
-- Signed and notarized builds, then Homebrew and winget packages
+- A signed Windows build; Homebrew and winget packages
 - Helm releases
 - Node drain, triggering a cron job, actions on several rows at once
 - Log search across history (Loki, Elasticsearch)

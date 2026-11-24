@@ -133,10 +133,13 @@ cluster can be hostile or simply broken.
   version and build number in its signed `Info.plist` must be the ones
   the release announced and newer than the running copy. An older Skiff,
   even a genuine one, is not installed.
-- **Current limit:** builds are not yet signed with a Developer ID. For
-  such a build the check confirms that the downloaded app is intact, not
-  who made it; what stands behind the download is then HTTPS to GitHub
-  and this repository's release process.
+- Released macOS builds are signed with the owner's Developer ID (Team
+  ID `2632424VR2`) and notarized, so the team check above applies to
+  them. **Limit:** for a copy without a Developer ID signature (one you
+  compiled yourself, or an old unsigned prerelease) the check only
+  confirms that the downloaded app is intact, not who made it; what
+  stands behind the download is then HTTPS to GitHub and this
+  repository's release process.
 - Update requests go only to `https://api.github.com/`, and `curl` is
   told to ignore your own `~/.curlrc` for them. Official builds
   never send a token. A build compiled for another repository
@@ -152,11 +155,15 @@ cluster can be hostile or simply broken.
 
 - Releases are built by the workflow in `.github/workflows/release.yml`
   from this repository, with every action pinned to a commit.
-- Each release has a `SHA256SUMS` file and, for a public repository,
-  build provenance attestations: see
-  [install.md](install.md#checking-a-download).
-- Signing keys, once configured, are available only to builds of `main`
-  and of `v*` tags, through a protected environment.
+- Each release has a `SHA256SUMS` file and build provenance
+  attestations: see [install.md](install.md#checking-a-download). (The
+  workflow skips attestations only while a repository is private.)
+- The macOS build is signed with an Apple Developer ID and notarized.
+  The Windows build is not yet signed, and Linux packages carry no
+  signature. The [code signing policy](code-signing-policy.md) names who
+  may release and what is planned for Windows.
+- Signing keys are available only to builds of `main` and of `v*` tags,
+  through a protected environment.
 - CI runs `cargo-deny` on every change and weekly: known advisories,
   licences, and that every crate comes from crates.io. Dependabot
   proposes dependency updates.

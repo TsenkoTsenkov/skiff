@@ -25,6 +25,11 @@
 # sign anything. A build that is not published is never given a secret, and
 # on the others the program is compiled before the signing keys are put on
 # the machine: a dependency's build script never runs within reach of them.
+#
+# Windows can be signed in three ways, of which at most one may be set up:
+# Azure Artifact Signing or a certificate file (hack/windows-package.ps1
+# signs on the build machine), or SignPath (the unsigned files are sent to
+# SignPath, which holds the key, and the signed ones come back).
 name: Release
 
 on:
@@ -329,10 +334,47 @@ jobs:
     environment: ${{ needs.meta.outputs.channel != 'none' && 'release' || '' }}
     outputs:
       signing: ${{ steps.verify.outputs.signing }}
+    env:
+      # (As in the macOS job: whether the secrets exist, not their values.
+      # Always false for a build that is not published, so a pull request
+      # never reaches a step that is given the SignPath token.)
+      HAVE_SIGNPATH: ${{ needs.meta.outputs.channel != 'none' && secrets.SIGNPATH_API_TOKEN != '' }}
+      HAVE_LOCAL_SIGNING: ${{ needs.meta.outputs.channel != 'none' && (secrets.AZURE_CLIENT_SECRET != '' || secrets.WINDOWS_CERT_PFX_BASE64 != '') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Half-configured signing would silently ship an unsigned release, and
+      # two ways at once would sign twice: both stop the job here, before
+      # anything is built. (The IDs and slugs are variables, not secrets.)
+      - name: SignPath is set up completely, or not at all
+        if: needs.meta.outputs.channel != 'none'
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          missing=""
+          present=""
+          for name in SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_SIGNING_POLICY_SLUG; do
+            if [ -n "${!name}" ]; then present="$present $name"; else missing="$missing $name"; fi
+          done
+          if [ "$HAVE_SIGNPATH" = true ]; then
+            if [ -n "$missing" ]; then
+              echo "::error::The secret SIGNPATH_API_TOKEN is set but these variables of the 'release' environment are not:$missing. See packaging/README.md."
+              exit 1
+            fi
+            if [ "$HAVE_LOCAL_SIGNING" = true ]; then
+              echo "::error::Both SignPath (SIGNPATH_API_TOKEN) and another way to sign Windows builds (AZURE_CLIENT_SECRET or WINDOWS_CERT_PFX_BASE64) are set up. Remove one; see packaging/README.md."
+              exit 1
+            fi
+            echo "Windows signing: SignPath."
+          elif [ -n "$present" ]; then
+            echo "::error::These SignPath variables are set but the secret SIGNPATH_API_TOKEN is not:$present. Set it in the 'release' environment or remove the variables; see packaging/README.md."
+            exit 1
+          else
+            echo "Windows signing: not through SignPath."
+          fi
       - name: Rust toolchain (rust-toolchain.toml)
         run: |
           rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal \
@@ -358,9 +400,9 @@ jobs:
       # The script signs skiff.exe and the installer when the signing
       # variables are set, and says UNSIGNED otherwise; an absent secret is
       # an empty variable here. (-Exe: it packs the file built above and
-      # runs no compiler.)
+      # runs no compiler.) Not when SignPath signs: see below.
       - name: Sign and package
-        if: needs.meta.outputs.channel != 'none'
+        if: needs.meta.outputs.channel != 'none' && env.HAVE_SIGNPATH != 'true'
         shell: pwsh
         env:
           SKIFF_BUILD: ${{ needs.meta.outputs.build }}
@@ -380,6 +422,87 @@ jobs:
         env:
           SKIFF_BUILD: ${{ needs.meta.outputs.build }}
         run: hack\windows-package.ps1 -Exe target\x86_64-pc-windows-msvc\release\skiff.exe
+
+      # ---- the SignPath route (only when SIGNPATH_API_TOKEN exists) ----
+      # SignPath signs what a run of this workflow has stored as an artifact
+      # of the run, and cannot look inside an NSIS installer. So there are
+      # two requests: skiff.exe first, then the installer that was built
+      # from the signed skiff.exe. The artifacts sent for signing are named
+      # unsigned-...: the publish job gathers skiff-* and must not get them.
+      - name: "SignPath: stage the unsigned skiff.exe"
+        if: env.HAVE_SIGNPATH == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\signpath\unsigned" | Out-Null
+          Copy-Item -LiteralPath target\x86_64-pc-windows-msvc\release\skiff.exe -Destination "$env:RUNNER_TEMP\signpath\unsigned\skiff.exe"
+      - name: "SignPath: store the unsigned skiff.exe with the run"
+        id: unsigned-exe
+        if: env.HAVE_SIGNPATH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-skiff-exe
+          path: ${{ runner.temp }}/signpath/unsigned/skiff.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: "SignPath: sign skiff.exe"
+        if: env.HAVE_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@a2c5b60d9c75f073142b653c354b632eedce097b # v3.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-exe.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signpath/signed-exe
+      # The zip and the installer are made from the signed skiff.exe.
+      # (-RequireSignedExe: the script stops unless that file carries a
+      # signature Windows accepts. -Exe: no compiler runs.)
+      - name: "SignPath: package the signed skiff.exe"
+        if: env.HAVE_SIGNPATH == 'true'
+        shell: pwsh
+        env:
+          SKIFF_BUILD: ${{ needs.meta.outputs.build }}
+        run: hack\windows-package.ps1 -Exe "$env:RUNNER_TEMP\signpath\signed-exe\skiff.exe" -RequireSignedExe
+      - name: "SignPath: store the unsigned installer with the run"
+        id: unsigned-setup
+        if: env.HAVE_SIGNPATH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-skiff-setup
+          path: dist/Skiff-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: "SignPath: sign the installer"
+        if: env.HAVE_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@a2c5b60d9c75f073142b653c354b632eedce097b # v3.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signpath/signed-setup
+      # From here on dist\ holds what is checked, summed and published.
+      - name: "SignPath: the signed installer replaces the unsigned one"
+        if: env.HAVE_SIGNPATH == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signed = "$env:RUNNER_TEMP\signpath\signed-setup\Skiff-windows-x64-setup.exe"
+          if (-not (Test-Path -LiteralPath $signed -PathType Leaf)) {
+            Get-ChildItem -Recurse "$env:RUNNER_TEMP\signpath"
+            throw "SignPath returned no Skiff-windows-x64-setup.exe"
+          }
+          $s = Get-AuthenticodeSignature -FilePath $signed
+          if ($s.Status -ne 'Valid') {
+            throw "the installer SignPath returned is not validly signed: $($s.Status) $($s.StatusMessage)"
+          }
+          Copy-Item -LiteralPath $signed -Destination dist\Skiff-windows-x64-setup.exe -Force
+          Write-Host "Signed dist\Skiff-windows-x64-setup.exe ($($s.SignerCertificate.Subject))"
+
       - name: Check what was built
         id: verify
         shell: pwsh

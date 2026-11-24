@@ -61,8 +61,8 @@ Out of scope:
   credential plugin your kubeconfig runs;
 - vulnerabilities in a cluster, in Prometheus or Grafana, or in your
   terminal app (report those to their projects);
-- the first-launch warnings of unsigned builds, which are a known and
-  documented state ([docs/install.md](docs/install.md));
+- the first-launch warning of the Windows build, which is not signed yet:
+  a known and documented state ([docs/install.md](docs/install.md));
 - vulnerabilities in dependencies without a way to reach them through
   Skiff. A dependency advisory is still welcome as an ordinary issue; CI
   checks the advisory database weekly.

@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "conditions": {
+    "date": "2026-11-24",
+    "machine": "an Apple M1 Pro Mac (macOS, arm64)",
+    "os": "macOS, arm64",
+    "rendering": "on the Mac's own display",
+    "cluster": "Local kwok test cluster: 100 nodes, 5,415 pods, the same cluster for every row",
+    "state": "Each app has its pod list open and loaded",
+    "caveats": [
+      "Memory is the physical footprint that Activity Monitor shows, not PSS (macOS has none): not comparable with the Linux figures",
+      "Each value is the median of three runs; only the medians were recorded, not the smallest and largest run"
+    ],
+    "notes": "Measured by the project's owner with hack/bench/run.sh, three runs per app. The rows were written by hand from the reported medians, rounded as reported (memory to 1 MiB, idle CPU to 0.1%); the raw files of the runs are on the owner's machine and are not checked in, so there is no min/max. Other hosts contacted in the first minute, besides the cluster, were reported for two rows and are in other_hosts_first_minute."
+  },
+  "rows": [
+    {
+      "label": "Skiff 0.1.0",
+      "category": "native",
+      "subject": true,
+      "version": "0.1.0 build 41",
+      "other_hosts_first_minute": {"value": 1, "what": "its update check"},
+      "metrics": {
+        "memory_footprint_bytes": {"value": 153092096, "n": 3},
+        "processes": {"value": 1, "n": 3},
+        "idle_cpu_percent": {"value": 0.1, "n": 3, "decimals": 1}
+      }
+    },
+    {
+      "label": "Terminal UI client",
+      "category": "terminal",
+      "notes": "ran inside a minimal wrapper with no terminal app around it; a real terminal would add to its numbers",
+      "metrics": {
+        "memory_footprint_bytes": {"value": 416284672, "n": 3},
+        "processes": {"value": 2, "n": 3},
+        "idle_cpu_percent": {"value": 16.2, "n": 3, "decimals": 1}
+      }
+    },
+    {
+      "label": "Electron-based client",
+      "category": "electron",
+      "notes": "ran in a fresh, empty profile limited to the test cluster",
+      "other_hosts_first_minute": {"value": 7},
+      "metrics": {
+        "memory_footprint_bytes": {"value": 936378368, "n": 3},
+        "processes": {"value": 6, "n": 3},
+        "idle_cpu_percent": {"value": 7.9, "n": 3, "decimals": 1}
+      }
+    }
+  ]
+}

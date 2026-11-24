@@ -44,8 +44,10 @@
 #   --fresh-state       empty XDG config/data/state directories for the app
 #   --out DIR           where results go (default target/bench/<date>)
 #
-# Linux is the tested platform. On macOS "app" works through ps, footprint
-# and lsof (no --xvfb, no --trace) and is UNTESTED.
+# Linux is the tested platform. On macOS only "app" works, through ps,
+# footprint and lsof (no --xvfb, no --trace, no --window-runs); that path
+# has been run on one Mac and no test covers it. Memory there is the
+# physical footprint, not PSS.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

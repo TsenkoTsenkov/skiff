@@ -35,7 +35,8 @@ still in its session) and measured as one "process tree".
 Every mode writes one JSON document (--out FILE, default standard output)
 and prints a short summary on standard error. Python 3.8+, standard library
 only. Linux is the tested platform. On macOS "steady" and "size" use ps,
-footprint and lsof instead of /proc and ss; that path is UNTESTED.
+footprint and lsof instead of /proc and ss; that path has been run on one Mac (results/2026-11-24-macos-arm64-m1pro.json)
+and no test covers it.
 """
 
 import argparse
@@ -266,7 +267,7 @@ def _snapshot_linux(pid):
 
 
 def _snapshot_mac(pid):
-    # UNTESTED. rss in KB; time as [dd-]hh:mm:ss.cc of CPU used so far.
+    # Run on one Mac only, no test. rss in KB; time as [dd-]hh:mm:ss.cc of CPU used so far.
     out = subprocess.run(["ps", "-o", "rss=,time=,comm=", "-p", str(pid)], capture_output=True, text=True, check=True).stdout.split(None, 2)
     cpu = 0.0
     for part in out[1].replace("-", ":").split(":"):
@@ -659,7 +660,7 @@ def mode_row(paths):
     peers = sorted({f"{x['peer']} ({x['process']})" for x in r["network"]["remote_addresses"]})
     sizes = "; ".join(f"{os.path.basename(p['path'].rstrip('/'))} {p['bytes'] / 1e6:.1f} MB" for p in size["result"]["paths"]) if size else "not measured"
     cells = [
-        steady["label"] + (" (macOS, untested script path)" if steady.get("untested_platform") else ""),
+        steady["label"] + (" (macOS, little-tested script path)" if steady.get("untested_platform") else ""),
         memory,
         mb(t.get("rss")),
         str(t["processes"]) + (f" (peak {r['network']['peak_processes']})" if r["network"]["peak_processes"] > t["processes"] else ""),

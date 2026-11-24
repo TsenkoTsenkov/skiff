@@ -22,17 +22,19 @@ in-app updater; you do not need them.
 1. Open `Skiff-macos-universal.dmg` and drag Skiff to Applications.
 2. Open Skiff from Applications.
 
-**While builds are not signed with an Apple Developer ID**, macOS refuses
-the first start ("Skiff cannot be opened…"). Allow it once: System Settings
-→ Privacy & Security → scroll down to the message about Skiff → **Open
-Anyway**. From a terminal the same is done with:
+The app is signed with an Apple Developer ID (`Developer ID Application:
+Tsenko Tsenkov`, Team ID `2632424VR2`) and notarized by Apple, so it opens
+like any other downloaded app. To see the signature yourself:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/Skiff.app
+codesign -dv --verbose=2 /Applications/Skiff.app    # Authority and TeamIdentifier
+spctl --assess --type execute -v /Applications/Skiff.app
 ```
 
-The notes of each release say whether that build is signed and notarized;
-a notarized build opens like any other downloaded app.
+This holds for 0.1.0 and for prereleases from `build-41` on. Earlier
+prereleases may be unsigned, and macOS refuses the first start of those;
+see
+[troubleshooting.md](troubleshooting.md#macos-says-skiff-cannot-be-opened).
 
 Opened from the Finder or the Dock, Skiff asks your login shell once for
 `PATH`, `KUBECONFIG` and the proxy variables, so that the credential
@@ -45,8 +47,11 @@ Run `Skiff-windows-x64-setup.exe`. It installs for the current user into
 `%LOCALAPPDATA%\Programs\Skiff`, adds a Start menu entry and an uninstaller
 (Settings → Apps), and does not ask for administrator rights.
 
-**While builds are not signed**, Windows shows "Windows protected your PC"
-(SmartScreen). Choose **More info**, then **Run anyway**.
+**The Windows build is not signed yet**, so Windows shows "Windows
+protected your PC" (SmartScreen). Choose **More info**, then **Run
+anyway**. You can [check the download](#checking-a-download) first. What
+is planned for Windows signing is in the
+[code signing policy](code-signing-policy.md#what-is-signed-today).
 
 The portable `Skiff-windows-x64.zip` holds `skiff.exe` and the licence; unpack it
 anywhere and run it.
@@ -88,6 +93,9 @@ it.
 The file dialog of "Add kubeconfig file…" uses the desktop portal (D-Bus)
 or `zenity`; without either, Skiff asks for the path in a dialog of its
 own.
+
+The Linux packages carry no signature; [check a
+download](#checking-a-download) with `SHA256SUMS` or its attestation.
 
 If Skiff cannot start its default renderer it tries OpenGL; if both fail
 it says so and exits. `SKIFF_RENDERER=glow` (or `wgpu`) forces one, see
@@ -147,8 +155,15 @@ build provenance attestation, checked with the
 gh attestation verify Skiff-linux-x86_64.AppImage -R TsenkoTsenkov/skiff
 ```
 
-GitHub provides attestations for public repositories only. A release made
-while the repository was private has none, and its notes say so.
+The command prints the workflow, the commit and the tag or branch the
+file was built from, and fails if the file is not one this repository's
+release workflow produced. It works for every file of a release and
+needs GitHub CLI 2.49 or newer.
+
+The release workflow writes attestations whenever the repository is
+public, which it now is: 0.1.0 and every later build have them. The few
+prereleases made while the repository was private have none, and their
+notes say so.
 
 ## Building from source
 
@@ -171,8 +186,8 @@ cargo build --release
   builds the installer and the zip.
 - `hack/linux-package.sh` builds the Linux packages into `dist/`.
 
-A build made this way has build number 0 and is not signed. Its update
-check compares version numbers only.
+A build made this way has build number 0 and is not signed with a
+Developer ID. Its update check compares version numbers only.
 
 The packaging scripts and the release pipeline are described in
 [packaging/README.md](../packaging/README.md).

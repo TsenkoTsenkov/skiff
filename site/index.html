@@ -196,10 +196,8 @@
         <img src="img/compare-dark.svg" width="880" height="281"
              alt="Skiff 0.1.0, measured on the launched app: memory 162 MiB for the whole process tree with the pod list loaded; 1 process; download 15.7 MB; window visible 161 ms after a warm launch; idle CPU 0.50% of one core.">
       </picture>
-      <figcaption>How it compares with similar software: only Skiff has been
-      measured so far, so the figure holds one row. The same script measures
-      any desktop app; a second row is added when someone has measured one
-      on the same machine, the same cluster and the same day.
+      <figcaption>On this Linux machine only Skiff has been measured, so
+      the figure holds one row. The same script measures any desktop app.
       <a href="docs/benchmarks.html#comparison-with-similar-software">How to measure and add one</a></figcaption>
     </figure>
 
@@ -208,7 +206,7 @@
       <thead><tr><th scope="col">What</th><th scope="col">Median</th><th scope="col">Range</th></tr></thead>
       <tbody>
         <tr><th scope="row">First frame built after launch</th><td>118 ms</td><td>96 – 127 ms</td></tr>
-        <tr><th scope="row">Window visible</th><td>161 ms</td><td>149 – 256 ms</td></tr>
+        <tr><th scope="row">Window visible</th><td>161 ms</td><td>149 – 257 ms</td></tr>
         <tr><th scope="row">All 5,415 pods listed and live</th><td>0.58 s</td><td>0.51 – 0.97 s</td></tr>
         <tr><th scope="row">Memory with that table open (PSS)</th><td>162 MiB</td><td>161 – 163 MiB</td></tr>
         <tr><th scope="row">CPU while idle</th><td>0.50% of one core</td><td>0.47 – 0.55%</td></tr>
@@ -222,12 +220,26 @@
 
     <ul class="notes">
       <li>At least 92 of the 162 MiB are the software graphics stack that
-      stands in for a GPU on that machine. Memory and speed on a real GPU,
-      on macOS and on Windows have not been measured yet.</li>
+      stands in for a GPU on that machine. Start-up times on macOS and
+      anything on Windows have not been measured yet.</li>
       <li>The test cluster's pods are simulated and the API server is local,
       so there is no network delay in these figures.</li>
     </ul>
     <p><a class="more" href="docs/benchmarks.html">Method, raw tables and caveats</a></p>
+
+    <h3 id="compared" class="h-sub">Next to similar software, on a Mac</h3>
+    <figure class="compare reveal">
+      <picture>
+        <source srcset="img/compare-macos-light.svg" media="(prefers-color-scheme: light)">
+        <img loading="lazy" src="img/compare-macos-dark.svg" width="880" height="576"
+             alt="Measured on macOS, Apple M1 Pro: Skiff 146 MiB of memory, 1 process, 0.1% idle CPU; a terminal UI client 397 MiB, 2 processes, 16.2% idle CPU; an Electron-based client 893 MiB, 6 processes, 7.9% idle CPU. Memory is the physical footprint Activity Monitor shows.">
+      </picture>
+      <figcaption>Skiff, a terminal UI client and an Electron-based client
+      showing the same pod list of the same test cluster on an Apple M1 Pro,
+      medians of three runs each; memory is the physical footprint Activity
+      Monitor shows, so it is not comparable with the Linux figures above.
+      <a href="docs/benchmarks.html">Method and caveats</a></figcaption>
+    </figure>
   </div>
 </section>
 
@@ -282,16 +294,13 @@
   <div class="wrap">
     <h2 class="h">Download</h2>
     <p class="sub">The current stable release. Free, no sign-up.</p>
-    <p class="pending"><strong>0.1.0 is not out yet.</strong> The buttons below
-    point at the latest stable release and lead nowhere until it is
-    published. Until then, builds of the main branch are on the
-    <a href="https://github.com/TsenkoTsenkov/skiff/releases">releases page</a>, marked as pre-releases.</p>
     <div class="downloads reveal">
       <div class="os" data-os="mac">
         <h3>macOS</h3>
         <p class="req">macOS 11 or newer · Apple Silicon and Intel</p>
         <a class="btn primary block" href="https://github.com/TsenkoTsenkov/skiff/releases/latest/download/Skiff-macos-universal.dmg">Disk image (.dmg)</a>
-        <p class="hint">Open it and drag Skiff to Applications.</p>
+        <p class="hint">Open it and drag Skiff to Applications. Signed and
+          notarized.</p>
       </div>
       <div class="os" data-os="windows">
         <h3>Windows</h3>
@@ -316,10 +325,11 @@
       </div>
     </div>
     <div class="notice">
-      <p><strong>First launch.</strong> The builds are not yet signed by Apple
-      or Microsoft, so both systems ask before running Skiff the first time.
-      The steps are in the <a href="#faq-macos">FAQ</a>. Each release's notes
-      say whether that build is signed.</p>
+      <p><strong>Windows asks first.</strong> The Windows build is not signed
+      yet, so Windows shows “Windows protected your PC” the first time:
+      choose <b>More info</b>, then <b>Run anyway</b>
+      (<a href="#faq-windows">more</a>). The macOS build is signed and
+      notarized and opens like any other app.</p>
     </div>
     <p class="verify">
       Check a download against
@@ -328,6 +338,27 @@
       browse <a href="https://github.com/TsenkoTsenkov/skiff/releases">all releases</a>,
       or <a href="docs/install.html#building-from-source">build from source</a>.
     </p>
+
+    <div id="code-signing-policy" class="policy reveal">
+      <h3>Code signing policy</h3>
+      <ul>
+        <li><b>macOS:</b> signed with the owner's Apple Developer ID
+        (Tsenko Tsenkov, team 2632424VR2) and notarized by Apple.</li>
+        <li><b>Windows:</b> not signed yet. Free code signing through the
+        SignPath Foundation is being applied for; until it is granted the
+        Windows files carry no signature.</li>
+        <li><b>Linux:</b> the packages carry no signature.</li>
+        <li><b>Every file</b> is built by GitHub Actions from this
+        repository's tagged source, and has a checksum and a build
+        provenance attestation.</li>
+        <li><b>Committers, reviewers and approvers:</b> the repository
+        owner, <a href="https://github.com/TsenkoTsenkov">TsenkoTsenkov</a>.</li>
+        <li><b>Privacy:</b> Skiff sends nothing anywhere except to the
+        clusters you open and one anonymous update check to
+        <code>api.github.com</code>, which a setting turns off.</li>
+      </ul>
+      <p><a class="more" href="docs/code-signing-policy.html">The full code signing policy</a></p>
+    </div>
 
     <div class="support-card reveal">
       <div>
@@ -344,24 +375,22 @@
   <div class="wrap narrow faq">
     <h2 class="h">Questions</h2>
 
-    <details id="faq-macos" open>
-      <summary>macOS says Skiff cannot be opened. What now?</summary>
-      <p>The Mac build is not yet signed with an Apple Developer ID, so
-      macOS stops the first start. Allow it once: open <b>System Settings →
-      Privacy &amp; Security</b>, scroll down to the message about Skiff and
-      choose <b>Open Anyway</b>. From a terminal, the same is:</p>
-      <pre><code>xattr -dr com.apple.quarantine /Applications/Skiff.app</code></pre>
-      <p>After that it opens normally. The notes of each release say whether
-      that build is signed and notarized; a notarized build needs none of
-      this.</p>
-    </details>
-
     <details id="faq-windows" open>
       <summary>Windows shows “Windows protected your PC”.</summary>
       <p>The Windows build is not yet signed, so SmartScreen warns about a
       program it has not seen before. Choose <b>More info</b>, then <b>Run
-      anyway</b>. You can check the file first against the release's
-      SHA256SUMS.</p>
+      anyway</b>. You can <a href="docs/install.html#checking-a-download">check
+      the file first</a> against the release's SHA256SUMS or its build
+      attestation. Signing for Windows is being applied for; see the
+      <a href="docs/code-signing-policy.html">code signing policy</a>.</p>
+    </details>
+
+    <details id="faq-macos">
+      <summary>macOS says Skiff cannot be opened.</summary>
+      <p>That should not happen with a current download: the Mac build is
+      signed with an Apple Developer ID and notarized. You most likely have
+      an old, unsigned prerelease; download the current version.
+      <a href="docs/troubleshooting.html#macos-says-skiff-cannot-be-opened">More</a></p>
     </details>
 
     <details>
@@ -435,6 +464,7 @@
       <a href="https://github.com/TsenkoTsenkov/skiff">GitHub</a>
       <a href="docs/index.html">Documentation</a>
       <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="docs/code-signing-policy.html">Code signing policy</a>
       <a href="https://github.com/TsenkoTsenkov/skiff/blob/main/SECURITY.md">Report a security problem</a>
       <a href="https://github.com/TsenkoTsenkov/skiff/issues">Issues</a>
       <a href="https://buymeacoffee.com/tsenkotsenkov">Support Skiff</a>

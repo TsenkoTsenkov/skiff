@@ -4,11 +4,16 @@
     hack/bench/chart.py hack/bench/results/<file>.json [--out docs/img] [--copy site/img]
     hack/bench/chart.py --check hack/bench/results/<file>.json
 
-Writes compare-light.svg and compare-dark.svg (the same figure for light
-and for dark pages) into each directory. With one row in the file the
-figure is a strip of that row's numbers; with two or more it is one panel
-of horizontal bars per metric, the row marked "subject" in the app's
-accent colour and the others in a neutral one.
+Writes <name>-light.svg and <name>-dark.svg (the same figure for light and
+for dark pages; --name, default "compare") into each directory. With one
+row in the file the figure is a strip of that row's numbers; with two or
+more it is one panel of horizontal bars per metric that at least one row
+has, the row marked "subject" in the app's accent colour and the others in
+a neutral one.
+
+Memory comes in two kinds that are not the same quantity: PSS (Linux) and
+the physical footprint (macOS). A results file holds one kind, so a figure
+never shows both.
 
 The results file is described in hack/bench/README.md ("The results
 file"). Python 3.8+, standard library only. Nothing is measured here.
@@ -29,19 +34,22 @@ CATEGORIES = {
     "electron": "Electron-based app (bundles a browser engine)",
     "webview": "app that uses the system's web view",
     "browser": "web interface opened in a browser (the browser is measured too)",
-    "terminal": "terminal interface (the terminal emulator is measured too)",
+    "terminal": "terminal interface (measured with what it ran in; the row's notes say what)",
     "other": "anything else; say what in the row's notes",
 }
 
 # key, panel title, what exactly it is (shown small), formatter name
 METRICS = [
     ("memory_pss_bytes", "Memory", "whole process tree, PSS, pod list loaded", "mib"),
+    ("memory_footprint_bytes", "Memory, physical footprint", "whole process tree, as Activity Monitor shows it, pod list loaded", "mib"),
     ("processes", "Processes", "in the tree, pod list loaded", "count"),
     ("download_bytes", "Download", "size of the file you download", "mb"),
     ("window_visible_s", "Window visible", "after launch, warm start", "time"),
     ("idle_cpu_percent", "Idle CPU", "of one core, over 60 idle seconds", "percent"),
 ]
-CONDITION_KEYS = ["date", "machine", "os", "rendering", "cluster", "state", "notes"]
+# The two kinds of memory. Linux gives PSS, macOS the physical footprint;
+# they count different things, so one file (one figure) holds one of them.
+MEMORY_KEYS = ("memory_pss_bytes", "memory_footprint_bytes")
 
 # Colours of crates/skiff/src/theme.rs (Palette::light and Palette::dark).
 THEMES = {
@@ -87,7 +95,13 @@ def load(path):
             doc = json.load(f)
     except (OSError, ValueError) as e:
         fail(f"{path}: {e}")
-    if doc.get("schema") != SCHEMA:
+    return check(doc, path)
+
+
+def check(doc, path):
+    """Checks a results document (path is only for the messages). Changes
+    doc: every metric becomes a dict or None. Returns (conditions, rows)."""
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
         fail(f"{path}: \"schema\" must be {SCHEMA}")
     cond = doc.get("conditions")
     if not isinstance(cond, dict):
@@ -95,6 +109,9 @@ def load(path):
     for key in ("date", "machine", "rendering", "cluster", "state"):
         if not isinstance(cond.get(key), str) or not cond[key].strip():
             fail(f"{path}: conditions.{key} is required (a sentence)")
+    caveats = cond.setdefault("caveats", [])
+    if not isinstance(caveats, list) or not all(isinstance(c, str) and c.strip() for c in caveats):
+        fail(f"{path}: conditions.caveats must be a list of sentences")
     rows = doc.get("rows")
     if not isinstance(rows, list) or not rows:
         fail(f"{path}: \"rows\" needs at least one row")
@@ -129,10 +146,15 @@ def load(path):
             for k in ("min", "max"):
                 if k in m and not isinstance(m[k], (int, float)):
                     fail(f"{where}: metrics.{key}.{k} must be a number")
+            if "decimals" in m and m["decimals"] not in (0, 1, 2, 3):
+                fail(f"{where}: metrics.{key}.decimals must be 0, 1, 2 or 3")
             if "min" in m and "max" in m and not m["min"] <= m["value"] <= m["max"]:
                 fail(f"{where}: metrics.{key}: value is outside min - max")
             clean[key] = m
         row["metrics"] = clean
+    kinds = [k for k in MEMORY_KEYS if any(r["metrics"][k] for r in rows)]
+    if len(kinds) > 1:
+        fail(f"{path}: rows have both {' and '.join(kinds)}; PSS and the physical footprint are different quantities and need a file each")
     subjects = [r for r in rows if r.get("subject")]
     if len(subjects) != 1:
         fail(f"{path}: exactly one row must have \"subject\": true (the row the figure is about)")
@@ -144,8 +166,12 @@ def load(path):
 # ------------------------------------------------------------- formatting
 
 
-def fmt_num(v, unit):
-    """(number, unit) as printed."""
+def fmt_num(v, unit, decimals=None):
+    """(number, unit) as printed. decimals: print a percentage with exactly
+    this many, for a value that was recorded already rounded (0.1 must not
+    be printed as 0.10)."""
+    if unit == "percent" and decimals is not None:
+        return f"{v:.{decimals}f}", "%"
     if unit == "mib":
         return f"{v / (1 << 20):,.0f}", "MiB"
     if unit == "mb":
@@ -160,9 +186,14 @@ def fmt_num(v, unit):
     raise ValueError(unit)
 
 
-def fmt(v, unit):
-    n, u = fmt_num(v, unit)
+def fmt(v, unit, decimals=None):
+    n, u = fmt_num(v, unit, decimals)
     return n + ("" if u in ("", "%") else " ") + u
+
+
+def fmt_m(m, unit):
+    """A metric's value as printed."""
+    return fmt(m["value"], unit, m.get("decimals"))
 
 
 def spread(m, unit):
@@ -258,19 +289,20 @@ class Svg:
 
 
 def conditions_lines(cond):
-    """The conditions as sentences for the foot of a figure."""
+    """The conditions, then the caveats, as sentences for the foot of a figure."""
     first = f"Measured {cond['date']} on {cond['machine']}; {cond['rendering']}."
     second = f"{cond['cluster']}. {cond['state']}."
-    return [first.replace("..", "."), second.replace("..", ".")]
+    return [first.replace("..", "."), second.replace("..", ".")] + [c.rstrip(".") + "." for c in cond.get("caveats", [])]
 
 
 def describe(cond, rows):
     """The figure in words, for <desc> (screen readers, and a text view)."""
     parts = []
     for row in rows:
-        vals = [f"{title.lower()} {fmt(row['metrics'][key]['value'], unit)}" for key, title, _, unit in METRICS if row["metrics"][key]]
+        vals = [f"{title.lower()} {fmt_m(row['metrics'][key], unit)}" for key, title, _, unit in METRICS if row["metrics"][key]]
         parts.append(f"{row['label']}: " + ", ".join(vals) + ".")
-    return " ".join(parts + conditions_lines(cond))
+    notes = [f"{row['label']}: {row['notes'].rstrip('.')}." for row in rows if len(rows) > 1 and row.get("notes")]
+    return " ".join(parts + conditions_lines(cond) + notes)
 
 
 def foot(svg, cond, y, x=24, mentions=()):
@@ -304,7 +336,7 @@ def single(cond, rows, theme):
             x += 18
         svg.rect(x, top + 6, 3, 11, "accent", r=1.5)
         svg.text(x + 10, top + 16, title, size=12.5, fill="muted", weight=600)
-        num, u = fmt_num(m["value"], unit)
+        num, u = fmt_num(m["value"], unit, m.get("decimals"))
         svg.run(x, top + 56, [(num, 32, "text", 600, 0)] + ([(u, 15, "muted", 600, 3 if u == "%" else 6)] if u else []))
         for j, line in enumerate(wrap(sub, 11.5, col_w - 26)[:2]):
             svg.text(x, top + 76 + j * 15, line, size=11.5, fill="faint")
@@ -321,24 +353,25 @@ def multi(cond, rows, theme):
     value_w = 150  # room for the value and its spread after the longest bar
     x0 = pad + label_w
     plot_w = WIDTH - pad - x0 - value_w
+    panels = [p for p in METRICS if any(r["metrics"][p[0]] for r in rows)]
     notes = []
     for row in rows:
-        for key, title, _, _ in METRICS:
+        for key, title, _, _ in panels:
             m = row["metrics"][key]
             if m and m.get("note"):
-                notes.append(f"{row['label']}, {title.lower()}: {m['note']}.")
+                notes.append(f"{row['label']}, {title.lower()}: {m['note'].rstrip('.')}.")
         if row.get("notes"):
-            notes.append(f"{row['label']}: {row['notes']}.")
+            notes.append(f"{row['label']}: {row['notes'].rstrip('.')}.")
     foot_lines = sum(len(wrap(s, 11.5, WIDTH - 2 * pad)) for s in conditions_lines(cond) + notes)
     panel_h = head_h + len(rows) * row_h + 6
     top = 58
-    height = top + len(METRICS) * (panel_h + panel_gap) + 12 + foot_lines * 17 + 8
+    height = top + len(panels) * (panel_h + panel_gap) + 12 + foot_lines * 17 + 8
     svg.rect(0.5, 0.5, WIDTH - 1, height - 1, "panel", r=10, stroke="border")
     subject = rows[0]["label"]
     svg.text(pad, 36, f"{subject} and similar software", size=17, weight=600)
     svg.text(WIDTH - pad, 36, "same machine, same cluster, same day · each panel has its own scale", size=12, fill="muted", anchor="end")
     y = top
-    for key, title, sub, unit in METRICS:
+    for key, title, sub, unit in panels:
         svg.out.append(f'<line x1="{pad}" y1="{y - 0.5:g}" x2="{WIDTH - pad}" y2="{y - 0.5:g}" stroke="{svg.c["border"]}"/>')
         svg.run(pad, y + 22, [(title, 13, "text", 600, 0), (sub, 11.5, "faint", 400, 8)])
         top_value = max((r["metrics"][key]["value"] for r in rows if r["metrics"][key]), default=0)
@@ -351,10 +384,10 @@ def multi(cond, rows, theme):
                 svg.text(x0, ry + bar_h - 2.5, "not measured", size=12, fill="faint", extra=' font-style="italic"')
                 continue
             w = max(plot_w * m["value"] / top_value, 3) if top_value else 3
-            tip = f"{row['label']} ({CATEGORIES[row['category']]}): {title.lower()} {fmt(m['value'], unit)}"
+            tip = f"{row['label']} ({CATEGORIES[row['category']]}): {title.lower()} {fmt_m(m, unit)}"
             more = spread(m, unit)
             svg.bar(x0, ry, w, bar_h, "accent" if is_subject else "other", tip + (f", {more}" if more else ""))
-            value = fmt(m["value"], unit)
+            value = fmt_m(m, unit)
             svg.text(x0 + w + 8, ry + bar_h - 2.5, value, size=13, weight=600 if is_subject else 400)
         y += panel_h + panel_gap
     foot(svg, cond, y + 10, pad, notes)
@@ -370,7 +403,7 @@ def main():
     ap.add_argument("results", help="a results file (hack/bench/results/*.json)")
     ap.add_argument("--out", default=None, help="directory for the SVGs (default docs/img of this repository)")
     ap.add_argument("--copy", action="append", default=[], metavar="DIR", help="also write them here (repeatable), e.g. site/img")
-    ap.add_argument("--name", default="compare", help="file name stem (default compare: compare-light.svg, compare-dark.svg)")
+    ap.add_argument("--name", default="compare", help="file name stem (default compare: compare-light.svg, compare-dark.svg); compare-macos for the macOS figure")
     ap.add_argument("--check", action="store_true", help="only check the results file")
     args = ap.parse_args()
     cond, rows = load(args.results)
