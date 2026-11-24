@@ -4,10 +4,16 @@ What Skiff costs the machine it runs on, measured on the real, launched
 binary from the outside. Every number on this page was produced by
 [`hack/bench/run.sh`](../hack/bench/README.md) and can be reproduced with it.
 
-We publish only numbers we measured. For other tools none have been
-measured yet, so the [comparison table](#comparison-with-other-tools) is
-empty; the same script measures any app, and the section says how to fill
-it.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/compare-dark.svg">
+  <img src="img/compare-light.svg" width="880" alt="Skiff 0.1.0, measured: memory 162 MiB (whole process tree, PSS, pod list loaded), 1 process, download 15.7 MB, window visible 161 ms after a warm launch, idle CPU 0.50% of one core. Measured 2026-11-23 on a 4-vCPU cloud VM without a GPU, with software rendering, against a local cluster of 5,415 simulated pods.">
+</picture>
+
+We publish only numbers we measured. Only Skiff has been measured so far,
+so the figure and the
+[comparison section](#comparison-with-similar-software) hold Skiff's row
+alone. The same script measures any app; that section says how to measure
+similar software on your own machine and add it.
 
 - **Date:** 2026-11-23
 - **Skiff:** 0.1.0, commit `65653da7bcf010df860f1d3ea6873bd00647032a`
@@ -41,7 +47,7 @@ prints the event (`SKIFF_TRACE_STARTUP=1`). 10 launches each.
 | | Median | Min - max |
 | --- | --- | --- |
 | First frame built, warm | 118 ms | 96 - 127 ms |
-| Window visible on the X display, warm | 160 ms | 149 - 256 ms |
+| Window visible on the X display, warm | 161 ms | 149 - 256 ms |
 | All 5,415 pods listed and live, warm | 0.58 s | 0.51 - 0.97 s |
 | First frame built, cold | 310 ms | 244 - 1,057 ms |
 | All 5,415 pods listed and live, cold | 0.78 s | 0.68 - 1.86 s |
@@ -226,41 +232,135 @@ the pods table taken at the end of the idle window) are written to the
   one per trace.
 - **Linux only.** macOS and Windows builds were not run.
 
-## Comparison with other tools
+## Comparison with similar software
 
-**We publish only numbers we measured; none have been measured for other
-tools yet.** This table is therefore empty apart from Skiff's row, and
-will stay that way until someone runs the procedure below on one machine
-for each tool.
+**Only Skiff has been measured so far.** No number for any other program
+appears on this page, and the figure at the top shows Skiff's row
+alone.
 
-Steady state with the list of all pods of the `scale` cluster showing:
+Why: a number is published here only when it was measured by this
+procedure under the same conditions as the rows next to it, which means
+the same machine, the same cluster, the same day and the same state (the
+list of all pods, loaded, nothing else opened). Memory, CPU and launch
+time depend on all of these. On this machine a software rasterizer alone
+accounts for more than half of Skiff's memory (see
+[Caveats](#caveats)), and it would cost a different amount in a program
+that draws differently. Figures taken from somewhere else, such as a
+vendor's page, a review or another machine, cannot be set beside ours
+honestly, so we do not use them. Other programs have not been installed
+or run in the environment where Skiff's numbers were taken.
 
-| App | Memory, PSS | Memory, RSS | Processes | Threads | Idle CPU, % of one core | Listening sockets | Remote addresses, first 60 s | Size on disk | Pod list judged ready by |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Skiff 0.1.0 (`65653da`), update check off, software rendering | 162 MiB | 165 MiB | 1 | 18 | 0.5 | none | 127.0.0.1:18081 (the API server) | executable 39.2 MB; .deb 11.3 MB | printed line |
-| *(no other tool measured)* | | | | | | | | | |
+When other rows exist they are identified by what kind of program they
+are ("Electron-based client A", "terminal client in a terminal
+emulator"), not by product name. The point of the comparison is what an
+architecture costs, and a neutral label keeps it from reading as a claim
+about somebody's product that they have had no chance to check.
 
-To add a row, on **one** machine, the same day, against the same cluster:
+The numbers behind the figure are in
+[`hack/bench/results/`](../hack/bench/results/), one file for each
+machine and day:
 
-```sh
-hack/cluster-up.sh
-export KUBECONFIG=$PWD/hack/kubeconfig
-hack/bench/run.sh skiff                         # Skiff's row on this machine
-hack/bench/run.sh app --label "Name 1.2.3" --installed /path/to/installed/app -- <launch command>
-```
+| Row | Memory, PSS | Processes | Download | Window visible, warm | Idle CPU, % of one core |
+| --- | --- | --- | --- | --- | --- |
+| Skiff 0.1.0 (`65653da`), update check off, software rendering | 162 MiB (161 - 163) | 1 | 15.7 MB (.tar.gz; .deb 11.3 MB, AppImage 15.4 MB) | 161 ms (149 - 256) | 0.50 (0.47 - 0.55) |
 
-For an app that cannot say when its list is loaded, the script asks you to
-open the list of all pods and **press Enter when the pod list is
-showing**; it then measures exactly what it measures for Skiff and prints
-a row for this table. Add the machine description from
-`<out>/machine.txt` (CPU, RAM, GPU or software rasterizer), the exact
-version of each app and the date. Do not mix rows from different
-machines, and do not copy numbers from anywhere else into this table. The
-fairness rules are in [hack/bench/README.md](../hack/bench/README.md).
+### Measure similar software on your own machine
 
-Launch times of other apps are not part of the table: an app that does
-not report when its list is complete cannot be timed without a stopwatch,
-and we will not publish stopwatch numbers next to instrumented ones.
+You need a Linux machine with an X display (or `Xvfb`), `python3`,
+`xdotool` and the programs you want to compare. Do everything on **one**
+machine, on one day, against the same cluster.
+
+1. Start the test cluster and build Skiff:
+
+   ```sh
+   hack/cluster-up.sh
+   export KUBECONFIG=$PWD/hack/kubeconfig
+   cargo build --release -p skiff
+   hack/linux-package.sh --binary target/release/skiff --out target/dist
+   ```
+
+2. Measure Skiff. This writes its results to `target/bench/mine` and
+   takes about eight minutes:
+
+   ```sh
+   hack/bench/run.sh skiff --runs 10 --out target/bench/mine
+   ```
+
+   Add `--xvfb` only if every program in the comparison will be measured
+   under Xvfb; see the rules below.
+
+3. Measure the other program with the generic mode. `--label` names the
+   raw files and stays on your machine; `--installed` is the installed
+   program; the launch command follows `--`:
+
+   ```sh
+   hack/bench/run.sh app --label "other 1.2.3" --window-runs 10 \
+     --installed /path/to/installed/app --out target/bench/mine \
+     -- /path/to/installed/app
+   ```
+
+   The script first launches the program ten times and times each launch
+   until a window is visible. Then it starts it once more and asks you to
+   open the list of all pods in all namespaces of the `scale` context.
+   **Press Enter in the terminal when the list is fully loaded**, then
+   leave the program alone. Five seconds later the script records memory
+   and processes, watches CPU for 60 idle seconds, saves a screenshot and
+   closes the program. Do this three times (a different `--out` each
+   time, or move the files) if you intend to publish the result.
+
+4. Start a results file for your machine by copying ours and editing its
+   `conditions` (the facts are in `target/bench/mine/machine.txt`), then
+   add the rows:
+
+   ```sh
+   cp hack/bench/results/2026-11-23-linux-x86_64-kvm.json hack/bench/results/mine.json
+   # edit "conditions" in mine.json, and set "rows" to []
+   hack/bench/results.py add hack/bench/results/mine.json --subject \
+     --label "Skiff 0.1.0" --category native \
+     --steady "target/bench/mine/Skiff-0.1.0-x86_64-unknown-linux-gnu.steady.json" \
+     --window "target/bench/mine/Skiff-0.1.0-x86_64-unknown-linux-gnu.startup-window.json" \
+     --download target/dist/skiff-linux-x86_64.tar.gz
+   hack/bench/results.py add hack/bench/results/mine.json \
+     --label "Electron-based client A" --category electron \
+     --steady target/bench/mine/other-1.2.3.steady.json \
+     --window target/bench/mine/other-1.2.3.startup-window.json \
+     --download ~/Downloads/the-file-you-downloaded
+   ```
+
+   Repeat `--steady` for each of several runs; the row then holds the
+   median and the range. The label in the results file is a neutral
+   description, never a product name. The categories and the file format
+   are described in
+   [hack/bench/README.md](../hack/bench/README.md#the-results-file).
+
+5. Draw the figures:
+
+   ```sh
+   hack/bench/chart.py hack/bench/results/mine.json --out target/bench/mine
+   ```
+
+   This writes `compare-light.svg` and `compare-dark.svg`. With two or
+   more rows the figure is one panel of bars for each metric. Without
+   `--out` the figures in `docs/img` are replaced; `--copy site/img`
+   writes the website's copies too.
+
+Rules, in short (the full list is in
+[hack/bench/README.md](../hack/bench/README.md)):
+
+- Do not mix rows from different machines or days in one file, and do
+  not copy a number from anywhere but the script's output.
+- Either every row is measured on the real display or every row under
+  `--xvfb`. Xvfb has no GPU.
+- A program measured inside a terminal emulator or a browser includes
+  the terminal emulator or the browser.
+- "Window visible" is when any window of the program is on the display,
+  even an empty one or a splash screen. It is not the time until pods are
+  listed. That time is published for Skiff only (see [Launch](#launch)),
+  because Skiff prints it; a program that does not say when its list is
+  complete cannot be timed without a stopwatch, and we will not publish
+  stopwatch numbers next to instrumented ones.
+- "Download" is the size of one file, the one a user downloads to
+  install the program on this platform. Say which in the row's note.
 
 ## What Skiff does and does not do
 
@@ -332,4 +432,4 @@ measurement on this page; the check is named.
   `cargo-deny` against the advisory database.
 - **Not claimed.** That Skiff has no vulnerabilities (it is new and has
   had no independent review), anything about memory or speed on a real
-  GPU, and anything about other tools.
+  GPU, and anything about other software.

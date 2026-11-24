@@ -158,13 +158,14 @@ try {
     $stagedExe = Join-Path $stage 'skiff.exe'
     Copy-Item -LiteralPath $Exe -Destination $stagedExe
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+    Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.md')
     Invoke-Sign $stagedExe
 
     # ---- portable zip --------------------------------------------------------
 
     $zip = Join-Path $OutDir 'Skiff-windows-x64.zip'
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip }
-    Compress-Archive -Path $stagedExe, (Join-Path $stage 'LICENSE.txt') -DestinationPath $zip -CompressionLevel Optimal
+    Compress-Archive -Path $stagedExe, (Join-Path $stage 'LICENSE.txt'), (Join-Path $stage 'THIRD-PARTY-NOTICES.md') -DestinationPath $zip -CompressionLevel Optimal
     Write-Host "Built $zip"
 
     # ---- installer -----------------------------------------------------------
@@ -188,6 +189,7 @@ try {
             "/DBUILD=$build",
             "/DEXE=$stagedExe",
             "/DLICENSE=$(Join-Path $root 'LICENSE')",
+            "/DNOTICES=$(Join-Path $root 'THIRD-PARTY-NOTICES.md')",
             "/DOUTFILE=$setup"
         )
         $icon = Join-Path $root 'crates\skiff\assets\icons\skiff.ico'

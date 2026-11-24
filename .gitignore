@@ -16,3 +16,11 @@
 *.AppImage
 *.dmg
 /packaging/**/*.exe
+
+# Generated: the documentation pages of the site (hack/site-build.py
+# builds them from docs/*.md; the Pages workflow does so before publishing).
+/site/docs/
+
+# Python leftovers of the scripts in hack/
+__pycache__/
+*.pyc

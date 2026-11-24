@@ -224,6 +224,7 @@ build="${SKIFF_BUILD:-0}"
 app=target/release/Skiff.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp LICENSE THIRD-PARTY-NOTICES.md "$app/Contents/Resources/"
 cp "$binary" "$app/Contents/MacOS/Skiff"
 
 sed -e "s/@VERSION@/${version}/g" -e "s/@BUILD@/${build}/g" \

@@ -200,6 +200,7 @@ fi
 tree="$work/tar/skiff-linux-$arch"
 populate "$tree"
 install -Dm644 LICENSE "$tree/share/doc/skiff/LICENSE"
+install -Dm644 THIRD-PARTY-NOTICES.md "$tree/share/doc/skiff/THIRD-PARTY-NOTICES.md"
 tarball="$out/skiff-linux-$arch.tar.gz"
 # (Sorted, with fixed owner and time, so that the same source gives the same
 # archive.)

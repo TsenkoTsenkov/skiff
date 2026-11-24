@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Measures what a desktop Kubernetes client costs the machine it runs on.
-# The same procedure for any app: Skiff, Lens, Freelens, Headlamp, k9s (in
-# a terminal emulator), anything with a launch command. See README.md.
+# The same procedure for any app: Skiff, another desktop client, a terminal
+# client (in a terminal emulator), anything with a launch command. See
+# README.md.
 #
 #   hack/bench/run.sh app --label "Name 1.2.3" [options] -- <launch command>
 #       Launches the app, waits until its pod list is showing (you press
@@ -9,8 +10,10 @@
 #       measures: memory of the whole process tree (PSS and RSS), process
 #       and thread counts, CPU over 60 idle seconds, listening sockets, the
 #       remote addresses it connected to in its first 60 s, and the size on
-#       disk of each --installed path. Writes <out>/<slug>.{steady,size}.json
-#       and prints a table row to paste into docs/benchmarks.md.
+#       disk of each --installed path. With --window-runs N it first times
+#       N launches until a window is visible. Writes
+#       <out>/<slug>.{steady,size,startup-window}.json and prints a table
+#       row; results.py puts the numbers into a results file for chart.py.
 #
 #   hack/bench/run.sh skiff [--binary PATH] [--runs N] [--context NAME]
 #       The whole Skiff procedure against the local test cluster
@@ -29,6 +32,9 @@
 #                       only honest if the list really is loaded by then:
 #                       check the screenshot)
 #   --idle SEC          length of the idle CPU window (default 60)
+#   --window-runs N     app: before the steady run, launch N times and time
+#                       each until a window of the app is visible on the X
+#                       display (needs xdotool); the app is closed each time
 #   --xvfb              run on a private virtual display (Xvfb) instead of
 #                       the current one; implied when DISPLAY is not set
 #   --trace             also run once more under strace and list every
@@ -58,6 +64,7 @@ shift
 label=""
 out=""
 runs=7
+window_runs=0
 idle=60
 context=scale
 binary=""
@@ -74,6 +81,7 @@ while [ $# -gt 0 ]; do
     --out) out="$2"; shift ;;
     --runs) runs="$2"; shift ;;
     --idle) idle="$2"; shift ;;
+    --window-runs) window_runs="$2"; shift ;;
     --context) context="$2"; shift ;;
     --binary) binary="$2"; shift ;;
     --installed) installed+=("$2"); shift ;;
@@ -181,6 +189,15 @@ case "$mode" in
     [ -n "$label" ] || die "app needs --label \"Name version\""
     [ ${#cmd[@]} -gt 0 ] || die "give the launch command after --"
     describe_machine
+    if [ "$window_runs" -gt 0 ]; then
+      # Until a window exists, whatever it shows: a splash screen counts.
+      # The first launch warms the page cache and is not timed.
+      echo "== one untimed launch, then time to a visible window, $window_runs runs" >&2
+      "${measure[@]}" startup --label "$label" --runs 1 --window ${pass[@]+"${pass[@]}"} \
+        --out "$out/$(slug "$label").startup-warmup.json" -- "${cmd[@]}"
+      "${measure[@]}" startup --label "$label" --runs "$window_runs" --window ${pass[@]+"${pass[@]}"} \
+        --out "$out/$(slug "$label").startup-window.json" -- "${cmd[@]}"
+    fi
     steady_and_size "$label" ${ready[@]+"${ready[@]}"} ${pass[@]+"${pass[@]}"} -- "${cmd[@]}"
     if [ "$trace" = 1 ]; then
       echo "Now once more under strace (60 s; bring the app to its pod list again if you like)." >&2

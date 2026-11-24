@@ -41,6 +41,10 @@ pub fn zoom_percent(zoom: f32) -> String {
 /// Where the third-party licences are published.
 pub const THIRD_PARTY_FILE: &str = "THIRD-PARTY-NOTICES.md";
 
+/// Where people who want to support the project can do so. Opened in the
+/// browser from Settings, About; Skiff itself never contacts it.
+pub const SUPPORT_URL: &str = "https://buymeacoffee.com/tsenkotsenkov";
+
 /// The project's page on GitHub.
 pub fn repository_url() -> String {
     format!("https://github.com/{}", update::repo())
@@ -1019,6 +1023,7 @@ fn about(ui: &mut Ui, pal: &Palette, state: &mut State, model: &Model, actions: 
             (icons::ICON_NEW_RELEASES, "Releases", format!("{repo}/releases")),
             (icons::ICON_BUG_REPORT, "Report a problem", format!("{repo}/issues")),
             (icons::ICON_GAVEL, "Third-party licences", format!("{repo}/blob/main/{THIRD_PARTY_FILE}")),
+            (icons::ICON_COFFEE, "Support Skiff", SUPPORT_URL.to_string()),
         ] {
             if widgets::link(ui, pal, ic, label).on_hover_text(&url).clicked() {
                 actions.push(Action::OpenUrl(url));

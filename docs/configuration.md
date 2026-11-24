@@ -6,7 +6,7 @@ writes the same file.
 
 - [config.json](#configjson)
 - [Which kubeconfig files are read](#which-kubeconfig-files-are-read)
-- [Keyboard](#keyboard) and [keys.json](#keysjson)
+- [Keyboard](#keyboard) and [keys.json](#keysjson); the shortcuts themselves are in [keyboard.md](keyboard.md)
 - [Command-line options](#command-line-options)
 - [Environment variables](#environment-variables)
 
@@ -92,7 +92,8 @@ JSON has no comments. Notes on single keys:
 
 Window state (pane sizes, the last view, the namespaces selected per
 cluster) is not in this file. It is kept separately in the application
-data folder of your system and needs no editing.
+data folder of your system and needs no editing; the folder is named in
+[troubleshooting.md](troubleshooting.md#where-skiff-keeps-its-files).
 
 ## Which kubeconfig files are read
 
@@ -139,88 +140,28 @@ Rules:
 
 ## Keyboard
 
-Press `?` in the app for this list with your own bindings filled in.
-`Cmd` replaces `Ctrl` on a Mac except where noted.
-
-| Key | Action |
-| --- | --- |
-| `Ctrl+K` | Search or jump to anything: resource types (kubectl short names work: `po`, `deploy`, `svc`), loaded objects, namespaces, clusters, actions |
-| `Ctrl+,` | Settings |
-| `?` | Keyboard shortcuts |
-| `Ctrl+=` `Ctrl+-` `Ctrl+0` | Zoom in, zoom out, actual size |
-| `/` | Filter the table |
-| `j` `k` or `↓` `↑` | Next / previous row or sidebar entry |
-| `Ctrl+d` `Ctrl+u` or `PageDown` `PageUp` | Down / up a page (`Ctrl` on a Mac too) |
-| `g` `G` or `Home` `End` | First / last row |
-| `h` or `←` | Move to the sidebar |
-| `l` or `→` | Back to the table, or open the selected row |
-| `Enter` | Open the selected row or sidebar entry |
-| `]` `[` | Next / previous tab of the details |
-| `Ctrl+S` | Apply the YAML you edited |
-| `Esc` | Close what is on top: a dialog, the details, the filter |
-| `Enter` `Shift+Enter` | In the log find box: next / previous match |
-
-Right-click a row for its actions.
-
-**In a shell** every key goes to the shell, including `Esc`, `Tab`,
-`Ctrl+K` and `Ctrl+S`:
-
-| Key | Action |
-| --- | --- |
-| `Ctrl+Shift+C` / `Ctrl+Shift+V` (also `Ctrl+V`) | Copy the selection / paste. On a Mac `Cmd+C` / `Cmd+V` |
-| `Shift+PageUp` `Shift+PageDown` | Scroll back and forth |
-| `Ctrl+Shift+K` | Search or jump, from a shell (`Cmd+K` on a Mac) |
-
-Click outside the terminal to give the keyboard back to the rest of the
-app. Because `Ctrl+V` pastes, programs that use it themselves need their
-other binding (in vim, `Ctrl+Q` starts a visual block). On Linux and
-Windows the zoom shortcuts are not taken while a shell has the keyboard.
+Every shortcut is listed in [keyboard.md](keyboard.md), and in the app
+under `?`. The keys for moving around can be changed, in a second file.
 
 ### keys.json
 
-The keys for moving around can be changed. Skiff reads `keys.json` from
-the same folder as `config.json` (or the file named by `$SKIFF_KEYMAP`);
-Settings → Files opens it, writing the defaults first if it does not
-exist. On Windows a `keys.json` at the older location
-`%USERPROFILE%\.config\skiff` is still used while there is none in
-`%APPDATA%\skiff`.
-
-The file maps actions to lists of keys. Actions it leaves out keep their
-defaults, and `[]` unbinds one. For example, the Colemak home row with the
-arrows kept:
+Skiff reads `keys.json` from the same folder as `config.json` (or the
+file named by `$SKIFF_KEYMAP`); Settings → Files opens it, writing the
+defaults first if it does not exist. It maps actions to lists of keys;
+actions it leaves out keep their defaults, and `[]` unbinds one:
 
 ```json
 {
   "down": ["n", "ArrowDown"],
-  "up": ["e", "ArrowUp"],
-  "focus_left": ["h", "ArrowLeft"],
-  "focus_right": ["i", "ArrowRight"]
+  "up": ["e", "ArrowUp"]
 }
 ```
 
-| Action | Default | Does |
-| --- | --- | --- |
-| `down` | `j`, `ArrowDown` | Next row or sidebar entry |
-| `up` | `k`, `ArrowUp` | Previous row or sidebar entry |
-| `page_down` | `Ctrl+d`, `PageDown` | Down a page |
-| `page_up` | `Ctrl+u`, `PageUp` | Up a page |
-| `top` | `g`, `Home` | First row |
-| `bottom` | `G`, `End` | Last row |
-| `open` | `Enter` | Open the selected row or sidebar entry |
-| `focus_left` | `h`, `ArrowLeft` | Move to the sidebar |
-| `focus_right` | `l`, `ArrowRight` | Back to the table, or open the selected row |
-| `next_tab` | `]` | Next tab |
-| `prev_tab` | `[` | Previous tab |
-| `filter` | `/` | Filter the table |
-| `help` | `?` | Show keyboard shortcuts |
-
-Keys are written as `j`, `ArrowDown`, `PageUp`, `Home`, `Enter`, `Space`,
-`/`, `[`, `F5` and so on, optionally after modifiers joined with `+`:
-`Ctrl+d`, `Shift+g`, `Alt+j` (or `Option+j`), `Cmd+j`. In this file `Cmd`
-means the Command key on a Mac and `Ctrl` on Linux and Windows. A single
-capital letter includes Shift: `G` is `Shift+g`. A key binds only with
-exactly the modifiers given, so `j` does not also fire on `Ctrl+j`. If the
-file has mistakes, Skiff says so and uses the parts it understood.
+The thirteen actions, their default keys and how keys are written are in
+[keyboard.md](keyboard.md#changing-the-keys). If the file has mistakes,
+Skiff says so and uses the parts it understood. On Windows a `keys.json`
+at the older location `%USERPROFILE%\.config\skiff` is still used while
+there is none in `%APPDATA%\skiff`.
 
 ## Command-line options
 
