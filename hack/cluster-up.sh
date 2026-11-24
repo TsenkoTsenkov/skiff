@@ -12,6 +12,7 @@ ensure_tools
 # helper daemons the demo cluster's simulated logs / port-forward depend on
 daemon_start logsim "$HACK_DIR/logsim.sh"
 daemon_start pf-target python3 -I "$HACK_DIR/pf-target.py" "$PF_TARGET_PORT"
+prom_start   # fake Prometheus: metrics charts and firing alerts for the demo cluster
 sleep 1   # logsim writes its initial history before the ClusterLogs are applied
 
 create_cluster demo "$DEMO_PORT"

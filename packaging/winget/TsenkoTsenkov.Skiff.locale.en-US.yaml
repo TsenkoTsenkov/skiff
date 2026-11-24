@@ -1,0 +1,27 @@
+# winget manifest, part 3 of 3 (what `winget show` displays).
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: TsenkoTsenkov.Skiff
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Skiff contributors
+PublisherUrl: https://github.com/TsenkoTsenkov
+PublisherSupportUrl: https://github.com/TsenkoTsenkov/skiff/issues
+PackageName: Skiff
+PackageUrl: https://github.com/TsenkoTsenkov/skiff
+License: MIT
+LicenseUrl: https://github.com/TsenkoTsenkov/skiff/blob/main/LICENSE
+ShortDescription: A fast, native Kubernetes cluster browser
+Description: |-
+  Skiff is a desktop client for Kubernetes clusters: browse and edit
+  resources, follow logs, open shells in containers and forward ports.
+  It is a native program, uses the kubeconfig as it is (including exec
+  credential plugins and OIDC) and has no account and no telemetry.
+Moniker: skiff
+Tags:
+  - kubernetes
+  - k8s
+  - kubectl
+  - devops
+ReleaseNotesUrl: https://github.com/TsenkoTsenkov/skiff/releases/tag/v0.1.0
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

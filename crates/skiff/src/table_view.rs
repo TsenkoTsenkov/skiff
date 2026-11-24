@@ -218,6 +218,10 @@ pub struct Laid {
     pub width: f32,
     /// Takes the space the other columns leave.
     pub flexible: bool,
+    /// How narrow a drag may make it. For the flexible column this is the
+    /// room the layout keeps for it: any narrower and the layout would
+    /// leave another column out to give it back.
+    pub floor: f32,
 }
 
 /// Lays the chosen columns out in `available` points (column gaps of `gap`
@@ -244,15 +248,18 @@ pub fn layout_columns(
             let user = tui.widths.get(c.title(snap)).copied();
             let flexible = user.is_none() && is_flexible(&c, snap);
             let width = user.unwrap_or_else(|| default_width(key, &c, snap, tui));
-            Laid { col: c, width, flexible }
+            // What the flexible column needs to be readable: its content,
+            // within limits.
+            let floor = if flexible {
+                let fit = tui.fitted.get(c.title(snap)).copied().unwrap_or(MIN_FLEX_WIDTH);
+                fit.clamp(MIN_FLEX_WIDTH, COMFORT_FLEX_WIDTH)
+            } else {
+                MIN_COL_WIDTH
+            };
+            Laid { col: c, width, flexible, floor }
         })
         .collect();
-    // What the flexible column needs to be readable: its content, within
-    // limits.
-    let comfort = |l: &Laid| -> f32 {
-        let fit = tui.fitted.get(l.col.title(snap)).copied().unwrap_or(MIN_FLEX_WIDTH);
-        fit.clamp(MIN_FLEX_WIDTH, COMFORT_FLEX_WIDTH)
-    };
+    let comfort = |l: &Laid| -> f32 { l.floor };
     let need = |cols: &[Laid]| -> f32 {
         cols.iter().map(|l| if l.flexible { comfort(l) } else { l.width } + gap).sum::<f32>() - gap
     };
@@ -292,11 +299,6 @@ pub fn layout_columns(
     cols
 }
 
-/// Kept for callers that only need which columns are shown.
-pub fn display_columns(key: &ResourceKey, snap: &Snapshot, tui: &TableUi, metrics: &Metrics, available: f32) -> Vec<DCol> {
-    layout_columns(key, snap, tui, metrics, available, 8.0).into_iter().map(|l| l.col).collect()
-}
-
 /// How wide column `index` of `cols` may be dragged without anything else
 /// having to make room: the flexible column gives up space down to its
 /// minimum, and nothing is ever dropped because of a drag.
@@ -304,7 +306,7 @@ pub fn max_drag_width(cols: &[Laid], index: usize, available: f32, gap: f32) -> 
     let used: f32 = cols
         .iter()
         .enumerate()
-        .map(|(i, l)| if l.flexible && i != index { MIN_FLEX_WIDTH.min(l.width) } else { l.width } + gap)
+        .map(|(i, l)| if l.flexible && i != index { l.floor.min(l.width) } else { l.width } + gap)
         .sum::<f32>()
         - gap;
     let w = cols.get(index).map(|l| l.width).unwrap_or(0.0);
@@ -324,7 +326,7 @@ pub fn max_drag_width(cols: &[Laid], index: usize, available: f32, gap: f32) -> 
 /// comes out right because the total does not change.
 pub fn drag_widths(start: &[Laid], index: usize, delta: f32, available: f32, gap: f32) -> Vec<(usize, f32)> {
     let Some(this) = start.get(index) else { return Vec::new() };
-    let min_of = |l: &Laid| if l.flexible { MIN_FLEX_WIDTH.min(l.width) } else { MIN_COL_WIDTH.min(l.width) };
+    let min_of = |l: &Laid| l.floor.min(l.width);
     let mut out = Vec::new();
     let put = |out: &mut Vec<(usize, f32)>, i: usize, w: f32| {
         if !start[i].flexible {
@@ -469,9 +471,17 @@ pub fn parse_filter(filter: &str, snap: &Snapshot) -> Vec<Term> {
         .to_lowercase()
         .split_whitespace()
         .filter_map(|word| {
-            let (negate, word) = match word.strip_prefix('!').or_else(|| word.strip_prefix('-').filter(|w| !w.is_empty())) {
+            // `!` excludes. So does `-` in front of a column filter
+            // (`-ns:shop`); in front of plain text it is part of the text,
+            // so `-prod` still finds `api-prod`.
+            let column_filter =
+                |w: &str| w.split_once(':').is_some_and(|(key, _)| !key.is_empty() && resolve_field(key, snap).is_some());
+            let (negate, word) = match word.strip_prefix('!') {
                 Some(rest) => (true, rest),
-                None => (false, word),
+                None => match word.strip_prefix('-').filter(|rest| column_filter(rest)) {
+                    Some(rest) => (true, rest),
+                    None => (false, word),
+                },
             };
             if word.is_empty() {
                 return None;
@@ -753,6 +763,15 @@ pub enum RowAction {
     ShowPods,
 }
 
+impl RowAction {
+    /// Whether the action changes the cluster (or, for a shell and a port
+    /// forward, opens a way to): these are not offered on a cluster that
+    /// is read-only in Skiff.
+    pub fn mutates(self) -> bool {
+        !matches!(self, RowAction::Logs | RowAction::CopyName | RowAction::ShowPods)
+    }
+}
+
 /// Which actions make sense for a resource type.
 pub fn actions_for(key: &ResourceKey) -> Vec<(RowAction, egui_material_icons::MaterialIcon, &'static str)> {
     let mut v = Vec::new();
@@ -806,6 +825,8 @@ pub fn show(
     laid: &[Laid],
     metrics: &Metrics,
     now: i64,
+    // Why actions that change the cluster are disabled, when they are.
+    locked: Option<&str>,
 ) -> TableOutput {
     let snap = &cache.snap;
     let mut out = TableOutput::default();
@@ -986,7 +1007,11 @@ pub fn show(
                         }
                         let color = if matches!(action, RowAction::Delete) { pal.err } else { pal.text };
                         let atoms = (widgets::icon(*ic, 15.0).color(color), RichText::new(*label).color(color));
-                        if ui.add(egui::Button::new(atoms).frame(false)).clicked() {
+                        let reason = locked.filter(|_| action.mutates());
+                        let item = ui.add_enabled(reason.is_none(), egui::Button::new(atoms).frame(false));
+                        if let Some(reason) = reason {
+                            item.on_disabled_hover_text(reason);
+                        } else if item.clicked() {
                             out.menu = Some((*action, row.clone()));
                             ui.close();
                         }
@@ -1161,6 +1186,11 @@ mod tests {
         assert_eq!(filtered(&snap, "st:crash"), ["web-2"], "a prefix of the title is enough");
         assert_eq!(filtered(&snap, "!running"), ["web-2"]);
         assert_eq!(filtered(&snap, "-ns:shop"), ["db-0"]);
+        // A leading hyphen on plain text is text (a fragment of a name).
+        assert_eq!(filtered(&snap, "-2"), ["web-2"]);
+        assert_eq!(filtered(&snap, "-0"), ["db-0"]);
+        assert_eq!(filtered(&snap, "!-2"), ["web-1", "db-0"]);
+        assert_eq!(filtered(&snap, "-bogus:x"), Vec::<String>::new());
         assert_eq!(filtered(&snap, "web node:=node-1"), ["web-1"], "terms combine");
         assert_eq!(filtered(&snap, "label:=app=db-0"), ["db-0"]);
         // A prefix that names no column is plain text.
@@ -1247,6 +1277,31 @@ mod tests {
             let total = edge(&after, after.len() - 1) - 8.0;
             assert!(total <= 1100.5, "{total}");
         }
+    }
+
+    #[test]
+    fn narrowing_the_name_column_never_costs_another_column() {
+        // Long names: the name column wants its full comfortable width.
+        let snap = pods_snapshot(&[("a-pod-with-quite-a-long-name-0123456789-abcdef", "b", "Running", "n")]);
+        let mut tui = TableUi::default();
+        tui.fitted.insert("Name".into(), 400.0);
+        let key = pods_key();
+        // Just enough room for every column with the name at that width
+        // and a little to spare.
+        let roomy = layout_columns(&key, &snap, &tui, &Metrics::default(), 2000.0, 8.0);
+        let fixed: f32 = roomy.iter().filter(|l| !l.flexible).map(|l| l.width + 8.0).sum();
+        let available = fixed + COMFORT_FLEX_WIDTH + 30.0;
+        let start = layout_columns(&key, &snap, &tui, &Metrics::default(), available, 8.0);
+        assert_eq!(start.len(), roomy.len());
+        assert!(start[0].flexible && (start[0].width - (COMFORT_FLEX_WIDTH + 30.0)).abs() < 1.5, "{:?}", start[0]);
+        // Dragged far to the left, the name gives the 30 it can spare and
+        // no more: every column is still there.
+        for (j, w) in drag_widths(&start, 0, -200.0, available, 8.0) {
+            tui.widths.insert(start[j].col.title(&snap).to_string(), w);
+        }
+        let after = layout_columns(&key, &snap, &tui, &Metrics::default(), available, 8.0);
+        assert_eq!(after.len(), start.len(), "no column was left out");
+        assert!((after[0].width - COMFORT_FLEX_WIDTH).abs() < 1.5, "{:?}", after[0]);
     }
 
     #[test]

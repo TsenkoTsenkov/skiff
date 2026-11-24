@@ -6,6 +6,14 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/TsenkoTsenkov/skiff"
+homepage = "https://github.com/TsenkoTsenkov/skiff"
+authors = ["Tsenko Tsenkov"]
+# The oldest toolchain the code is known to build with (README: "Rust 1.95
+# or newer"). rust-toolchain.toml pins the one releases are built with.
+rust-version = "1.95"
+# Skiff ships as an application, not as crates on crates.io.
+publish = false
 
 [profile.dev]
 opt-level = 1
@@ -18,6 +26,8 @@ opt-level = 2
 opt-level = 3
 lto = "thin"
 codegen-units = 4
+# Symbols are stripped, which also makes the build reproducible across
+# checkout paths.
 strip = true
 # (Not panic = "abort": the terminal emulator runs on whatever a container
 # prints, and a panic there is caught so that it cannot take the app down.)

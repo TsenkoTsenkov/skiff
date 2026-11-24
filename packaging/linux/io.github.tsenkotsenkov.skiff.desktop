@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Skiff
+GenericName=Kubernetes Client
+Comment=A fast, native Kubernetes cluster browser
+Exec=skiff
+Icon=io.github.tsenkotsenkov.skiff
+Terminal=false
+Categories=Development;
+Keywords=kubernetes;k8s;kubectl;cluster;pods;containers;
+StartupNotify=true
+StartupWMClass=io.github.tsenkotsenkov.skiff

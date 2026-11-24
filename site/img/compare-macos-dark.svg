@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="576" viewBox="0 0 880 576" role="img" aria-labelledby="t d" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title id="t">Skiff 0.1.0 and similar software, measured</title>
+<desc id="d">Skiff 0.1.0: memory, physical footprint 146 MiB, processes 1, idle cpu 0.1%. Terminal UI client: memory, physical footprint 397 MiB, processes 2, idle cpu 16.2%. Electron-based client: memory, physical footprint 893 MiB, processes 6, idle cpu 7.9%. Measured 2026-11-24 on an Apple M1 Pro Mac (macOS, arm64); on the Mac's own display. Local kwok test cluster: 100 nodes, 5,415 pods, the same cluster for every row. Each app has its pod list open and loaded. Memory is the physical footprint that Activity Monitor shows, not PSS (macOS has none): not comparable with the Linux figures. Each value is the median of three runs; only the medians were recorded, not the smallest and largest run. Terminal UI client: ran inside a minimal wrapper with no terminal app around it; a real terminal would add to its numbers. Electron-based client: ran in a fresh, empty profile limited to the test cluster.</desc>
+<rect x="0.5" y="0.5" width="879" height="575" rx="10" fill="#13161B" stroke="#242933"/>
+<text x="24" y="36" font-size="17" fill="#D5DAE3" font-weight="600">Skiff 0.1.0 and similar software</text>
+<text x="856" y="36" font-size="12" fill="#9BA3B2" text-anchor="end">same machine, same cluster, same day · each panel has its own scale</text>
+<line x1="24" y1="57.5" x2="856" y2="57.5" stroke="#242933"/>
+<text x="24" y="80"><tspan font-size="13" fill="#D5DAE3" font-weight="600">Memory, physical footprint</tspan><tspan font-size="11.5" fill="#848D9D" font-weight="400" dx="8">whole process tree, as Activity Monitor shows it, pod list loaded</tspan></text>
+<text x="170.21" y="103.5" font-size="13" fill="#D5DAE3" font-weight="600" text-anchor="end">Skiff 0.1.0</text>
+<path d="M182.21,92h81.6365a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-81.6365z" fill="#5B9DFF"><title>Skiff 0.1.0 (native app (draws its own interface)): memory, physical footprint 146 MiB, median of 3</title></path>
+<text x="275.846" y="103.5" font-size="13" fill="#D5DAE3" font-weight="600">146 MiB</text>
+<text x="170.21" y="129.5" font-size="13" fill="#9BA3B2" text-anchor="end">Terminal UI client</text>
+<path d="M182.21,118h228.861a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-228.861z" fill="#5C6473"><title>Terminal UI client (terminal interface (measured with what it ran in; the row's notes say what)): memory, physical footprint 397 MiB, median of 3</title></path>
+<text x="423.071" y="129.5" font-size="13" fill="#D5DAE3">397 MiB</text>
+<text x="170.21" y="155.5" font-size="13" fill="#9BA3B2" text-anchor="end">Electron-based client</text>
+<path d="M182.21,144h519.79a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-519.79z" fill="#5C6473"><title>Electron-based client (Electron-based app (bundles a browser engine)): memory, physical footprint 893 MiB, median of 3</title></path>
+<text x="714" y="155.5" font-size="13" fill="#D5DAE3">893 MiB</text>
+<line x1="24" y1="189.5" x2="856" y2="189.5" stroke="#242933"/>
+<text x="24" y="212"><tspan font-size="13" fill="#D5DAE3" font-weight="600">Processes</tspan><tspan font-size="11.5" fill="#848D9D" font-weight="400" dx="8">in the tree, pod list loaded</tspan></text>
+<text x="170.21" y="235.5" font-size="13" fill="#D5DAE3" font-weight="600" text-anchor="end">Skiff 0.1.0</text>
+<path d="M182.21,224h83.2984a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-83.2984z" fill="#5B9DFF"><title>Skiff 0.1.0 (native app (draws its own interface)): processes 1, median of 3</title></path>
+<text x="277.508" y="235.5" font-size="13" fill="#D5DAE3" font-weight="600">1</text>
+<text x="170.21" y="261.5" font-size="13" fill="#9BA3B2" text-anchor="end">Terminal UI client</text>
+<path d="M182.21,250h170.597a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-170.597z" fill="#5C6473"><title>Terminal UI client (terminal interface (measured with what it ran in; the row's notes say what)): processes 2, median of 3</title></path>
+<text x="364.806" y="261.5" font-size="13" fill="#D5DAE3">2</text>
+<text x="170.21" y="287.5" font-size="13" fill="#9BA3B2" text-anchor="end">Electron-based client</text>
+<path d="M182.21,276h519.79a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-519.79z" fill="#5C6473"><title>Electron-based client (Electron-based app (bundles a browser engine)): processes 6, median of 3</title></path>
+<text x="714" y="287.5" font-size="13" fill="#D5DAE3">6</text>
+<line x1="24" y1="321.5" x2="856" y2="321.5" stroke="#242933"/>
+<text x="24" y="344"><tspan font-size="13" fill="#D5DAE3" font-weight="600">Idle CPU</tspan><tspan font-size="11.5" fill="#848D9D" font-weight="400" dx="8">of one core, over 60 idle seconds</tspan></text>
+<text x="170.21" y="367.5" font-size="13" fill="#D5DAE3" font-weight="600" text-anchor="end">Skiff 0.1.0</text>
+<path d="M182.21,356h1.61664a1.61664,1.61664 0 0 1 1.61664,1.61664v10.7667a1.61664,1.61664 0 0 1 -1.61664,1.61664h-1.61664z" fill="#5B9DFF"><title>Skiff 0.1.0 (native app (draws its own interface)): idle cpu 0.1%, median of 3</title></path>
+<text x="193.443" y="367.5" font-size="13" fill="#D5DAE3" font-weight="600">0.1%</text>
+<text x="170.21" y="393.5" font-size="13" fill="#9BA3B2" text-anchor="end">Terminal UI client</text>
+<path d="M182.21,382h519.79a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-519.79z" fill="#5C6473"><title>Terminal UI client (terminal interface (measured with what it ran in; the row's notes say what)): idle cpu 16.2%, median of 3</title></path>
+<text x="714" y="393.5" font-size="13" fill="#D5DAE3">16.2%</text>
+<text x="170.21" y="419.5" font-size="13" fill="#9BA3B2" text-anchor="end">Electron-based client</text>
+<path d="M182.21,408h251.429a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-251.429z" fill="#5C6473"><title>Electron-based client (Electron-based app (bundles a browser engine)): idle cpu 7.9%, median of 3</title></path>
+<text x="445.638" y="419.5" font-size="13" fill="#D5DAE3">7.9%</text>
+<text x="24" y="464" font-size="11.5" fill="#848D9D">Measured 2026-11-24 on an Apple M1 Pro Mac (macOS, arm64); on the Mac's own display.</text>
+<text x="24" y="481" font-size="11.5" fill="#848D9D">Local kwok test cluster: 100 nodes, 5,415 pods, the same cluster for every row. Each app has its pod list open and loaded.</text>
+<text x="24" y="498" font-size="11.5" fill="#848D9D">Memory is the physical footprint that Activity Monitor shows, not PSS (macOS has none): not comparable with the Linux figures.</text>
+<text x="24" y="515" font-size="11.5" fill="#848D9D">Each value is the median of three runs; only the medians were recorded, not the smallest and largest run.</text>
+<text x="24" y="532" font-size="11.5" fill="#848D9D">Terminal UI client: ran inside a minimal wrapper with no terminal app around it; a real terminal would add to its numbers.</text>
+<text x="24" y="549" font-size="11.5" fill="#848D9D">Electron-based client: ran in a fresh, empty profile limited to the test cluster.</text>
+</svg>

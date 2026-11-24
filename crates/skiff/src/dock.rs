@@ -147,11 +147,11 @@ impl LogsTab {
         self.reveal_current = true;
     }
 
-    /// The command that follows these logs with `kubectl`.
-    fn kubectl_command(&self, stream: &LogStream) -> String {
+    /// The `kubectl` commands that follow these logs.
+    fn kubectl_invocation(&self, stream: &LogStream) -> crate::external::Invocation {
         let targets: Vec<(String, String, String)> =
             stream.targets.iter().map(|t| (t.namespace.clone(), t.pod.clone(), t.container.clone())).collect();
-        crate::external::logs_command(
+        crate::external::logs_invocation(
             &self.session.context,
             &targets,
             self.options.tail,
@@ -262,7 +262,7 @@ impl LogsTab {
                 self.scanned = 0;
             }
             if widgets::icon_button(ui, icons::ICON_OPEN_IN_NEW, "Follow these logs in your terminal app (kubectl)").clicked() {
-                match crate::external::open(&self.kubectl_command(&stream)) {
+                match crate::external::open_invocation(&self.kubectl_invocation(&stream)) {
                     Ok(app) => toasts.push((format!("Opened in {app}"), Tone::Normal)),
                     Err(e) => toasts.push((e, Tone::Err)),
                 }
@@ -676,7 +676,7 @@ impl Dock {
                             let x = egui::Button::new(widgets::icon(icons::ICON_CLOSE, 13.0).color(pal.muted))
                                 .frame_when_inactive(false)
                                 .min_size(egui::vec2(18.0, 20.0));
-                            if ui.add(x).on_hover_text("Close tab").clicked() {
+                            if widgets::named(ui.add(x), "Close tab").clicked() {
                                 close = Some(i);
                             }
                             ui.add_space(6.0);

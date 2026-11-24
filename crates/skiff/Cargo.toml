@@ -3,6 +3,10 @@ name = "skiff"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "A fast, native Kubernetes cluster browser"
 
 [lib]
@@ -15,13 +19,25 @@ path = "src/main.rs"
 [dependencies]
 skiff-core = { path = "../skiff-core" }
 skiff-term = { path = "../skiff-term", optional = true }
-eframe = { version = "0.37", features = ["persistence"] }
+# Both renderers are compiled in: wgpu is the default, glow (OpenGL) is what
+# main.rs falls back to on a machine where wgpu finds nothing to draw with.
+eframe = { version = "0.37", features = ["persistence", "glow"] }
 egui = "0.37"
 egui_extras = { version = "0.37", features = ["syntect"] }
 egui_material_icons = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# Native "open file" dialog. Pure Rust: on Linux it talks to the XDG desktop
+# portal over D-Bus (no GTK), on macOS and Windows to the system dialog.
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+# Reads the clipboard back before a copied secret is cleared from it (egui
+# only writes). The version and backends egui-winit already builds.
+arboard = { version = "3.7", default-features = false }
+
+[build-dependencies]
+# Embeds the icon and version info into skiff.exe (build.rs; Windows targets only).
+winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }

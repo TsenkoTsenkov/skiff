@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::AsyncBufReadExt;
+use futures::{AsyncBufRead, AsyncBufReadExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, LogParams};
 use kube::Client;
@@ -16,45 +16,15 @@ use tokio::task::AbortHandle;
 use crate::util::{friendly, Notifier};
 
 const MAX_LINES: usize = 100_000;
+/// Bytes kept of one line. What a line has beyond this is discarded as it
+/// arrives, never held.
 const MAX_LINE_BYTES: usize = 64 * 1024;
-
-/// Like `read_until(b'\n')`, but keeps at most `cap` bytes of a line in
-/// `buf` and drops the rest of it: a container that prints for hours without
-/// a newline (progress bars, binary output) must not grow the buffer without
-/// end. Partial data stays in `buf` when the future is cancelled (nothing is
-/// consumed from the reader without being accounted for first), so a timeout
-/// around it loses nothing. Returns the bytes read (0 at the end of input).
-async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> std::io::Result<usize>
-where
-    R: futures::AsyncBufRead + Unpin,
-{
-    let mut total = 0;
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(total);
-        }
-        let (chunk, done) = match available.iter().position(|b| *b == b'\n') {
-            Some(i) => (&available[..=i], true),
-            None => (available, false),
-        };
-        let n = chunk.len();
-        let room = cap.saturating_sub(buf.len());
-        if room >= n {
-            buf.extend_from_slice(chunk);
-        } else {
-            buf.extend_from_slice(&chunk[..room]);
-            if done {
-                buf.push(b'\n');
-            }
-        }
-        reader.consume_unpin(n);
-        total += n;
-        if done {
-            return Ok(total);
-        }
-    }
-}
+/// Memory the buffered lines of one stream may take, counted as their text
+/// plus the per-line bookkeeping. The line count alone is not a bound:
+/// 100,000 lines of 64 KiB would be several gigabytes.
+const MAX_BUFFER_BYTES: usize = 128 * 1024 * 1024;
+/// Appended to a line that was cut at `MAX_LINE_BYTES`.
+const TRUNCATED_MARK: &str = " … [line truncated]";
 /// Consecutive failed attempts (connections that could not be made, or that
 /// ended at once with nothing new) before a follow stream gives up.
 const MAX_RETRIES: u32 = 30;
@@ -100,6 +70,16 @@ pub struct LogLine {
     /// Unix milliseconds, 0 if the server sent no timestamp.
     pub time_ms: i64,
     pub text: Box<str>,
+    /// The line was longer than Skiff keeps; `text` is its beginning,
+    /// followed by a note saying so.
+    pub truncated: bool,
+}
+
+impl LogLine {
+    /// What the line costs to keep.
+    fn cost(&self) -> usize {
+        self.text.len() + std::mem::size_of::<LogLine>()
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +89,100 @@ pub struct LogBuffer {
     pub dropped: u64,
     /// Bumps whenever `lines` changes.
     pub generation: u64,
+    /// Memory taken by `lines` (text plus per-line bookkeeping).
+    pub bytes: usize,
+}
+
+impl LogBuffer {
+    /// Appends a line, evicting the oldest lines while the buffer holds
+    /// more than `max_lines` lines or `max_bytes` bytes. The newest line is
+    /// always kept.
+    fn push_bounded(&mut self, line: LogLine, max_lines: usize, max_bytes: usize) {
+        self.bytes += line.cost();
+        self.lines.push_back(line);
+        while self.lines.len() > 1 && (self.lines.len() > max_lines || self.bytes > max_bytes) {
+            if let Some(old) = self.lines.pop_front() {
+                self.bytes = self.bytes.saturating_sub(old.cost());
+                self.dropped += 1;
+            }
+        }
+        self.generation += 1;
+    }
+}
+
+/// Reads `\n`-terminated lines from a stream while holding at most `cap`
+/// bytes of any one line: what a line has beyond that is thrown away as it
+/// arrives. A stream that never sends a newline therefore costs `cap` bytes,
+/// not all the memory there is.
+///
+/// Also used for watch streams (`watch.rs`).
+pub(crate) struct LineReader {
+    buf: Vec<u8>,
+    cap: usize,
+    /// Part of the current line was discarded.
+    truncated: bool,
+    /// The line in `buf` was handed out; the next read starts a new one.
+    complete: bool,
+}
+
+/// What `LineReader::read` found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LineRead {
+    /// A whole line is available from `LineReader::line`.
+    Line { truncated: bool },
+    /// The stream ended (possibly in the middle of a line, which is dropped).
+    Eof,
+}
+
+impl LineReader {
+    pub(crate) fn new(cap: usize) -> Self {
+        LineReader { buf: Vec::new(), cap, truncated: false, complete: false }
+    }
+
+    /// The line last returned by `read`, without its newline; at most `cap`
+    /// bytes.
+    pub(crate) fn line(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Reads up to and including the next newline.
+    ///
+    /// Safe to cancel (to drop the returned future at any point, e.g. on a
+    /// timeout): the only place it waits is for more data, and data is taken
+    /// from the stream only once it has been dealt with, so the next call
+    /// carries on where this one stopped.
+    pub(crate) async fn read<R: AsyncBufRead + Unpin>(&mut self, reader: &mut R) -> std::io::Result<LineRead> {
+        if self.complete {
+            self.complete = false;
+            self.truncated = false;
+            self.buf.clear();
+            // Do not hold on to the memory of one unusually long line.
+            if self.buf.capacity() > 256 * 1024 {
+                self.buf = Vec::new();
+            }
+        }
+        loop {
+            let (used, found) = {
+                let available = reader.fill_buf().await?;
+                if available.is_empty() {
+                    return Ok(LineRead::Eof);
+                }
+                let (chunk, found) = match memchr::memchr(b'\n', available) {
+                    Some(i) => (&available[..i], true),
+                    None => (available, false),
+                };
+                let keep = chunk.len().min(self.cap.saturating_sub(self.buf.len()));
+                self.buf.extend_from_slice(&chunk[..keep]);
+                self.truncated |= keep < chunk.len();
+                (chunk.len() + usize::from(found), found)
+            };
+            reader.consume_unpin(used);
+            if found {
+                self.complete = true;
+                return Ok(LineRead::Line { truncated: self.truncated });
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,17 +224,14 @@ impl Shared {
         }
     }
 
-    fn push(&self, source: u16, time_ms: i64, text: &str) {
+    fn push(&self, source: u16, time_ms: i64, text: &str, truncated: bool) {
+        // (Built before taking the lock: the copy is the slow part.)
+        let text: Box<str> = if truncated { format!("{text}{TRUNCATED_MARK}").into() } else { text.into() };
         let mut b = self.buf.lock();
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        if b.lines.len() >= MAX_LINES {
-            b.lines.pop_front();
-            b.dropped += 1;
-        }
-        b.lines.push_back(LogLine { source, time_ms, text: text.into() });
-        b.generation += 1;
+        b.push_bounded(LogLine { source, time_ms, text, truncated }, MAX_LINES, MAX_BUFFER_BYTES);
     }
 
     fn stop(&self) {
@@ -224,6 +295,7 @@ impl LogStream {
     pub fn clear(&self) {
         let mut b = self.shared.buf.lock();
         b.lines.clear();
+        b.bytes = 0;
         b.generation += 1;
     }
 
@@ -516,32 +588,32 @@ async fn pump(
                 connected_once = true;
                 shared.set_state(idx, SourceState::Streaming);
                 notify.ping();
-                let mut reader = Box::pin(reader);
-                let mut buf = Vec::with_capacity(1024);
+                futures::pin_mut!(reader);
+                // A line longer than the cap is cut as it arrives; a
+                // container that never prints a newline cannot make us
+                // buffer its whole output.
+                let mut line = LineReader::new(MAX_LINE_BYTES);
                 loop {
-                    // `read_until` keeps partial data in `buf` when it is
-                    // cancelled, so the timeout loses nothing.
+                    // The reader keeps a partial line when it is cancelled,
+                    // so the timeout loses nothing.
                     let wait = if unannounced { PING_INTERVAL } else { Duration::from_secs(3600) };
-                    let read = tokio::time::timeout(wait, read_line_capped(&mut reader, &mut buf, MAX_LINE_BYTES)).await;
+                    let read = tokio::time::timeout(wait, line.read(&mut reader)).await;
                     match read {
                         Err(_elapsed) => {}
-                        Ok(Ok(_)) if buf.last() == Some(&b'\n') => {
-                            let mut raw = &buf[..];
-                            while let Some((last, rest)) = raw.split_last() {
-                                if *last == b'\n' || *last == b'\r' {
-                                    raw = rest;
-                                } else {
-                                    break;
-                                }
+                        Ok(Ok(LineRead::Line { truncated })) => {
+                            let mut raw = line.line();
+                            // (The newline itself is not kept; a cut line
+                            // has no line ending left to remove.)
+                            while let Some((b'\r', rest)) = raw.split_last() {
+                                raw = rest;
                             }
-                            let text = String::from_utf8_lossy(&raw[..raw.len().min(MAX_LINE_BYTES)]);
+                            let text = String::from_utf8_lossy(raw);
                             let (time_ms, body) = split_timestamp(&text);
                             if resume.admit(time_ms, body) {
-                                shared.push(idx as u16, time_ms, body);
+                                shared.push(idx as u16, time_ms, body, truncated);
                                 healthy = true;
                                 unannounced = true;
                             }
-                            buf.clear();
                         }
                         // End of stream (possibly mid-line) or a read error.
                         Ok(_) => break,
@@ -634,24 +706,6 @@ pub(crate) fn open(
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn endless_lines_are_capped() {
-        let mut input: Vec<u8> = vec![b'x'; 300_000];
-        input.extend_from_slice(b"\nnext\n");
-        let mut reader = futures::io::Cursor::new(input);
-        let mut buf = Vec::new();
-        let n = futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap();
-        assert_eq!(n, 300_001, "the whole line is consumed");
-        assert_eq!(buf.len(), 1025, "but only the cap is kept, plus the newline");
-        assert_eq!(buf.last(), Some(&b'\n'));
-        buf.clear();
-        futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap();
-        assert_eq!(buf, b"next\n");
-        buf.clear();
-        assert_eq!(futures::executor::block_on(read_line_capped(&mut reader, &mut buf, 1024)).unwrap(), 0);
-    }
-
     use super::*;
 
     #[test]
@@ -866,11 +920,11 @@ mod tests {
             visible: AtomicBool::new(true),
             last_ping: Mutex::new(Instant::now()),
         };
-        shared.push(0, 1, "before");
+        shared.push(0, 1, "before", false);
         shared.stop();
         // A pump that has not yet noticed its cancellation.
         shared.set_state(0, SourceState::Streaming);
-        shared.push(0, 2, "after");
+        shared.push(0, 2, "after", false);
         assert_eq!(shared.states.lock()[0], SourceState::Ended);
         assert_eq!(shared.buf.lock().lines.len(), 1);
     }
@@ -893,5 +947,150 @@ mod tests {
             assert!(late.await.unwrap_err().is_cancelled());
             assert_eq!(shared.states.lock()[0], SourceState::Ended);
         });
+    }
+
+    /// A stream that hands out `total` bytes of `x` in small pieces and
+    /// never a newline.
+    struct NoNewlines {
+        chunk: Vec<u8>,
+        left: usize,
+    }
+
+    impl futures::AsyncRead for NoNewlines {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            unreachable!("only read through its buffer")
+        }
+    }
+
+    impl AsyncBufRead for NoNewlines {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            let this = self.get_mut();
+            let n = this.left.min(this.chunk.len());
+            std::task::Poll::Ready(Ok(&this.chunk[..n]))
+        }
+
+        fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+            self.get_mut().left -= amt;
+        }
+    }
+
+    #[test]
+    fn a_stream_without_newlines_stays_bounded() {
+        // A gigabyte of output without a single newline.
+        let mut stream = NoNewlines { chunk: vec![b'x'; 8 * 1024], left: 1 << 30 };
+        let mut line = LineReader::new(MAX_LINE_BYTES);
+        let end = futures::executor::block_on(line.read(&mut stream)).unwrap();
+        assert_eq!(end, LineRead::Eof);
+        assert_eq!(stream.left, 0, "everything was read (and thrown away)");
+        assert_eq!(line.buf.len(), MAX_LINE_BYTES);
+        assert!(line.buf.capacity() <= 2 * MAX_LINE_BYTES, "held {} bytes", line.buf.capacity());
+    }
+
+    #[test]
+    fn long_lines_are_cut_and_the_next_line_is_intact() {
+        let mut data = vec![b'a'; 100];
+        data.extend_from_slice(b"\nshort\n");
+        data.extend(vec![b'b'; 10]);
+        data.extend_from_slice(b"\n\ntail without newline");
+        let mut stream = futures::io::BufReader::with_capacity(7, futures::io::Cursor::new(data));
+        let mut line = LineReader::new(10);
+        let mut next = || {
+            let end = futures::executor::block_on(line.read(&mut stream)).unwrap();
+            (end, String::from_utf8(line.line().to_vec()).unwrap())
+        };
+        assert_eq!(next(), (LineRead::Line { truncated: true }, "a".repeat(10)));
+        assert_eq!(next(), (LineRead::Line { truncated: false }, "short".to_string()));
+        // Exactly at the cap is not truncated.
+        assert_eq!(next(), (LineRead::Line { truncated: false }, "b".repeat(10)));
+        assert_eq!(next(), (LineRead::Line { truncated: false }, String::new()));
+        assert_eq!(next().0, LineRead::Eof);
+    }
+
+    #[test]
+    fn buffer_is_bounded_by_bytes_as_well_as_lines() {
+        let line = |text: &str| LogLine { source: 0, time_ms: 0, text: text.into(), truncated: false };
+        let cost = line("0123456789").cost();
+        let mut b = LogBuffer::default();
+        // Room for three such lines by size, many more by count.
+        for _ in 0..10 {
+            b.push_bounded(line("0123456789"), 1000, 3 * cost);
+        }
+        assert_eq!((b.lines.len(), b.dropped, b.bytes), (3, 7, 3 * cost));
+        // The oldest go first, and the count limit still applies.
+        b.push_bounded(line("newest"), 2, usize::MAX);
+        assert_eq!(b.lines.len(), 2);
+        assert_eq!(&*b.lines[1].text, "newest");
+        // A line bigger than the whole budget is kept on its own.
+        b.push_bounded(line(&"x".repeat(1000)), 1000, 100);
+        assert_eq!(b.lines.len(), 1);
+        assert_eq!(b.bytes, b.lines[0].cost());
+        assert_eq!(b.generation, 12);
+    }
+
+    /// A pod that prints megabytes without a newline, then a normal line:
+    /// the first arrives cut to the cap and marked, the second intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endless_log_line_is_cut_not_buffered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const FLOOD: usize = 8 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while !req.windows(4).any(|x| x == b"\r\n\r\n") {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n")
+                .await;
+            let piece = vec![b'x'; 64 * 1024];
+            for _ in 0..FLOOD / piece.len() {
+                if sock.write_all(&piece).await.is_err() {
+                    return;
+                }
+            }
+            let _ = sock.write_all(b"\n2024-01-01T00:00:01Z after the flood\n").await;
+            let _ = sock.flush().await;
+            // A followed log stays open.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = Client::try_from(kube::Config::new(format!("http://{addr}").parse().unwrap())).unwrap();
+        let stream = open(
+            &tokio::runtime::Handle::current(),
+            async move { Ok(client) },
+            Arc::new(|| None),
+            vec![LogTarget { namespace: "x".into(), pod: "p".into(), container: "c".into() }],
+            LogOptions::default(),
+            Notifier::noop(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while stream.with(|b| b.lines.len()) < 2 {
+            assert!(Instant::now() < deadline, "timed out; states: {:?}", stream.states());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stream.with(|b| {
+            let first = &b.lines[0];
+            assert!(first.truncated);
+            assert_eq!(first.text.len(), MAX_LINE_BYTES + TRUNCATED_MARK.len());
+            assert!(first.text.ends_with(TRUNCATED_MARK));
+            let second = &b.lines[1];
+            assert!(!second.truncated);
+            assert_eq!(&*second.text, "after the flood");
+            assert_eq!(second.time_ms, 1704067201000);
+            assert!(b.bytes < 2 * MAX_LINE_BYTES, "buffer accounts for {} bytes", b.bytes);
+        });
+        stream.stop();
     }
 }

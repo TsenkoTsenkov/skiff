@@ -4,6 +4,10 @@ description = "egui terminal widget for byte-stream (kubectl exec style) session
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 egui = "0.37"

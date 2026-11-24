@@ -1,5 +1,5 @@
-//! Column resizing, column filters, find shortcuts and the settings page,
-//! driven through the real app against the dev clusters from
+//! Column resizing, column filters, find shortcuts and the settings that
+//! go with them (hiding clusters, log history, column reset), driven through the real app against the dev clusters from
 //! `hack/cluster-up.sh` (skipped when they are not there).
 
 use std::path::PathBuf;
@@ -34,12 +34,36 @@ fn test_context() -> Option<String> {
 }
 
 fn harness(context: &str, view: &str, size: [f32; 2]) -> H {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light: false, namespace: None };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), ..Default::default() };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
         .wgpu()
         .build_eframe(move |cc| SkiffApp::headless(&cc.egui_ctx, opts))
+}
+
+/// The app with a config file of its own: `json` is written to
+/// `dir/config.json`, which is also where the app saves changes.
+fn harness_config(context: &str, view: &str, dir: &std::path::Path, json: &str, size: [f32; 2]) -> H {
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), ..Default::default() };
+    let path = dir.join("config.json");
+    std::fs::write(&path, json).unwrap();
+    let (config, warnings) = skiff::config::Config::load_from(&path);
+    Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless_with_config(&cc.egui_ctx, opts, config, warnings))
+}
+
+fn config_json(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
+}
+
+fn steps(h: &mut H, n: usize) {
+    for _ in 0..n {
+        h.step();
+    }
 }
 
 fn settle(h: &mut H, what: &str, mut done: impl FnMut(&H) -> bool) {
@@ -58,6 +82,21 @@ fn settle(h: &mut H, what: &str, mut done: impl FnMut(&H) -> bool) {
             panic!("timed out waiting for: {what}");
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits for the first usage figures from metrics-server, where the cluster
+/// has one (the dev clusters do): the pods table then gains its CPU and
+/// Memory columns, which must not happen halfway through a test that
+/// measures where columns are. Goes on without them after a while.
+fn wait_for_metrics(h: &mut H) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && !h.state().session().is_some_and(|s| s.metrics().available) {
+        std::thread::sleep(Duration::from_millis(20));
+        h.step();
+    }
+    for _ in 0..4 {
+        h.step();
     }
 }
 
@@ -116,14 +155,18 @@ fn drag(h: &mut H, from: Pos2, to: Pos2) {
 #[test]
 fn columns_resize_by_dragging_and_stay_inside_the_window() {
     let Some(ctx) = test_context() else { return };
-    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
+    // Wide enough that the name column has room to give with the CPU and
+    // Memory columns of metrics-server shown as well.
+    const WIDTH: f32 = 1680.0;
+    let mut h = harness(&ctx, "pods", [WIDTH, 900.0]);
     settle(&mut h, "pods", |h| h.state().table_stats().1 && header(h, "Status").is_some());
+    wait_for_metrics(&mut h);
     shot(&mut h, "col_01_initial");
     let before = headers(&h, &POD_COLUMNS);
     let titles: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
-    assert_eq!(titles, POD_COLUMNS, "all pod columns fit at 1440 wide");
+    assert_eq!(titles, POD_COLUMNS, "all pod columns fit at this width");
     for (t, r) in &before {
-        assert!(r.right() <= 1440.0, "{t} ends at {} beyond the window", r.right());
+        assert!(r.right() <= WIDTH, "{t} ends at {} beyond the window", r.right());
     }
 
     // Widen Namespace by 80 by dragging its right edge (just left of the
@@ -147,7 +190,7 @@ fn columns_resize_by_dragging_and_stay_inside_the_window() {
     assert!((restarts.left() - restarts_before.left()).abs() < 1.0, "Restarts stays put");
     let after = headers(&h, &POD_COLUMNS);
     assert_eq!(after.len(), POD_COLUMNS.len(), "no column was pushed out");
-    assert!(after.iter().all(|(_, r)| r.right() <= 1440.0));
+    assert!(after.iter().all(|(_, r)| r.right() <= WIDTH));
 
     // The width stays when the detail panel opens and closes.
     h.key_press(Key::ArrowDown);
@@ -175,7 +218,7 @@ fn columns_resize_by_dragging_and_stay_inside_the_window() {
     shot(&mut h, "col_04_huge_drag");
     let after = headers(&h, &POD_COLUMNS);
     assert_eq!(after.len(), POD_COLUMNS.len(), "a drag never pushes columns out: {after:?}");
-    assert!(after.iter().all(|(_, r)| r.right() <= 1440.0 + 0.5), "{after:?}");
+    assert!(after.iter().all(|(_, r)| r.right() <= WIDTH + 0.5), "{after:?}");
 
     // The name column can be made narrower too (it used to have no handle).
     let name_edge = Pos2::new(header(&h, "Namespace").unwrap().left() - 4.0, ns.center().y);
@@ -253,7 +296,6 @@ fn cmd_f_finds_in_logs_when_working_there_and_in_the_table_otherwise() {
     let Some(ctx) = test_context() else { return };
     let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
     settle(&mut h, "pods", |h| h.state().table_stats().1 && h.state().table_stats().0 > 3);
-    let total = h.state().table_stats().0;
     let (name, ns) = h.state().row_at(0).unwrap();
     let ctx_egui = h.ctx.clone();
     let pods = skiff_core::kinds::pods();
@@ -266,7 +308,9 @@ fn cmd_f_finds_in_logs_when_working_there_and_in_the_table_otherwise() {
     h.step();
     h.event(egui::Event::Text("zzqqxx".into()));
     settle(&mut h, "log find", |h| has_label(h, "no matches"));
-    assert_eq!(h.state().table_stats().0, total, "the table filter was left alone");
+    // (Not by counting rows: pods come and go in a live cluster.)
+    assert_eq!(h.state().table_filter(), "", "the table filter was left alone");
+    assert!(h.state().table_stats().0 > 0);
     shot(&mut h, "find_01_logs");
 
     // After a click in the table, Cmd+F is for the table.
@@ -290,42 +334,125 @@ fn cmd_f_finds_in_logs_when_working_there_and_in_the_table_otherwise() {
 }
 
 #[test]
-fn settings_page_lists_files_and_clusters() {
+fn settings_window_manages_clusters_columns_and_log_history() {
     let Some(ctx) = test_context() else { return };
-    let mut h = harness(&ctx, "pods", [1440.0, 900.0]);
-    settle(&mut h, "pods", |h| h.state().table_stats().1);
-    h.key_press_modifiers(Modifiers::COMMAND, Key::Comma);
-    settle(&mut h, "settings", |h| has_label(h, "Kubeconfig files"));
-    shot(&mut h, "settings_01");
-    assert_eq!(h.state().view_id(), "settings");
-    assert!(has_label(&h, "Clusters"));
+    let dir = std::env::temp_dir().join(format!("skiff-columns-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = harness_config(&ctx, "pods", &dir, "{}", [1440.0, 900.0]);
+    settle(&mut h, "pods", |h| h.state().table_stats().1 && header(h, "Status").is_some());
+    wait_for_metrics(&mut h);
     let contexts: Vec<String> = h.state().contexts.items.iter().map(|c| c.name.clone()).collect();
     assert!(contexts.len() >= 2, "the dev kubeconfig has demo and scale");
     let other = contexts.iter().find(|c| **c != ctx).unwrap().clone();
 
-    // Hiding a cluster takes it out of the menus, and back.
-    let hide = "Hide from the cluster menu (the kubeconfig is not changed)";
-    let buttons: Vec<_> = h.query_all_by_label(hide).collect();
-    assert_eq!(buttons.len(), contexts.len());
-    let index = contexts.iter().position(|c| *c == other).unwrap();
-    let mut nodes: Vec<_> = h.query_all_by_label(hide).map(|n| n.rect().top()).collect();
-    nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y = nodes[index];
-    h.query_all_by_label(hide).find(|n| n.rect().top() == y).unwrap().click();
-    h.step();
-    h.step();
-    assert!(!h.state().contexts.items.iter().any(|c| c.name == other), "{other} hidden");
-    shot(&mut h, "settings_02_hidden");
-    h.get_by_label_contains("Show hidden clusters").click();
-    h.step();
-    h.get_by_label("Show in the cluster menu again").click();
-    h.step();
-    h.step();
-    assert!(h.state().contexts.items.iter().any(|c| c.name == other), "{other} back");
+    // A dragged column makes "Reset all" in Settings worth offering.
+    let before = headers(&h, &POD_COLUMNS);
+    let y = header(&h, "Namespace").unwrap().center().y;
+    let edge = Pos2::new(header(&h, "Ready").unwrap().left() - 4.0, y);
+    drag(&mut h, edge, edge + egui::vec2(60.0, 0.0));
+    assert!((header(&h, "Ready").unwrap().left() - before[2].1.left() - 60.0).abs() < 4.0, "the drag took");
+
+    // The one Settings window, on its shortcut.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Comma);
+    settle(&mut h, "settings", |h| h.state().settings.is_some() && has_label(h, "Log history"));
+    assert_eq!(h.state().view_id(), "pods", "Settings is a window over the view, not a view");
+    shot(&mut h, "settings_01_appearance");
+    assert!(h.query_all_by_label_contains("1 table with columns or widths you chose").next().is_some());
+    h.get_by_label("Reset the columns of every table").click();
+    steps(&mut h, 4);
+    assert!(h.query_all_by_label_contains("Every table shows its default columns").next().is_some());
+
+    // Log history is a setting of config.json, and new log tabs follow it.
+    assert_eq!(h.state().log_history(), Some(1000), "the default");
+    h.get_by_label("10,000").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().log_history(), Some(10_000));
+    assert_eq!(h.state().dock.default_tail, Some(10_000));
+    assert_eq!(config_json(&dir)["log_history"], serde_json::json!(10_000));
+    h.get_by_label("All").click();
+    steps(&mut h, 3);
+    assert_eq!(h.state().log_history(), None);
+    assert_eq!(config_json(&dir)["log_history"], "all");
+
+    // Clusters: every context with its connection, and what can be done.
+    h.get_by_label("Clusters").click();
+    steps(&mut h, 4);
+    shot(&mut h, "settings_02_clusters");
+    assert!(h.query_all_by_label_contains("Connected").next().is_some(), "the open cluster's state is shown");
+    assert!(has_label(&h, "Not connected"), "{other} has no connection yet");
+    assert!(!has_label(&h, &format!("Open {ctx}")), "the open cluster needs no Open button");
+
+    // Hiding a cluster takes it out of the menu and the palette, not out
+    // of the kubeconfig or this list; and back.
+    h.get_by_label(&format!("Hide {other} from the cluster menu")).click();
+    steps(&mut h, 3);
+    assert!(h.state().menu_contexts().items.iter().all(|c| c.name != other), "{other} hidden from the menu");
+    assert!(h.state().contexts.items.iter().any(|c| c.name == other), "{other} is still a known cluster");
+    assert_eq!(config_json(&dir)["clusters"][&other]["hidden"], serde_json::json!(true));
+    shot(&mut h, "settings_03_hidden");
+    h.get_by_label(&format!("Show {other} in the cluster menu again")).click();
+    steps(&mut h, 3);
+    assert!(h.state().menu_contexts().items.iter().any(|c| c.name == other), "{other} back");
+    assert!(config_json(&dir)["clusters"][&other].get("hidden").is_none(), "shown is the default: no key");
 
     // Reload reads the files again and keeps the connection.
-    h.get_by_label_contains("Reload kubeconfig").click();
+    // (The window's own button: the table behind it has a reload button too.)
+    h.query_all_by_label_contains("Reload")
+        .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("the Reload button")
+        .click();
     h.step();
     assert_eq!(h.state().active.as_deref(), Some(ctx.as_str()));
-    settle(&mut h, "toast", |h| h.query_all_by_label_contains("Kubeconfig read").next().is_some());
+    settle(&mut h, "toast", |h| h.query_all_by_label_contains("Kubeconfig reloaded").next().is_some());
+
+    // About says what the app is costing right now.
+    h.get_by_label("About").click();
+    steps(&mut h, 4);
+    shot(&mut h, "settings_04_about");
+    assert!(has_label(&h, "Last frame") && has_label(&h, "Connections"));
+    assert!(h.query_all_by_label_contains("ms of CPU").next().is_some());
+
+    // Opening a cluster from the list switches to it and closes the window.
+    h.get_by_label("Clusters").click();
+    steps(&mut h, 4);
+    h.get_by_label(&format!("Open {other}")).click();
+    settle(&mut h, "the other cluster", |h| h.state().active.as_deref() == Some(other.as_str()));
+    assert!(h.state().settings.is_none(), "the window gets out of the way");
+    // It has a connection now, which can be closed from the same list.
+    h.state_mut().open_settings(skiff::settings::Section::Clusters);
+    steps(&mut h, 4);
+    h.get_by_label(&format!("Disconnect {other}")).click();
+    steps(&mut h, 4);
+    assert_eq!(h.state().active, None, "disconnecting the open cluster leaves none open");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hidden_cluster_is_left_out_of_the_cluster_menu() {
+    let Some(ctx) = test_context() else { return };
+    let dir = std::env::temp_dir().join(format!("skiff-columns-hidden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // (The other dev cluster; hidden in the file, as a user would write it.)
+    let other = if ctx == "scale" { "demo" } else { "scale" };
+    let json = format!(r#"{{"clusters": {{"{other}": {{"hidden": true}}}}}}"#);
+    let mut h = harness_config(&ctx, "pods", &dir, &json, [1440.0, 900.0]);
+    settle(&mut h, "pods", |h| h.state().table_stats().1);
+    if !h.state().contexts.items.iter().any(|c| c.name == other) {
+        return;
+    }
+    // (The switcher's button is the topmost thing that shows the cluster's name.)
+    h.query_all_by_label_contains(&ctx)
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .expect("cluster switcher")
+        .click();
+    settle(&mut h, "cluster menu", |h| h.query_all_by_label_contains("Manage clusters").next().is_some());
+    shot(&mut h, "settings_05_menu_hidden");
+    assert!(h.query_all_by_label_contains("Manage clusters… (1 hidden)").next().is_some());
+    assert!(!has_label(&h, other), "{other} is not offered");
+    h.get_by_label_contains("Manage clusters… (1 hidden)").click();
+    settle(&mut h, "settings", |h| h.state().settings.as_ref().is_some_and(|s| s.section == skiff::settings::Section::Clusters));
+    assert!(has_label(&h, &format!("Show {other} in the cluster menu again")));
+    let _ = std::fs::remove_dir_all(&dir);
 }

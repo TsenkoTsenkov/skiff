@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template of Skiff.app/Contents/Info.plist. hack/macos-app.sh replaces
+     @VERSION@, @BUILD@ and @MIN_MACOS@. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Skiff</string>
+  <key>CFBundleDisplayName</key><string>Skiff</string>
+  <key>CFBundleIdentifier</key><string>io.github.tsenkotsenkov.skiff</string>
+  <key>CFBundleExecutable</key><string>Skiff</string>
+  <key>CFBundleIconFile</key><string>Skiff</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@BUILD@</string>
+  <key>LSMinimumSystemVersion</key><string>@MIN_MACOS@</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+  <key>NSHumanReadableCopyright</key><string>MIT License</string>
+  <!-- "Open in terminal" drives Terminal or iTerm with AppleScript; macOS
+       shows this sentence when it asks the user to allow that. -->
+  <key>NSAppleEventsUsageDescription</key><string>Skiff opens a shell or a kubectl command in your terminal app when you ask it to.</string>
+</dict>
+</plist>

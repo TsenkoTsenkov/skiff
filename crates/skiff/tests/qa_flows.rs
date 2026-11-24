@@ -49,7 +49,7 @@ pub fn setup() -> bool {
 }
 
 pub fn harness_sized(context: &str, view: &str, size: [f32; 2], light: bool) -> H {
-    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None };
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), light, namespace: None, ..Default::default() };
     Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -266,7 +266,7 @@ fn t00_race_connect_then_table() {
         let t = Instant::now();
         let mut ok = false;
         while t.elapsed() < Duration::from_secs(4) {
-            if store.snapshot().rows.len() > 0 {
+            if !store.snapshot().rows.is_empty() {
                 ok = true;
                 break;
             }
@@ -625,7 +625,7 @@ pub fn click_checkbox(h: &mut H, label: &str) {
 pub fn open_ns_picker(h: &mut H) {
     let n = h
         .query_all_by_role(Role::Button)
-        .find(|n| n.accesskit_node().label().map(|l| clean(&l)).map_or(false, |l| l == "All namespaces" || l.ends_with("namespaces") || h_is_ns(&l)))
+        .find(|n| n.accesskit_node().label().map(|l| clean(&l)).is_some_and(|l| l == "All namespaces" || l.ends_with("namespaces") || h_is_ns(&l)))
         .expect("ns picker button");
     n.click();
     frames(h, 4);
@@ -634,7 +634,7 @@ pub fn open_ns_picker(h: &mut H) {
 /// The namespace picker button: the one with the folder glyph (U+E2C7).
 pub fn ns_button(h: &H) -> egui_kittest::Node<'_> {
     h.query_all_by_role(Role::Button)
-        .find(|n| n.accesskit_node().label().map_or(false, |l| l.contains('\u{e2c7}')))
+        .find(|n| n.accesskit_node().label().is_some_and(|l| l.contains('\u{e2c7}')))
         .expect("ns picker button")
 }
 
@@ -718,7 +718,7 @@ fn t04_namespace_picker() {
     eprintln!("kube-public only: pill={} nothing={}", count_pill(&h), has(&h, "Nothing here"));
     shot(&mut h, "ns_empty");
     // back to all
-    h.get_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map(|l| l == "All namespaces").unwrap_or(false)).map(|n| n.click());
+    if let Some(n) = h.get_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map(|l| l == "All namespaces").unwrap_or(false)) { n.click() }
     frames(&mut h, 4);
     eprintln!("back to all: pill={} button={:?}", count_pill(&h), ns_button(&h).accesskit_node().label());
 }
@@ -810,7 +810,7 @@ fn t05_column_chooser() {
     h.get_by_label("Choose columns").click();
     frames(&mut h, 3);
     for b in ["Namespace", "Ready", "Status", "Restarts", "Node", "Age"] {
-        if h.query_all_by_role(Role::CheckBox).any(|n| n.accesskit_node().label().map_or(false, |l| l == b)) {
+        if h.query_all_by_role(Role::CheckBox).any(|n| n.accesskit_node().label().is_some_and(|l| l == b)) {
             click_checkbox(&mut h, b);
         }
     }
@@ -860,8 +860,7 @@ pub fn open_custom(h: &mut H, kind: &str, ns: &str, name: &str) {
 pub fn tab(h: &mut H, name: &str) {
     let n = h
         .query_all_by_role(Role::Button)
-        .filter(|n| n.accesskit_node().label().map_or(false, |l| l.starts_with(name)))
-        .last()
+        .rfind(|n| n.accesskit_node().label().is_some_and(|l| l.starts_with(name)))
         .unwrap_or_else(|| panic!("no tab {name}"));
     n.click();
     frames(h, 5);
@@ -949,11 +948,11 @@ fn t06_detail_kinds() {
 pub fn click_link(h: &mut H, text: &str) {
     let n = h
         .query_all_by_role(Role::Link)
-        .find(|n| n.accesskit_node().label().map_or(false, |l| l == text))
+        .find(|n| n.accesskit_node().label().is_some_and(|l| l == text))
         .unwrap_or_else(|| panic!("no link {text}"));
     n.scroll_to_me();
     frames(h, 3);
-    let n = h.query_all_by_role(Role::Link).find(|n| n.accesskit_node().label().map_or(false, |l| l == text)).unwrap();
+    let n = h.query_all_by_role(Role::Link).find(|n| n.accesskit_node().label().is_some_and(|l| l == text)).unwrap();
     n.click();
     frames(h, 6);
 }
@@ -1048,7 +1047,7 @@ fn t06_links_and_secret() {
 pub fn click_tip(h: &mut H, tip: &str) {
     let n = h
         .query_all_by_role(Role::Button)
-        .find(|n| n.accesskit_node().label().map_or(false, |l| clean(&l) == tip))
+        .find(|n| n.accesskit_node().label().is_some_and(|l| clean(&l) == tip))
         .unwrap_or_else(|| panic!("no button/tooltip {tip}"));
     n.click();
     frames(h, 5);
@@ -1082,7 +1081,7 @@ fn t07_edit_yaml() {
     let new = text.replace("color: blue", "color: green");
     h.query_all_by_role(Role::MultilineTextInput).next().unwrap().set_text_value_accesskit(&new);
     frames(&mut h, 4);
-    eprintln!("editor now contains green: {}", yaml_editor_text(&h).map_or(false, |t| t.contains("green")));
+    eprintln!("editor now contains green: {}", yaml_editor_text(&h).is_some_and(|t| t.contains("green")));
     shot(&mut h, "mut_cm_modified");
     click_button(&mut h, "Apply");
     frames(&mut h, 10);
@@ -1208,16 +1207,16 @@ fn t07_delete_scale_restart_cordon() {
     // invalid input disables the button
     h.query_all_by_role(Role::TextInput).last().unwrap().set_text_value_accesskit("abc");
     frames(&mut h, 3);
-    let scale_btn_disabled = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l == "Scale")).map(|n| n.accesskit_node().is_disabled());
+    let scale_btn_disabled = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l == "Scale")).map(|n| n.accesskit_node().is_disabled());
     eprintln!("Scale disabled with 'abc': {scale_btn_disabled:?}");
     h.query_all_by_role(Role::TextInput).last().unwrap().set_text_value_accesskit("-3");
     frames(&mut h, 3);
-    let scale_btn_disabled = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l == "Scale")).map(|n| n.accesskit_node().is_disabled());
+    let scale_btn_disabled = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l == "Scale")).map(|n| n.accesskit_node().is_disabled());
     eprintln!("Scale disabled with '-3': {scale_btn_disabled:?}");
     h.query_all_by_role(Role::TextInput).last().unwrap().set_text_value_accesskit("4");
     frames(&mut h, 3);
     // the Scale button inside the dialog (last "Scale" button)
-    let btn = h.query_all_by_role(Role::Button).filter(|n| n.accesskit_node().label().map_or(false, |l| l == "Scale")).last().unwrap();
+    let btn = h.query_all_by_role(Role::Button).rfind(|n| n.accesskit_node().label().is_some_and(|l| l == "Scale")).unwrap();
     btn.click();
     frames(&mut h, 10);
     std::thread::sleep(Duration::from_millis(800));
@@ -1270,7 +1269,7 @@ fn t07_delete_scale_restart_cordon() {
     }
     // Confirm
     click_tip(&mut h, "Delete");
-    let b = h.query_all_by_role(Role::Button).filter(|n| n.accesskit_node().label().map_or(false, |l| l == "Delete")).last().unwrap();
+    let b = h.query_all_by_role(Role::Button).rfind(|n| n.accesskit_node().label().is_some_and(|l| l == "Delete")).unwrap();
     b.click();
     frames(&mut h, 10);
     std::thread::sleep(Duration::from_millis(600));
@@ -1332,7 +1331,7 @@ fn t09_logs() {
     let d: Vec<_> = dock_labels(&h).into_iter().take(14).collect();
     eprintln!("dock head: {d:?}");
     // filter
-    let fin = h.query_all_by_role(Role::TextInput).find(|n| n.accesskit_node().label().map_or(false, |l| l.contains("Filter lines")) || n.accesskit_node().value().is_some()).map(|_| ());
+    let fin = h.query_all_by_role(Role::TextInput).find(|n| n.accesskit_node().label().is_some_and(|l| l.contains("Filter lines")) || n.accesskit_node().value().is_some()).map(|_| ());
     let _ = fin;
     let inputs: Vec<(String,)> = h.query_all_by_role(Role::TextInput).map(|n| (format!("{:?}/{:?}", n.accesskit_node().label(), n.accesskit_node().value()),)).collect();
     eprintln!("text inputs: {inputs:?}");
@@ -1354,13 +1353,13 @@ fn t09_logs() {
     click_tip(&mut h, "Wrap long lines");
     click_tip(&mut h, "Show timestamps");
     // tail menu
-    let tail_btn = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l.starts_with("last ") || l == "all"));
+    let tail_btn = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l.starts_with("last ") || l == "all"));
     eprintln!("tail button: {:?}", tail_btn.as_ref().map(|n| n.accesskit_node().label()));
     if let Some(n) = tail_btn { n.click(); frames(&mut h, 4); }
     shot(&mut h, "logs_tail_menu");
     let items: Vec<_> = labels(&h).into_iter().filter(|x| x.1.starts_with("last ") || x.1 == "all").collect();
     eprintln!("tail menu items: {items:?}");
-    if let Some(n) = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l == "last 100")) { n.click(); }
+    if let Some(n) = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l == "last 100")) { n.click(); }
     frames(&mut h, 8);
     eprintln!("after tail=100: {}", log_summary(&h));
     // copy
@@ -1498,7 +1497,7 @@ fn t10_port_forward() {
     // stop all
     let mut stops = 0;
     loop {
-        let found = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l == "Stop forwarding"));
+        let found = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l == "Stop forwarding"));
         match found {
             Some(n) => n.click(),
             None => break,
@@ -1652,7 +1651,7 @@ fn t12_keyboard() {
     let snap = h.state().session().unwrap().table(&builtin_key("configmaps")).snapshot();
     // expected order: Name asc using the app's own compare
     let col = snap.columns.iter().find(|c| c.source == skiff_core::ColSource::Name).unwrap();
-    let mut rows: Vec<_> = snap.rows.iter().cloned().collect();
+    let mut rows: Vec<_> = snap.rows.to_vec();
     rows.sort_by(|a, b| skiff_core::compare(a, b, col));
     let names: Vec<String> = rows.iter().map(|r| format!("{}/{}", r.namespace, r.name)).collect();
     eprintln!("n rows {} first {} last {}", names.len(), names[0], names[names.len() - 1]);
@@ -1729,7 +1728,7 @@ fn t13_scale_cluster() {
     }
     let t0 = Instant::now();
     let mut h = harness("scale", "pods");
-    let ok = settle_for(&mut h, 60, |h| count_pill(h).replace(',', "").parse::<usize>().map_or(false, |n| n > 5000));
+    let ok = settle_for(&mut h, 60, |h| count_pill(h).replace(',', "").parse::<usize>().is_ok_and(|n| n > 5000));
     eprintln!("scale pods: ok={ok} in {:?} pill={}", t0.elapsed(), count_pill(&h));
     shot(&mut h, "scale_pods_full");
     let mut max = Duration::ZERO;
@@ -1770,13 +1769,13 @@ fn t13_scale_cluster() {
     go_view(&mut h, "pods");
     wait_table(&mut h);
     // switch back to demo via the switcher UI
-    let ctxbtn = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| clean(&l) == "scale")).unwrap();
+    let ctxbtn = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| clean(&l) == "scale")).unwrap();
     ctxbtn.click();
     frames(&mut h, 4);
     shot(&mut h, "ctx_switcher");
     let items: Vec<_> = labels(&h).into_iter().filter(|x| x.0 == Role::Button && (x.1.contains("demo") || x.1.contains("scale") || x.1.contains("Disconnect"))).collect();
     eprintln!("switcher items: {items:?}");
-    let demo = h.query_all_by_role(Role::Button).filter(|n| n.accesskit_node().label().map_or(false, |l| clean(&l) == "demo")).last().unwrap();
+    let demo = h.query_all_by_role(Role::Button).rfind(|n| n.accesskit_node().label().is_some_and(|l| clean(&l) == "demo")).unwrap();
     demo.click();
     frames(&mut h, 8);
     let ok = settle_for(&mut h, 10, pods_ready);
@@ -1785,7 +1784,7 @@ fn t13_scale_cluster() {
     // switch to scale again: instant (session kept)?
     let t = Instant::now();
     h.state_mut().switch_context("scale");
-    let ok = settle_for(&mut h, 20, |h| count_pill(h).replace(',', "").parse::<usize>().map_or(false, |n| n > 5000));
+    let ok = settle_for(&mut h, 20, |h| count_pill(h).replace(',', "").parse::<usize>().is_ok_and(|n| n > 5000));
     eprintln!("second switch to scale shows data after {:?} ok={ok}", t.elapsed());
 }
 
@@ -1798,7 +1797,7 @@ fn t14_unreachable_cluster() {
     }
     unsafe { std::env::set_var("KUBECONFIG", &dead) };
     let t0 = Instant::now();
-    let opts = AppOptions { context: Some("dead".into()), view: Some("pods".into()), light: false, namespace: None };
+    let opts = AppOptions { context: Some("dead".into()), view: Some("pods".into()), light: false, namespace: None, ..Default::default() };
     let mut h = Harness::builder()
         .with_size([1440.0, 900.0])
         .with_pixels_per_point(1.0)
@@ -1833,7 +1832,7 @@ fn t14_unreachable_cluster() {
     h.key_press(egui::Key::Escape);
     frames(&mut h, 3);
     // Retry button
-    let retry = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l == "Retry"));
+    let retry = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l == "Retry"));
     if let Some(n) = retry {
         n.click();
         frames(&mut h, 5);
@@ -1915,6 +1914,6 @@ fn t15_layouts() {
 }
 
 fn click_button_prefix(h: &mut H, prefix: &str) {
-    let n = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().map_or(false, |l| l.starts_with(prefix))).expect("button");
+    let n = h.query_all_by_role(Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l.starts_with(prefix))).expect("button");
     n.click();
 }

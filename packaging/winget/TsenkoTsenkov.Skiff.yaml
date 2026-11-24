@@ -1,0 +1,10 @@
+# winget manifest, part 1 of 3 (version). Template: for each stable release
+# replace 0.1.0 in all three files and the hash in the installer file, then
+# submit them to microsoft/winget-pkgs under
+# manifests/t/TsenkoTsenkov/Skiff/<version>/ (packaging/README.md).
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
+PackageIdentifier: TsenkoTsenkov.Skiff
+PackageVersion: 0.1.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.9.0
