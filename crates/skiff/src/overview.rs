@@ -78,6 +78,49 @@ fn loading(snap: &Snapshot) -> bool {
     matches!(snap.state, LoadState::Connecting | LoadState::Loading)
 }
 
+/// Why a list has nothing to show, when it failed (no permission to list
+/// it, cluster unreachable): an empty list then means "unknown", never
+/// "all healthy". With the words and tone for its card.
+fn failure(snap: &Snapshot) -> Option<(&'static str, Tone)> {
+    if denied(snap) {
+        Some(("no access", Tone::Muted))
+    } else if snap.state == LoadState::Failed && snap.rows.is_empty() {
+        Some(("couldn't load", Tone::Err))
+    } else {
+        None
+    }
+}
+
+/// What the "Needs attention" block can say when it lists no problems.
+#[derive(Debug, PartialEq)]
+enum Verdict<'a> {
+    /// These lists failed to load, so their health is not known.
+    Unknown(Vec<&'a str>),
+    /// Everything the account can read has loaded; `unreadable` names the
+    /// lists it may not read (expected for an account limited to a
+    /// namespace, and no reason for a warning).
+    Clear { unreadable: Vec<&'a str> },
+    /// Still loading: nothing to say yet.
+    Waiting,
+}
+
+fn verdict<'a>(lists: &[(&'a str, &Snapshot)]) -> Verdict<'a> {
+    let names = |pick: &dyn Fn(&Snapshot) -> bool| -> Vec<&'a str> {
+        lists.iter().filter(|(_, s)| pick(s)).map(|(name, _)| *name).collect()
+    };
+    let unknown = names(&|s| !denied(s) && failure(s).is_some());
+    if !unknown.is_empty() {
+        return Verdict::Unknown(unknown);
+    }
+    let unreadable = names(&|s| denied(s));
+    let loaded = |s: &Snapshot| matches!(s.state, LoadState::Live | LoadState::Polling);
+    if unreadable.len() < lists.len() && lists.iter().all(|(_, s)| loaded(s) || denied(s)) {
+        Verdict::Clear { unreadable }
+    } else {
+        Verdict::Waiting
+    }
+}
+
 fn status_text<'a>(snap: &'a Snapshot, row: &'a Row) -> &'a str {
     snap.columns
         .iter()
@@ -354,11 +397,12 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
 
         ui.with_layout(Layout::left_to_right(Align::Min).with_main_wrap(true), |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            // A table the account may not read has no number to show.
-            let count = |snap: &Snapshot, n: usize| if denied(snap) { "—".to_string() } else { widgets::thousands(n) };
-            let no_access = ("no access".to_string(), Tone::Muted);
-            let (sub, tone) = if denied(nodes) {
-                no_access.clone()
+            // A table that could not be read (no access, or the list
+            // failed) has no number to show, and is not "all ready".
+            let count = |snap: &Snapshot, n: usize| if failure(snap).is_some() { "—".to_string() } else { widgets::thousands(n) };
+            let failed = |snap: &Snapshot| failure(snap).map(|(why, tone)| (why.to_string(), tone));
+            let (sub, tone) = if let Some(why) = failed(nodes) {
+                why
             } else if node_bad == 0 {
                 ("all ready".to_string(), Tone::Ok)
             } else {
@@ -373,12 +417,12 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
                 (e, 0) => (format!("{e} failing"), Tone::Err),
                 (e, w) => (format!("{e} failing, {w} pending"), Tone::Err),
             };
-            let (sub, tone) = if denied(pods) { no_access.clone() } else { (sub, tone) };
+            let (sub, tone) = failed(pods).unwrap_or((sub, tone));
             if card(ui, pal, "Pods", &count(pods, pod_rows.len()), &sub, tone, loading(pods)) {
                 action = Some(Action::Go(k_pods.clone()));
             }
-            let (sub, tone) = if denied(deploys) {
-                no_access.clone()
+            let (sub, tone) = if let Some(why) = failed(deploys) {
+                why
             } else if dep_bad == 0 {
                 ("all available".to_string(), Tone::Ok)
             } else {
@@ -387,8 +431,8 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
             if card(ui, pal, "Deployments", &count(deploys, dep_rows.len()), &sub, tone, loading(deploys)) {
                 action = Some(Action::Go(k_deploy.clone()));
             }
-            let (sub, tone) = if denied(events) {
-                no_access.clone()
+            let (sub, tone) = if let Some(why) = failed(events) {
+                why
             } else if warn_events.is_empty() {
                 ("no warnings".to_string(), Tone::Ok)
             } else {
@@ -450,10 +494,32 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
         ui.add_space(16.0);
         widgets::caption(ui, &format!("Needs attention · {}", problems.len()), pal);
         ui.add_space(4.0);
-        if problems.is_empty() {
+        // A list that failed says nothing about health, and one that is
+        // still loading does not yet: "nothing is failing" waits for both.
+        // A list the account may not read is expected, and no warning.
+        let lists: [(&str, &Snapshot); 4] =
+            [("nodes", nodes), ("pods", pods), ("deployments", deploys), ("events", events)];
+        let verdict = verdict(&lists);
+        if let Verdict::Unknown(unknown) = &verdict {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(widgets::icon(icons::ICON_ERROR, 16.0).color(pal.warn));
+                ui.label(
+                    RichText::new(format!(
+                        "Couldn't list {}, so this page can't say whether they are healthy.",
+                        unknown.join(", ")
+                    ))
+                    .color(pal.muted),
+                );
+            });
+        } else if let (true, Verdict::Clear { unreadable }) = (problems.is_empty(), &verdict) {
             ui.horizontal(|ui| {
                 ui.label(widgets::icon(icons::ICON_CHECK_CIRCLE, 16.0).color(pal.ok));
                 ui.label(RichText::new("Nothing is failing in the selected scope.").color(pal.muted));
+                if !unreadable.is_empty() {
+                    ui.label(
+                        RichText::new(format!("(No access to {}.)", unreadable.join(", "))).color(pal.faint).size(12.0),
+                    );
+                }
             });
         }
         for (key, snap, row) in problems.iter().take(40) {
@@ -519,6 +585,29 @@ pub fn show(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeSet<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_access_is_not_a_failed_list() {
+        let live = Snapshot::empty(LoadState::Live);
+        let loading = Snapshot::empty(LoadState::Loading);
+        let failed = |code| Snapshot { error_code: code, ..Snapshot::empty(LoadState::Failed) };
+        let (denied, broken) = (failed(403), failed(500));
+        // An account limited to a namespace can never list nodes: the page
+        // still says that what it can read is fine.
+        assert_eq!(
+            verdict(&[("nodes", &denied), ("pods", &live), ("events", &live)]),
+            Verdict::Clear { unreadable: vec!["nodes"] }
+        );
+        assert_eq!(verdict(&[("nodes", &live), ("pods", &live)]), Verdict::Clear { unreadable: vec![] });
+        // A list that failed for another reason is what is not known.
+        assert_eq!(
+            verdict(&[("nodes", &denied), ("pods", &broken), ("events", &live)]),
+            Verdict::Unknown(vec!["pods"])
+        );
+        assert_eq!(verdict(&[("nodes", &denied), ("pods", &loading)]), Verdict::Waiting);
+        // Nothing readable at all is not "nothing is failing".
+        assert_eq!(verdict(&[("nodes", &denied), ("pods", &denied)]), Verdict::Waiting);
+    }
 
     #[test]
     fn the_line_under_the_alerts_counts_what_is_not_listed() {

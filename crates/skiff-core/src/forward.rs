@@ -127,13 +127,20 @@ pub(crate) async fn start(
             let Some(fwd) = weak.upgrade() else { break };
             // A failed accept (out of file descriptors, a connection reset
             // before it was taken) must not end the forward for good.
-            let Ok((conn, _)) = accepted else {
-                if fwd.stopped.load(Ordering::SeqCst) {
-                    break;
+            let conn = match accepted {
+                Ok((conn, _)) => conn,
+                Err(e) => {
+                    if fwd.stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Say so, rather than a forward that looks active but
+                    // answers nothing.
+                    *fwd.last_error.lock() = Some(format!("accepting a connection failed: {e}"));
+                    notify.ping();
+                    drop(fwd);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
-                drop(fwd);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
             };
             {
                 let mut conns = fwd.conns.lock();

@@ -40,6 +40,8 @@ back after you edited it. There are no secrets in it.
 | `terminal` | text | Skiff picks one | The terminal app for "open in terminal": a name such as `iTerm`, `Ghostty` or `kitty`, or on Linux a program path. `$SKIFF_TERMINAL` wins over it. |
 | `theme` | `"dark"`, `"light"` or `"system"` | `"dark"` | The colours of the window. `"system"` follows the light or dark mode of your computer. |
 | `zoom` | number, 0.5 to 3.0 | `1.0` | Size of everything in the window. Also changed by the zoom shortcuts. |
+| `log_history` | number of lines, or `"all"` | `1000` | How many earlier lines a new log tab loads. Each log tab can still be given another amount while it is open. |
+| `clusters.<context>.hidden` | true or false | `false` | Leave this cluster out of the cluster menu and the command palette. The kubeconfig is not changed, and the cluster stays listed in Settings, Clusters. |
 | `clusters.<context>.read_only` | true or false | `false` | Refuse every change in this cluster: no edit, delete, scale or restart, and no new shell or port-forward. Shells and port-forwards that are already open keep running until closed. |
 | `clusters.<context>.confirm` | true or false | `false` | Ask before every change in this cluster, also for the ones that normally go ahead at once. |
 | `clusters.<context>.prometheus.namespace` | text | found automatically | Namespace of the Prometheus Service to chart from. Set namespace and service to skip the automatic search. |
@@ -62,8 +64,10 @@ A complete file using every key:
   "terminal": "iTerm",
   "theme": "system",
   "zoom": 1.0,
+  "log_history": 1000,
   "clusters": {
     "production": {
+      "hidden": false,
       "read_only": true,
       "confirm": true,
       "prometheus": {

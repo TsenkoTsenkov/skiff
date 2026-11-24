@@ -191,7 +191,9 @@ fn stopping_a_port_forward_closes_open_connections() {
         }
     };
     assert!(closed, "existing connection kept forwarding after stop");
-    assert!(std::net::TcpStream::connect(&addr).is_err(), "listener should be closed");
+    // (Stopping cancels the accept task; the socket is closed when that
+    // task is next polled, which is a moment later.)
+    wait_for("the listener to close", Duration::from_secs(2), || std::net::TcpStream::connect(&addr).is_err());
 }
 
 #[test]

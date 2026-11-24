@@ -407,6 +407,19 @@ impl Keymap {
         self.bindings(action).iter().any(|b| b.pressed_in(i))
     }
 
+    /// Whether the user's keymap binds `key` with these modifiers held to
+    /// any action: a built-in shortcut on the same keys then stands back.
+    pub fn binds(&self, key: Key, modifiers: Modifiers) -> bool {
+        self.bindings.values().flatten().any(|b| b.matches(key, modifiers))
+    }
+
+    /// Whether a press of `key` this frame belongs to the keymap.
+    pub fn claims(&self, i: &InputState, key: Key) -> bool {
+        i.events.iter().any(
+            |e| matches!(e, Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && self.binds(key, *modifiers)),
+        )
+    }
+
     /// Whether `ev` is a press of a key bound to `action`.
     pub fn is_event(&self, ev: &Event, action: Action) -> bool {
         matches!(ev, Event::Key { key, pressed: true, modifiers, .. }
@@ -479,6 +492,18 @@ mod tests {
         assert!(!map.is_event(&ev(Key::Questionmark, Modifiers::CTRL), Action::Help));
         // Not for ordinary keys: Shift+/ is not the filter key.
         assert!(!map.is_event(&ev(Key::Slash, Modifiers::SHIFT), Action::Filter));
+    }
+
+    #[test]
+    fn a_binding_on_the_find_keys_is_the_users() {
+        // What Ctrl+F arrives as on Linux and Windows.
+        let ctrl = Modifiers::CTRL | Modifiers::COMMAND;
+        assert!(!Keymap::default().binds(Key::F, ctrl), "the defaults leave Ctrl+F to find");
+        let (map, errors) = Keymap::from_json(r#"{"page_down": ["Ctrl+f"]}"#);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(map.binds(Key::F, ctrl));
+        assert!(!map.binds(Key::F, Modifiers::NONE));
+        assert!(!map.binds(Key::D, ctrl), "replaced, not added to");
     }
 
     #[test]

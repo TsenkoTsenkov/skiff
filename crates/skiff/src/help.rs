@@ -52,6 +52,7 @@ pub fn shortcuts(keymap: &Keymap, mac: bool) -> Vec<(Group, Vec<Shortcut>)> {
                 Group::Navigation => from_keymap(group).collect(),
                 Group::Tables => {
                     let mut list: Vec<Shortcut> = from_keymap(group).collect();
+                    list.push(fixed(&[&with_cmd("F")], "Filter the table (find)"));
                     list.push(fixed(&["Esc"], "Clear the filter"));
                     list
                 }
@@ -62,6 +63,7 @@ pub fn shortcuts(keymap: &Keymap, mac: bool) -> Vec<(Group, Vec<Shortcut>)> {
                     list
                 }
                 Group::Logs => vec![
+                    fixed(&[&with_cmd("F")], "Find in the logs"),
                     fixed(&["Enter"], "Next match, in the find box"),
                     fixed(&["Shift+Enter"], "Previous match"),
                 ],
@@ -71,6 +73,8 @@ pub fn shortcuts(keymap: &Keymap, mac: bool) -> Vec<(Group, Vec<Shortcut>)> {
                         fixed(&[copy], "Copy the selection"),
                         fixed(&[paste], "Paste"),
                         fixed(&["Shift+PgUp", "Shift+PgDn"], "Scroll back and forth"),
+                        // (Ctrl+F is the shell's own "forward one character".)
+                        fixed(&[if mac { "Cmd+F" } else { "Ctrl+Shift+F" }], "Find in the scrollback"),
                     ];
                     if !mac {
                         // Ctrl+K is the shell's own "delete to the end of the line".
@@ -201,6 +205,10 @@ mod tests {
         assert_eq!(find(&other, "Settings").keys, ["Ctrl+,"]);
         assert_eq!(find(&mac, "Copy the selection").keys, ["Cmd+C"]);
         assert_eq!(find(&other, "Copy the selection").keys, ["Ctrl+Shift+C"]);
+        assert_eq!(find(&mac, "Find in the logs").keys, ["Cmd+F"]);
+        assert_eq!(find(&other, "Filter the table (find)").keys, ["Ctrl+F"]);
+        assert_eq!(find(&mac, "Find in the scrollback").keys, ["Cmd+F"]);
+        assert_eq!(find(&other, "Find in the scrollback").keys, ["Ctrl+Shift+F"]);
         assert!(mac.iter().flat_map(|(_, l)| l).all(|s| s.what != "Search or jump, from a shell"));
     }
 }

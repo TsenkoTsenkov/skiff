@@ -197,6 +197,20 @@ pub const KEYS: &[KeyDoc] = &[
         doc: "Size of everything in the window. Also changed by the zoom shortcuts.",
     },
     KeyDoc {
+        key: "log_history",
+        kind: "number of lines, or \"all\"",
+        default: "1000",
+        doc: "How many earlier lines a new log tab loads. Each log tab can still be given another \
+              amount while it is open.",
+    },
+    KeyDoc {
+        key: "clusters.<context>.hidden",
+        kind: "true or false",
+        default: "false",
+        doc: "Leave this cluster out of the cluster menu and the command palette. The kubeconfig is \
+              not changed, and the cluster stays listed in Settings, Clusters.",
+    },
+    KeyDoc {
         key: "clusters.<context>.read_only",
         kind: "true or false",
         default: "false",
@@ -258,8 +272,10 @@ pub const EXAMPLE: &str = r#"{
   "terminal": "iTerm",
   "theme": "system",
   "zoom": 1.0,
+  "log_history": 1000,
   "clusters": {
     "production": {
+      "hidden": false,
       "read_only": true,
       "confirm": true,
       "prometheus": {
@@ -373,6 +389,30 @@ impl Theme {
     }
 }
 
+/// The most lines `log_history` can ask for; more than that is "all".
+pub const LOG_HISTORY_MAX: i64 = 1_000_000;
+
+/// How many earlier lines a new log tab loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LogHistory {
+    Lines(i64),
+    All,
+}
+
+impl LogHistory {
+    /// As the log reader wants it: `None` for everything.
+    pub fn tail(self) -> Option<i64> {
+        match self {
+            LogHistory::Lines(n) => Some(n),
+            LogHistory::All => None,
+        }
+    }
+
+    pub fn from_tail(tail: Option<i64>) -> LogHistory {
+        tail.map_or(LogHistory::All, LogHistory::Lines)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Updates {
     pub check: bool,
@@ -401,6 +441,8 @@ pub struct PrometheusOverride {
 /// The settings of one cluster (one kubeconfig context).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClusterConfig {
+    /// Left out of the cluster menu and the command palette.
+    pub hidden: bool,
     pub read_only: bool,
     pub confirm: bool,
     pub prometheus: Option<PrometheusOverride>,
@@ -415,6 +457,7 @@ struct Settings {
     terminal: Option<String>,
     theme: Option<Theme>,
     zoom: Option<f32>,
+    log_history: Option<LogHistory>,
     clusters: BTreeMap<String, ClusterConfig>,
 }
 
@@ -524,6 +567,11 @@ impl Config {
         self.settings.zoom
     }
 
+    /// How much history a new log tab loads, if the file says.
+    pub fn log_history(&self) -> Option<LogHistory> {
+        self.settings.log_history
+    }
+
     /// The settings of the cluster behind kubeconfig context `context`
     /// (the defaults when the file has none).
     pub fn cluster(&self, context: &str) -> ClusterConfig {
@@ -603,6 +651,21 @@ impl Config {
         // (1.100000023841858) out of the file.
         let z = (f64::from(zoom.clamp(ZOOM_MIN, ZOOM_MAX)) * 100.0).round() / 100.0;
         self.edit(&["zoom"], Some(json!(z)));
+    }
+
+    /// Sets how much history a new log tab loads.
+    pub fn set_log_history(&mut self, history: LogHistory) {
+        let value = match history {
+            LogHistory::Lines(n) => json!(n.clamp(1, LOG_HISTORY_MAX)),
+            LogHistory::All => json!("all"),
+        };
+        self.edit(&["log_history"], Some(value));
+    }
+
+    /// Hides a cluster from the cluster menu and the palette, or shows it
+    /// again (which removes the key: shown is the default).
+    pub fn set_hidden(&mut self, context: &str, hidden: bool) {
+        self.edit(&["clusters", context, "hidden"], hidden.then_some(Value::Bool(true)));
     }
 
     pub fn set_read_only(&mut self, context: &str, read_only: bool) {
@@ -892,6 +955,27 @@ fn interpret(raw: &Map<String, Value>, warnings: &mut Vec<String>) -> Settings {
         )),
     }
 
+    match raw.get("log_history") {
+        None => {}
+        Some(Value::String(word)) if word.trim().eq_ignore_ascii_case("all") => s.log_history = Some(LogHistory::All),
+        Some(Value::Number(n)) => match n.as_i64().filter(|n| *n >= 1) {
+            Some(n) => {
+                if n > LOG_HISTORY_MAX {
+                    warnings.push(format!("log_history: {n} is more than {LOG_HISTORY_MAX}; using {LOG_HISTORY_MAX}"));
+                }
+                s.log_history = Some(LogHistory::Lines(n.min(LOG_HISTORY_MAX)));
+            }
+            None => warnings.push("log_history: should be a whole number of lines, 1 or more, or \"all\"; ignored".into()),
+        },
+        Some(other) => warnings.push(format!(
+            "log_history: should be a number of lines or \"all\", not {}; ignored",
+            match other {
+                Value::String(_) => "other text",
+                v => kind_of(v),
+            }
+        )),
+    }
+
     match raw.get("clusters") {
         None => {}
         Some(Value::Object(clusters)) => {
@@ -921,6 +1005,7 @@ fn interpret(raw: &Map<String, Value>, warnings: &mut Vec<String>) -> Settings {
 fn interpret_cluster(c: &Map<String, Value>, label: &str, warnings: &mut Vec<String>) -> ClusterConfig {
     warn_unknown(c, "clusters.<context>", label, warnings);
     let mut out = ClusterConfig {
+        hidden: read_bool(c, "hidden", &format!("{label}.hidden"), warnings).unwrap_or(false),
         read_only: read_bool(c, "read_only", &format!("{label}.read_only"), warnings).unwrap_or(false),
         confirm: read_bool(c, "confirm", &format!("{label}.confirm"), warnings).unwrap_or(false),
         ..Default::default()
@@ -1192,10 +1277,12 @@ mod tests {
         assert_eq!(config.updates(), Updates { check: true, channel: Channel::Stable });
         assert_eq!(config.terminal(), Some("iTerm"));
         assert_eq!(config.zoom(), Some(1.0));
+        assert_eq!(config.log_history(), Some(LogHistory::Lines(1000)));
         assert_eq!(config.cluster_names().collect::<Vec<_>>(), ["production"]);
         assert_eq!(
             config.cluster("production"),
             ClusterConfig {
+                hidden: false,
                 read_only: true,
                 confirm: true,
                 prometheus: Some(PrometheusOverride {
@@ -1244,9 +1331,9 @@ mod tests {
 
     #[test]
     fn known_keys_come_from_the_docs() {
-        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "theme", "zoom", "clusters"]);
+        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "theme", "zoom", "log_history", "clusters"]);
         assert_eq!(known_keys("updates"), ["check", "channel"]);
-        assert_eq!(known_keys("clusters.<context>"), ["read_only", "confirm", "prometheus", "grafana_url"]);
+        assert_eq!(known_keys("clusters.<context>"), ["hidden", "read_only", "confirm", "prometheus", "grafana_url"]);
         assert_eq!(
             known_keys("clusters.<context>.prometheus"),
             ["namespace", "service", "port", "scheme", "path_prefix"]
@@ -1419,6 +1506,35 @@ mod tests {
         c.remove_kubeconfig("~/b");
         assert_eq!(c.kubeconfigs(), None);
         assert!(!c.raw.contains_key("kubeconfigs"));
+    }
+
+    #[test]
+    fn log_history_is_a_number_of_lines_or_all() {
+        assert_eq!(Config::from_json(r#"{"log_history": 250}"#).0.log_history(), Some(LogHistory::Lines(250)));
+        assert_eq!(Config::from_json(r#"{"log_history": "all"}"#).0.log_history(), Some(LogHistory::All));
+        assert_eq!(Config::default().log_history(), None);
+        for bad in [r#"{"log_history": 0}"#, r#"{"log_history": -5}"#, r#"{"log_history": 1.5}"#, r#"{"log_history": "lots"}"#, r#"{"log_history": true}"#] {
+            assert_eq!(one_warning(bad, "log_history", "ignored").log_history(), None, "{bad}");
+        }
+        let big = one_warning(r#"{"log_history": 99999999}"#, "log_history", "more than");
+        assert_eq!(big.log_history(), Some(LogHistory::Lines(LOG_HISTORY_MAX)));
+        let mut config = Config::default();
+        config.set_log_history(LogHistory::All);
+        assert_eq!(config.log_history().map(LogHistory::tail), Some(None));
+        config.set_log_history(LogHistory::from_tail(Some(100)));
+        assert_eq!(config.log_history(), Some(LogHistory::Lines(100)));
+    }
+
+    #[test]
+    fn hiding_a_cluster_is_a_key_that_goes_away_again() {
+        let mut config = Config::default();
+        config.set_hidden("staging", true);
+        assert!(config.cluster("staging").hidden);
+        assert!(!config.cluster("other").hidden);
+        config.set_hidden("staging", false);
+        assert!(!config.cluster("staging").hidden);
+        assert_eq!(lookup(&config.raw, &["clusters", "staging", "hidden"]), None);
+        one_warning(r#"{"clusters": {"a": {"hidden": "yes"}}}"#, "clusters.a.hidden", "true or false");
     }
 
     #[test]

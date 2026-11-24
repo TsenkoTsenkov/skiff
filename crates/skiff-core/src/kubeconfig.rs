@@ -283,6 +283,33 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Files in `~/.kube` that look like kubeconfigs and are not among the
+/// ones `sources` reads: what a settings page can offer to add. Only looks
+/// directly in that folder, and only at small files.
+pub fn suggestions(sources: &KubeconfigSources) -> Vec<PathBuf> {
+    match home_dir() {
+        Some(home) => suggestions_in(&home.join(".kube"), &sources.resolve()),
+        None => Vec::new(),
+    }
+}
+
+fn suggestions_in(dir: &Path, in_use: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && !in_use.contains(p))
+        .filter(|p| {
+            // Small YAML files that mention clusters and contexts.
+            std::fs::metadata(p).map(|m| m.len() < 4 << 20).unwrap_or(false)
+                && std::fs::read_to_string(p).map(|t| t.contains("clusters:") && t.contains("contexts:")).unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn default_paths() -> Vec<PathBuf> {
     paths_from_env(std::env::var_os("KUBECONFIG"), home_dir())
 }
@@ -493,6 +520,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn kubeconfigs_in_a_folder_are_suggested_unless_in_use() {
+        let dir = TempDir::new("suggest");
+        let used = dir.write("config", "clusters: []\ncontexts: []\n");
+        let other = dir.write("staging.yaml", "clusters: []\ncontexts: []\n");
+        dir.write("notes.txt", "not a kubeconfig");
+        dir.write("cache/discovery", "clusters: contexts:");
+        assert_eq!(suggestions_in(&dir.0, std::slice::from_ref(&used)), std::slice::from_ref(&other));
+        assert_eq!(suggestions_in(&dir.0, &[]), [used, other]);
+        assert!(suggestions_in(&dir.0.join("missing"), &[]).is_empty());
     }
 
     fn config(context: &str, cluster: &str, server: &str, extra_cluster: &str, user_body: &str) -> String {

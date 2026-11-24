@@ -9,6 +9,7 @@ in [configuration.md](configuration.md#which-kubeconfig-files-are-read).
 - [Cloud clusters and single sign-on](#cloud-clusters-and-single-sign-on)
 - [Troubleshooting a connection](#troubleshooting-a-connection)
 - [Proxies](#proxies)
+- [Managing clusters](#managing-clusters)
 - [Read-only clusters](#read-only-clusters)
 - [Accounts limited to a namespace](#accounts-limited-to-a-namespace)
 - [When the network misbehaves](#when-the-network-misbehaves)
@@ -95,6 +96,17 @@ server's identity is not checked.
 
 Prometheus needs no proxy settings of its own: it is reached through the
 API server.
+
+## Managing clusters
+
+Settings → Clusters lists every context of your kubeconfig files with its
+connection state, and for each one: open it, reconnect (which also picks
+up new credentials), disconnect, and **hide** it. A hidden cluster is left
+out of the cluster menu and the command palette (`"hidden": true` under
+`clusters.<context>` in `config.json`); the kubeconfig is not changed, and
+"Manage clusters…" at the bottom of the cluster menu says how many are
+hidden. Kubeconfig files found in `~/.kube` that Skiff does not read yet
+are offered next to "Add file…".
 
 ## Read-only clusters
 

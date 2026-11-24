@@ -10,6 +10,39 @@ here.
 
 ## [Unreleased]
 
+### Added
+
+- **Column filters** in the table filter: `node:worker-1`, `status:crash`,
+  `ns:kube`, `label:app=web`. A column title can be shortened to any
+  prefix, `column:=value` matches the whole value and a leading `!` leaves
+  the matches out.
+- **Find shortcuts**: `Ctrl/Cmd+F` filters the table, or finds in the log
+  tab you are working in. Shells search their scrollback with `Cmd+F` on
+  macOS and `Ctrl+Shift+F` elsewhere.
+- **"Show pods"** on a node or a namespace (right-click, or the node's
+  detail panel) opens the pods table filtered to it.
+- **Settings**: log history for new log tabs (`log_history` in
+  `config.json`) and "Reset all" table columns in Appearance; in Clusters,
+  each cluster's connection state with open, reconnect, disconnect and
+  hide from the cluster menu (`clusters.<context>.hidden`), and the
+  kubeconfig files found in `~/.kube` offered next to "Add file…"; frame
+  time, memory and open connections in About.
+
+### Changed
+
+- **Table columns** are sized to their content, and the less important
+  ones drop out when the window is narrow. Dragging a column edge works
+  like a splitter and holds; double-click resets it. The columns and
+  widths you choose are remembered between runs.
+
+### Fixed
+
+- The overview no longer says "all ready" or "nothing is failing" for a
+  list that could not be loaded, or while lists are still loading.
+- A Secret's overview no longer shows the
+  `kubectl.kubernetes.io/last-applied-configuration` annotation, which can
+  hold the secret's values in plain text.
+
 ## [0.1.0] - 2026-11-24
 
 The first stable release, and the first version meant for people other

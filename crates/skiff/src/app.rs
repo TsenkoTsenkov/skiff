@@ -105,6 +105,16 @@ struct Saved {
     sidebar_closed: bool,
     /// The first-run hint about the palette and `?` has done its job.
     hint_seen: bool,
+    /// Column choices and widths, by resource id (window state, like the
+    /// sidebar: not a setting of config.json).
+    columns: HashMap<String, SavedColumns>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
+struct SavedColumns {
+    visible: HashMap<String, bool>,
+    widths: HashMap<String, f32>,
 }
 
 /// How long a secret copied from Skiff stays on the clipboard.
@@ -305,6 +315,9 @@ pub struct ForwardDialog {
 pub struct SkiffApp {
     core: Core,
     pub pal: Palette,
+    /// Every context of the kubeconfig files. The cluster menu and the
+    /// palette show [`SkiffApp::menu_contexts`], which leaves out the ones
+    /// hidden in Settings.
     pub contexts: Contexts,
     /// The config file. Read it with [`SkiffApp::config`], change it with
     /// [`SkiffApp::edit_config`] (which saves and applies it).
@@ -648,6 +661,14 @@ impl SkiffApp {
         } else {
             config_sources(&config)
         });
+        let mut tables: HashMap<String, TableUi> = HashMap::new();
+        for (id, cols) in saved.columns {
+            let t = tables.entry(id).or_default();
+            t.col_visible = cols.visible;
+            t.widths = cols.widths;
+        }
+        // (`apply_config` sets the log history a new tab loads.)
+        let dock = Dock::default();
         let mut app = SkiffApp {
             core,
             pal,
@@ -670,10 +691,10 @@ impl SkiffApp {
             ns_filter: BTreeSet::new(),
             saved_ns: saved.namespaces,
             ns_search: String::new(),
-            tables: HashMap::new(),
+            tables,
             cache: ViewCache::default(),
             detail: None,
-            dock: Dock::default(),
+            dock,
             updater: Default::default(),
             update_check_asked: false,
             palette: None,
@@ -726,6 +747,7 @@ impl SkiffApp {
             .context
             .or(saved.context.filter(known))
             .or(app.contexts.current.clone().filter(known))
+            .or(app.contexts.items.iter().find(|c| !app.config.cluster(&c.name).hidden).map(|c| c.name.clone()))
             .or(app.contexts.items.first().map(|c| c.name.clone()));
         if let Some(c) = initial {
             app.switch_context(&c);
@@ -749,8 +771,28 @@ impl SkiffApp {
             namespaces: self.saved_ns.clone(),
             sidebar_closed: !self.sidebar_open,
             hint_seen: self.hint_seen,
+            columns: self
+                .tables
+                .iter()
+                .filter(|(_, t)| !t.col_visible.is_empty() || !t.widths.is_empty())
+                .map(|(id, t)| (id.clone(), SavedColumns { visible: t.col_visible.clone(), widths: t.widths.clone() }))
+                .collect(),
         };
         eframe::set_value(storage, "skiff", &saved);
+    }
+
+    /// Whether the cluster menu and the palette offer this context: not
+    /// when it is hidden in Settings, unless it is the open one (the menu
+    /// never hides where you are).
+    fn in_menu(&self, context: &str) -> bool {
+        !self.config.cluster(context).hidden || self.active.as_deref() == Some(context)
+    }
+
+    /// The contexts the cluster menu and the palette offer.
+    pub fn menu_contexts(&self) -> Contexts {
+        let mut visible = self.contexts.clone();
+        visible.items.retain(|c| self.in_menu(&c.name));
+        visible
     }
 
     pub fn session(&self) -> Option<&Arc<Session>> {
@@ -925,12 +967,31 @@ impl SkiffApp {
         };
         self.updater.configure(updates.check, channel);
         crate::external::set_preferred_terminal(self.config.terminal());
+        self.dock.default_tail = self.log_history();
         for (name, session) in &self.sessions {
             session.set_read_only(self.cluster_read_only(name));
             session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
         }
         self.ctx.set_zoom_factor(self.zoom());
         self.sync_theme();
+    }
+
+    /// Earlier lines a new log tab loads (`None`: all of them).
+    pub fn log_history(&self) -> Option<i64> {
+        self.config.log_history().map_or(skiff_core::LogOptions::default().tail, |h| h.tail())
+    }
+
+    /// Every table back to its default columns and widths.
+    pub fn reset_all_columns(&mut self) {
+        for t in self.tables.values_mut() {
+            t.reset_columns();
+        }
+    }
+
+    /// Hides a cluster from the cluster menu and the palette (or shows it
+    /// again) and saves that in the config file.
+    pub fn set_cluster_hidden(&mut self, context: &str, hidden: bool) {
+        self.edit_config(|c| c.set_hidden(context, hidden));
     }
 
     // ------------------------------------------------------------------
@@ -1155,7 +1216,13 @@ impl SkiffApp {
         let removable = self.kube_source() == settings::KubeSource::ConfigFile;
         let fresh = self.settings.as_ref()?.kube.as_ref().is_some_and(|(g, _)| *g == generation);
         if !fresh {
-            let kube = settings::kube_model(&self.core.kubeconfig_sources(), &self.kube, &self.contexts, removable);
+            let sources = self.core.kubeconfig_sources();
+            let mut kube = settings::kube_model(&sources, &self.kube, &self.contexts, removable);
+            // (Not for --kubeconfig, which is for one run, and never the
+            // user's own folder in a headless run.)
+            if !self.cli_kubeconfigs && !self.headless {
+                kube.suggestions = skiff_core::kubeconfig::suggestions(&sources);
+            }
             self.settings.as_mut()?.kube = Some((generation, Arc::new(kube)));
         }
         let kube = self.settings.as_ref()?.kube.as_ref()?.1.clone();
@@ -1165,9 +1232,20 @@ impl SkiffApp {
             .iter()
             .map(|c| {
                 let cluster = self.config.cluster(&c.name);
+                let session = self.sessions.get(&c.name);
+                let state = match session.map(|s| s.status()).as_deref() {
+                    Some(ConnStatus::Connected { version }) => settings::ClusterState::Connected(version.clone()),
+                    Some(ConnStatus::Connecting) => settings::ClusterState::Connecting,
+                    Some(ConnStatus::Failed(err)) => settings::ClusterState::Failed(
+                        session.and_then(|s| s.failure()).map(|info| info.summary).unwrap_or_else(|| err.clone()),
+                    ),
+                    None => settings::ClusterState::NotConnected,
+                };
                 settings::ClusterRow {
                     name: c.name.clone(),
                     active: self.active.as_deref() == Some(c.name.as_str()),
+                    state,
+                    hidden: cluster.hidden,
                     read_only: self.cluster_read_only(&c.name),
                     confirm: cluster.confirm,
                     plugin: c.exec_command.clone(),
@@ -1179,6 +1257,8 @@ impl SkiffApp {
             theme: self.theme_choice(),
             system_dark: self.ctx.system_theme().map(|t| t == egui::Theme::Dark),
             zoom: self.zoom(),
+            log_history: self.log_history(),
+            tables_customised: self.tables.values().filter(|t| !t.col_visible.is_empty() || !t.widths.is_empty()).count(),
             kube_source: self.kube_source(),
             kube,
             clusters,
@@ -1191,6 +1271,9 @@ impl SkiffApp {
             config_path: self.config.path().map(Path::to_path_buf),
             keys_path: self.keys_path(),
             mac: self.ctx.os() == egui::os::OperatingSystem::Mac,
+            frame_time: self.last_ui,
+            memory: resident_memory(),
+            connections: (self.sessions.len(), self.sessions.values().map(|s| s.active_watches()).sum()),
         })
     }
 
@@ -1211,12 +1294,40 @@ impl SkiffApp {
                 }
                 A::SetTheme(theme) => self.choose_theme(theme),
                 A::SetZoom(zoom) => self.set_zoom(zoom),
+                A::SetLogHistory(tail) => {
+                    self.edit_config(|c| c.set_log_history(crate::config::LogHistory::from_tail(tail)));
+                }
+                A::ResetColumns => {
+                    self.reset_all_columns();
+                    self.toast("Every table is back to its default columns", Tone::Normal);
+                }
                 A::AddKubeconfig => self.ask_for_kubeconfig(ctx),
+                A::AddKubeconfigPath(path) => {
+                    if let Err(e) = self.add_kubeconfig(&path) {
+                        self.toast(e, Tone::Err);
+                    }
+                }
                 A::RemoveKubeconfig(entry) => self.remove_kubeconfig(&entry),
                 A::ResetKubeconfigs => self.reset_kubeconfigs(),
                 A::ReloadKubeconfig => self.reload_kubeconfig(true),
                 A::SetReadOnly(context, on) => self.set_read_only(&context, on),
                 A::SetConfirm(context, on) => self.set_confirm(&context, on),
+                A::SetHidden(context, on) => self.set_cluster_hidden(&context, on),
+                // (Opening closes the window: the cluster is what the
+                // user asked to see. An unsaved edit keeps both.)
+                A::OpenCluster(context) => {
+                    self.switch_context(&context);
+                    if self.active.as_deref() == Some(context.as_str()) && !covered {
+                        self.settings = None;
+                    }
+                }
+                A::Reconnect(context) => {
+                    if let Some(s) = self.sessions.get(&context) {
+                        s.reconnect();
+                        self.toast(format!("Reconnecting to {context}"), Tone::Normal);
+                    }
+                }
+                A::Disconnect(context) => self.disconnect(&context),
                 A::SetUpdateCheck(on) => self.edit_config(|c| c.set_update_check(on)),
                 A::SetChannel(channel) => self.edit_config(|c| c.set_update_channel(channel)),
                 A::CheckForUpdates => self.run_command(ctx, Command::CheckForUpdates),
@@ -1625,6 +1736,12 @@ impl SkiffApp {
         self.row_at(self.cache.position(uid)?)
     }
 
+    /// The quick filter of the current table (for tests and diagnostics).
+    pub fn table_filter(&self) -> String {
+        let View::Resource(key) = &self.view else { return String::new() };
+        self.tables.get(&key.id()).map(|t| t.filter.clone()).unwrap_or_default()
+    }
+
     /// Time the last filter + sort pass took.
     pub fn last_table_cost(&self) -> Duration {
         self.cache.last_cost()
@@ -1957,6 +2074,7 @@ impl SkiffApp {
                     local: String::new(),
                 }));
             }
+            RowAction::ShowPods => self.show_pods_of(key, name),
             RowAction::Cordon | RowAction::Uncordon => {
                 let on = action == RowAction::Cordon;
                 self.pending.push(Pending::Simple {
@@ -1971,6 +2089,25 @@ impl SkiffApp {
                     ok: format!("{} {name}", if on { "Suspended" } else { "Resumed" }),
                 });
             }
+        }
+    }
+
+    /// Opens the pods table showing the pods on a node (by an exact match on
+    /// the Node column) or in a namespace (by the namespace filter).
+    pub fn show_pods_of(&mut self, key: &ResourceKey, name: &str) {
+        let pods = kinds::pods();
+        if self.blocked_by_edit() {
+            return;
+        }
+        self.detail = None;
+        self.view = View::Resource(pods.clone());
+        let tui = self.tables.entry(pods.id()).or_default();
+        tui.selected = None;
+        if key.is("", "nodes") {
+            tui.filter = format!("node:={name}");
+        } else if key.is("", "namespaces") {
+            tui.filter.clear();
+            self.ns_filter = BTreeSet::from([name.to_string()]);
         }
     }
 
@@ -2316,6 +2453,16 @@ impl SkiffApp {
                 None => self.open_settings(Section::default()),
             }
         }
+        // Under a window, dialog or menu nothing is found in: the find
+        // shortcuts are taken, so that the dock below does not open its
+        // find box behind it.
+        if self.overlay_open(ctx) {
+            let shell_find = crate::shell::find_shortcut(ctx);
+            ctx.input_mut(|i| {
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F));
+                i.consume_shortcut(&shell_find);
+            });
+        }
         // Keys belong to whatever is on top: a text field, the terminal, a
         // dialog, the palette, or an open menu / popup.
         let busy = self.overlay_open(ctx) || self.terminal_focused || ctx.text_edit_focused();
@@ -2338,6 +2485,19 @@ impl SkiffApp {
             if elsewhere || !self.sidebar_open {
                 self.nav_focus = NavFocus::Main;
             }
+        }
+        // Cmd/Ctrl+F finds in the table, unless the user is working in the
+        // dock (logs, a shell), which then takes it. A keys.json binding
+        // on the same keys wins: it is the user's own choice.
+        let find = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+        if matches!(self.view, View::Resource(_))
+            && self.session().is_some()
+            && !self.dock.has_attention()
+            && !ctx.input(|i| self.keymap.claims(i, Key::F))
+            && ctx.input_mut(|i| i.consume_shortcut(&find))
+        {
+            self.focus_filter = true;
+            self.nav_focus = NavFocus::Main;
         }
         // Only where a filter box is actually drawn.
         if ctx.input(|i| self.keymap.pressed(i, Action::Filter))
@@ -2706,13 +2866,14 @@ impl SkiffApp {
         let mut disconnect = None;
         let mut read_only: Option<bool> = None;
         let mut ask_first: Option<bool> = None;
-        let (mut add_file, mut reload) = (false, false);
+        let (mut add_file, mut reload, mut manage) = (false, false, false);
+        // (Clusters hidden in Settings are left out.)
+        let shown: Vec<&skiff_core::ContextInfo> = self.contexts.items.iter().filter(|c| self.in_menu(&c.name)).collect();
+        let hidden = self.contexts.items.len() - shown.len();
         // The longest context name decides the width, within limits. The
         // width is fixed for the whole menu: rows that size themselves from
         // the space left over would make the popup grow on every frame.
-        let longest = self
-            .contexts
-            .items
+        let longest = shown
             .iter()
             .map(|c| {
                 ui.painter()
@@ -2743,7 +2904,7 @@ impl SkiffApp {
                 egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, true]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     let row_width = ui.available_width();
-                    for c in &self.contexts.items {
+                    for c in &shown {
                         let is_active = self.active.as_deref() == Some(c.name.as_str());
                         let session = self.sessions.get(&c.name);
                         let connected = session.map(|s| s.status());
@@ -2845,6 +3006,17 @@ impl SkiffApp {
                     reload = true;
                     ui.close();
                 }
+                let label = match hidden {
+                    0 => "Manage clusters…".to_string(),
+                    n => format!("Manage clusters… ({n} hidden)"),
+                };
+                if item(ui, icons::ICON_SETTINGS, &label)
+                    .on_hover_text("Settings, Clusters: kubeconfig files, hiding clusters from this menu, protection")
+                    .clicked()
+                {
+                    manage = true;
+                    ui.close();
+                }
             });
         if let Some(c) = switch_to {
             self.switch_context(&c);
@@ -2863,6 +3035,9 @@ impl SkiffApp {
         }
         if reload {
             self.reload_kubeconfig(true);
+        }
+        if manage {
+            self.open_settings(Section::Clusters);
         }
     }
 
@@ -3352,12 +3527,14 @@ impl SkiffApp {
                             .on_hover_text("Default columns and widths")
                             .clicked()
                         {
-                            tui.col_visible.clear();
-                            tui.widths_generation = tui.widths_generation.wrapping_add(1);
+                            tui.reset_columns();
                         }
                     });
                 let id = egui::Id::unique("table-filter");
-                let filter = widgets::search_box(ui, &mut tui.filter, "Filter  ( / )", 240.0, id);
+                let filter = widgets::search_box(ui, &mut tui.filter, "Filter  ( / )", 240.0, id).on_hover_text(
+                    "Words match anywhere in a row. Column filters: node:worker-1, status:crash, ns:kube, label:app=web\n\
+                     column:=value matches the whole value; !word or !column:value leaves matches out.",
+                );
                 if self.focus_filter {
                     self.focus_filter = false;
                     filter.request_focus();
@@ -3465,7 +3642,9 @@ impl SkiffApp {
             }
         }
 
-        let cols = table_view::display_columns(key, &snap, tui, &metrics, ui.available_width());
+        table_view::fit_widths(ui, key, &self.cache, tui);
+        let gap = ui.spacing().item_spacing.x;
+        let cols = table_view::layout_columns(key, &snap, tui, &metrics, ui.available_width(), gap);
         let now = skiff_core::now_unix();
         let out = table_view::show(ui, &pal, key, &self.cache, tui, &cols, &metrics, now, locked.as_deref());
         self.tick = self.tick.min(table_view::age_tick(out.youngest));
@@ -3589,9 +3768,14 @@ impl SkiffApp {
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
+        if self.palette.is_none() {
+            return;
+        }
+        // (Clusters hidden in Settings are not offered.)
+        let shown = self.menu_contexts();
         let Some(state) = &mut self.palette else { return };
         let session = self.active.as_ref().and_then(|c| self.sessions.get(c)).cloned();
-        match palette::show(ctx, &self.pal, state, &self.contexts, self.active.as_deref(), session.as_ref()) {
+        match palette::show(ctx, &self.pal, state, &shown, self.active.as_deref(), session.as_ref()) {
             palette::Outcome::Open => {}
             palette::Outcome::Close => self.palette = None,
             palette::Outcome::Run(cmd) => {
@@ -4215,6 +4399,43 @@ impl eframe::App for SkiffApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         SkiffApp::save(self, storage);
+    }
+}
+
+/// Memory the process holds in RAM (resident set), when the platform says.
+pub fn resident_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages * 4096)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `ps` is cheap enough when asked rarely; cached for a few seconds.
+        use std::sync::Mutex;
+        static CACHE: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().ok()?;
+        if let Some((at, v)) = *cache {
+            if at.elapsed() < Duration::from_secs(5) {
+                return v;
+            }
+        }
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok();
+        let v = out
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|t| t.trim().parse::<u64>().ok())
+            .map(|kb| kb * 1024);
+        *cache = Some((Instant::now(), v));
+        v
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
     }
 }
 

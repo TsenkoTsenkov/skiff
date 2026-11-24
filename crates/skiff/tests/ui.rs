@@ -372,6 +372,7 @@ fn restricted_account_can_work_in_its_namespace() {
     let pods = kubectl(&["-n", &ns, "get", "pods", "-o", "name"]).lines().count();
     assert!(has_label(&h, &pods.to_string()), "the pods card counts the namespace's {pods} pods");
     assert!(has_label(&h, "no access"), "what cannot be read (nodes) says so rather than showing 0");
+    assert!(!has_label_containing(&h, "Couldn't list"), "no access is expected here, not a failure to warn about");
     shot(&mut h, "46_restricted_overview");
 
     // Without a namespace there is nothing to count: the overview says
@@ -2224,7 +2225,12 @@ fn pod_metrics_come_from_prometheus_through_the_api_server() {
             steps(&mut h, 2);
 
             // Another range loads its own data and is remembered.
-            h.get_by_label("24h").click();
+            // (The range button, not the Age cell of a pod that happens to
+            // be 24 hours old: the details panel is the rightmost.)
+            h.get_all_by_label("24h")
+                .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+                .expect("the 24h range button")
+                .click();
             settle(&mut h, "the 24h range", |h| has_label_containing(h, "one point every 15 min"));
             shot(&mut h, "83_pod_metrics_24h");
             h.get_by_label("7d").click();

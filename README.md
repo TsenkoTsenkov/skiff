@@ -152,8 +152,16 @@ of `config.json` is in [docs/configuration.md](docs/configuration.md).
 ## Features
 
 - **Every resource type** the cluster serves, custom resources included,
-  with live updates, instant filter (`/`), sortable columns and a column
-  chooser
+  with live updates, instant filter (`/` or `Ctrl/Cmd+F`), sortable columns
+  and a column chooser. Columns are sized to their content; drag one wider
+  or narrower (double-click its edge for the default width), and the
+  columns and widths you chose are remembered
+- **Column filters** in the filter box: `node:worker-1`, `status:crash`,
+  `ns:kube`, `label:app=web`. A column title can be shortened to any
+  prefix, `:=` asks for the whole value (`node:=worker-1` leaves out
+  `worker-10`) and `!` keeps the rows that do not match (`!status:running`)
+- **Pods by node or namespace**: "Show pods" on a node or namespace
+  (right-click, or the detail panel) opens the pods table filtered to it
 - **Several clusters**: switch between kubeconfig contexts; connections
   stay warm. Namespace filter, one or many, remembered per cluster
 - **Details** for each object: tailored summaries, conditions, related
@@ -162,9 +170,11 @@ of `config.json` is in [docs/configuration.md](docs/configuration.md).
   underneath your edit; create or update from a manifest with server-side
   apply, which reports field conflicts instead of overriding them
 - **Logs**: follow, merge the pods of a workload, timestamps, previous
-  container, find with highlighted matches
+  container, find (`Ctrl/Cmd+F`) with highlighted matches
 - **Shell** in any container, in a built-in terminal or in your own
-  terminal app; **port forwarding** for pods and services
+  terminal app, with find in the scrollback (`Cmd+F` on macOS,
+  `Ctrl+Shift+F` elsewhere, since `Ctrl+F` belongs to the shell);
+  **port forwarding** for pods and services
 - **Metrics**: CPU, memory, network and restart charts for pods, workloads
   and nodes from the Prometheus already in your cluster, with no extra
   credentials; a short history from metrics-server where there is none
@@ -175,7 +185,9 @@ of `config.json` is in [docs/configuration.md](docs/configuration.md).
 - **Actions**: scale, restart, cordon and uncordon, suspend and resume
   cron jobs, delete
 - **Settings** window (`Ctrl/Cmd+,`): theme (dark, light or follow the
-  system), zoom, kubeconfig files, update channel, terminal app
+  system), zoom, log history, kubeconfig files (those found in `~/.kube`
+  are offered), the clusters with their connection state (open, reconnect,
+  disconnect, hide from the menu), update channel, terminal app
 - Vim-style keyboard navigation with [custom bindings](docs/keyboard.md#changing-the-keys)
 
 | | |

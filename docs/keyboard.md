@@ -45,10 +45,29 @@ kubeconfig file…", "Check for updates" and making a cluster read-only.
 
 | Key | Action |
 | --- | --- |
-| `/` | Filter the table |
+| `/` or `Ctrl+F` | Filter the table |
 | `Esc` | Clear the filter |
 
-Right-click a row for its actions.
+`Ctrl+F` is for the table unless you are working in the dock: after a
+click in a log tab it opens that tab's find box instead. If your
+`keys.json` binds `Ctrl+F` to something, the table does that instead and
+`/` remains the way to the filter.
+
+Words in the filter match anywhere in a row. A word of the form
+`column:text` looks in one column only: `node:worker-1`, `status:crash`,
+`ns:kube`, `label:app=web`. The column title can be shortened to any
+prefix. `column:=text` matches the whole value (`node:=worker-1` leaves
+out `worker-10`), and a leading `!` keeps the rows that do not match
+(`!status:running`). In front of a column filter `-` does the same
+(`-ns:kube`); in front of a plain word it is part of the word, so `-prod`
+finds `api-prod`.
+
+Right-click a row for its actions. On a node or a namespace, "Show pods"
+opens the pods table filtered to it.
+
+Drag the edge of a column header to change its width; double-click the
+edge for the default width. The widths and the columns you chose are
+remembered; Settings → Appearance resets all of them.
 
 ## Details and YAML
 
@@ -62,6 +81,7 @@ Right-click a row for its actions.
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+F` | Find in the log tab you are working in |
 | `Enter` | In the find box: next match |
 | `Shift+Enter` | In the find box: previous match |
 
@@ -74,6 +94,7 @@ Every key goes to the shell, including `Esc`, `Tab`, `Ctrl+K` and
 | --- | --- |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` (also `Ctrl+V`) | Copy the selection / paste. On a Mac `Cmd+C` / `Cmd+V` |
 | `Shift+PageUp` `Shift+PageDown` | Scroll back and forth |
+| `Ctrl+Shift+F` | Find in the scrollback (`Cmd+F` on a Mac); `Enter` / `Shift+Enter` step through the matches, `Esc` closes it |
 | `Ctrl+Shift+K` | Search or jump, from a shell (`Cmd+K` on a Mac) |
 
 Click outside the terminal to give the keyboard back to the rest of the

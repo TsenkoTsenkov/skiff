@@ -38,6 +38,9 @@ pub fn zoom_percent(zoom: f32) -> String {
     format!("{}%", (zoom * 100.0).round() as i32)
 }
 
+/// What "Log history" offers: (label, lines; `None` is everything).
+pub const LOG_TAILS: [(&str, Option<i64>); 4] = [("100", Some(100)), ("1,000", Some(1000)), ("10,000", Some(10_000)), ("All", None)];
+
 /// Where the third-party licences are published.
 pub const THIRD_PARTY_FILE: &str = "THIRD-PARTY-NOTICES.md";
 
@@ -216,6 +219,10 @@ pub struct Kube {
     /// [`ClusterRow::plugin_missing`], which also knows the `PATH` its
     /// kubeconfig entry sets.
     pub plugins: BTreeMap<String, Option<PathBuf>>,
+    /// Kubeconfig files found in `~/.kube` that are not read yet, to
+    /// offer next to "Add file…" (filled in by the app, which knows
+    /// whether it may look at the user's own files).
+    pub suggestions: Vec<PathBuf>,
 }
 
 /// Builds the [`Kube`] model from the last kubeconfig load.
@@ -269,7 +276,18 @@ pub fn kube_model(sources: &KubeconfigSources, report: &KubeconfigReport, contex
             plugins.insert(command.to_string(), skiff_core::find_executable(command));
         }
     }
-    Kube { files, plugins }
+    Kube { files, plugins, suggestions: Vec::new() }
+}
+
+/// A cluster's connection, as the Clusters section shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterState {
+    NotConnected,
+    Connecting,
+    /// With the server's version.
+    Connected(String),
+    /// With what went wrong.
+    Failed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +295,9 @@ pub struct ClusterRow {
     pub name: String,
     /// The one that is open.
     pub active: bool,
+    pub state: ClusterState,
+    /// Left out of the cluster menu and the palette.
+    pub hidden: bool,
     pub read_only: bool,
     pub confirm: bool,
     /// The credential plugin its kubeconfig entry runs (`aws`, `gke-gcloud-auth-plugin`).
@@ -292,6 +313,10 @@ pub struct Model {
     /// What "System" resolves to now, if the system says.
     pub system_dark: Option<bool>,
     pub zoom: f32,
+    /// Earlier lines a new log tab loads (`None`: all of them).
+    pub log_history: Option<i64>,
+    /// Tables whose columns or widths were chosen by hand.
+    pub tables_customised: usize,
     pub kube_source: KubeSource,
     pub kube: Arc<Kube>,
     pub clusters: Vec<ClusterRow>,
@@ -307,6 +332,12 @@ pub struct Model {
     pub config_path: Option<PathBuf>,
     pub keys_path: Option<PathBuf>,
     pub mac: bool,
+    /// CPU time the last frame took to build.
+    pub frame_time: std::time::Duration,
+    /// Memory the process holds, where the system says.
+    pub memory: Option<u64>,
+    /// Clusters with a connection, and the watches they keep open.
+    pub connections: (usize, usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -314,13 +345,23 @@ pub enum Action {
     Close,
     SetTheme(Theme),
     SetZoom(f32),
+    /// Earlier lines a new log tab loads (`None`: all).
+    SetLogHistory(Option<i64>),
+    /// Every table back to its default columns and widths.
+    ResetColumns,
     AddKubeconfig,
+    /// Add this file (one of the suggestions) without asking for it.
+    AddKubeconfigPath(String),
     RemoveKubeconfig(String),
     /// Back to `$KUBECONFIG` / `~/.kube/config`.
     ResetKubeconfigs,
     ReloadKubeconfig,
     SetReadOnly(String, bool),
     SetConfirm(String, bool),
+    SetHidden(String, bool),
+    OpenCluster(String),
+    Reconnect(String),
+    Disconnect(String),
     SetUpdateCheck(bool),
     SetChannel(Channel),
     CheckForUpdates,
@@ -565,6 +606,35 @@ fn appearance(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Actio
             actions.push(Action::SetZoom(less));
         }
     });
+    let columns = match model.tables_customised {
+        0 => "Every table shows its default columns at their default widths.".to_string(),
+        n => format!(
+            "{} with columns or widths you chose. They are remembered between runs; double-click a column edge to reset just that one.",
+            widgets::plural(n, "table")
+        ),
+    };
+    setting(ui, pal, "Table columns", &columns, 236.0, |ui| {
+        let reset = ui.add_enabled(model.tables_customised > 0, egui::Button::new("Reset all").min_size(Vec2::new(0.0, 26.0)));
+        if widgets::named(reset, "Reset the columns of every table").clicked() {
+            actions.push(Action::ResetColumns);
+        }
+    });
+    setting(
+        ui,
+        pal,
+        "Log history",
+        "How many earlier lines a new log tab loads. A tab that is open can load more from its own toolbar.",
+        288.0,
+        |ui| {
+            let labels: Vec<&str> = LOG_TAILS.iter().map(|(label, _)| *label).collect();
+            // (A number typed into config.json that is none of these
+            // selects nothing here, and stays until one is picked.)
+            let at = LOG_TAILS.iter().position(|(_, n)| *n == model.log_history).unwrap_or(usize::MAX);
+            if let Some(i) = widgets::segmented(ui, pal, &labels, at, 68.0) {
+                actions.push(Action::SetLogHistory(LOG_TAILS[i].1));
+            }
+        },
+    );
 }
 
 fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>) {
@@ -617,13 +687,28 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
         ui.add_space(2.0);
         note(ui, pal, "Adding a file starts a list in config.json: \"$KUBECONFIG\" (these locations, still followed) and the new file.");
     }
+    if !model.kube.suggestions.is_empty() {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            ui.label(RichText::new("Found in ~/.kube").color(pal.muted).size(12.0));
+            for path in &model.kube.suggestions {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let button = egui::Button::new((widgets::icon(icons::ICON_ADD, 14.0), RichText::new(&name).size(12.0)));
+                if widgets::named(ui.add(button), &format!("Add {}", short_path(path))).clicked() {
+                    actions.push(Action::AddKubeconfigPath(path.to_string_lossy().into_owned()));
+                }
+            }
+        });
+    }
 
     ui.add_space(18.0);
-    widgets::caption(ui, "Protection", pal);
+    widgets::caption(ui, "Clusters and protection", pal);
     note(
         ui,
         pal,
-        "Read-only: Skiff changes nothing in the cluster. Ask first: restart, scale, cordon, suspend and applying YAML are confirmed. Deleting always asks.",
+        "Read-only: Skiff changes nothing in the cluster. Ask first: restart, scale, cordon, suspend and applying YAML are confirmed. Deleting always asks. \
+         A hidden cluster is left out of the cluster menu and the command palette; its kubeconfig is not changed.",
     );
     ui.add_space(4.0);
     if model.clusters.is_empty() {
@@ -632,7 +717,8 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
         });
         return;
     }
-    const TOGGLE: f32 = 86.0;
+    const TOGGLE: f32 = 78.0;
+    const ACTIONS: f32 = 4.0 * ROW_BUTTON;
     card(ui, pal, |ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         ui.horizontal(|ui| {
@@ -650,19 +736,39 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
         for row in &model.clusters {
             ui.separator();
             ui.horizontal(|ui| {
-                let toggles = 2.0 * TOGGLE;
-                let name_width = (ui.available_width() - toggles - 8.0).max(80.0);
+                let right = 2.0 * TOGGLE + ACTIONS;
+                let name_width = (ui.available_width() - right - 8.0).max(80.0);
                 ui.allocate_ui_with_layout(Vec2::new(name_width, 0.0), Layout::top_down(Align::Min), |ui| {
                     ui.set_width(name_width);
                     ui.spacing_mut().item_spacing.y = 1.0;
+                    let (dot, state) = match &row.state {
+                        ClusterState::Connected(version) if version.is_empty() => (pal.ok, "Connected".to_string()),
+                        ClusterState::Connected(version) => (pal.ok, format!("Connected · {version}")),
+                        ClusterState::Connecting => (pal.warn, "Connecting…".to_string()),
+                        ClusterState::Failed(why) => (pal.err, format!("Failed: {why}")),
+                        ClusterState::NotConnected => (pal.faint, "Not connected".to_string()),
+                    };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        widgets::dot(ui, dot);
                         let name = if row.active { widgets::semibold(&row.name, 13.0) } else { RichText::new(&row.name) };
-                        ui.add(egui::Label::new(name.color(pal.text)).truncate());
+                        let name = name.color(if row.hidden { pal.faint } else { pal.text });
+                        // (Room for what follows the name.)
+                        let tags = if row.active { 40.0 } else { 0.0 } + if row.hidden { 50.0 } else { 0.0 };
+                        ui.allocate_ui_with_layout(
+                            Vec2::new((ui.available_width() - tags).max(40.0), 18.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| ui.add(egui::Label::new(name).truncate()).on_hover_text(&row.name),
+                        );
                         if row.active {
                             ui.label(RichText::new("open").color(pal.faint).size(11.5));
                         }
+                        if row.hidden {
+                            ui.label(RichText::new("hidden").color(pal.faint).size(11.5));
+                        }
                     });
+                    let color = if matches!(row.state, ClusterState::Failed(_)) { pal.err } else { pal.muted };
+                    ui.add(egui::Label::new(RichText::new(&state).color(color).size(12.0)).truncate()).on_hover_text(&state);
                     if let Some(plugin) = &row.plugin {
                         plugin_line(ui, pal, plugin, row.plugin_missing, model.kube.plugins.get(plugin).and_then(|p| p.as_deref()));
                     }
@@ -677,10 +783,46 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
                     if toggle_cell(ui, pal, TOGGLE, row.read_only, true, &format!("{} is read-only", row.name)) {
                         actions.push(Action::SetReadOnly(row.name.clone(), !row.read_only));
                     }
+                    // What can be done with the cluster, rightmost first.
+                    ui.allocate_ui_with_layout(Vec2::new(ACTIONS, 26.0), Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let name = &row.name;
+                        let (ic, tip) = if row.hidden {
+                            (icons::ICON_VISIBILITY_OFF, format!("Show {name} in the cluster menu again"))
+                        } else {
+                            (icons::ICON_VISIBILITY, format!("Hide {name} from the cluster menu"))
+                        };
+                        if row_button(ui, pal, ic, &tip) {
+                            actions.push(Action::SetHidden(name.clone(), !row.hidden));
+                        }
+                        if row.state != ClusterState::NotConnected {
+                            if row_button(ui, pal, icons::ICON_POWER_SETTINGS_NEW, &format!("Disconnect {name}")) {
+                                actions.push(Action::Disconnect(name.clone()));
+                            }
+                            if row_button(ui, pal, icons::ICON_SYNC, &format!("Reconnect to {name} and reload everything")) {
+                                actions.push(Action::Reconnect(name.clone()));
+                            }
+                        }
+                        if !row.active && row_button(ui, pal, icons::ICON_LOGIN, &format!("Open {name}")) {
+                            actions.push(Action::OpenCluster(name.clone()));
+                        }
+                    });
                 });
             });
         }
     });
+}
+
+/// The width of one [`row_button`].
+const ROW_BUTTON: f32 = 28.0;
+
+/// A small frameless icon button in a table row. Returns whether it was
+/// clicked.
+fn row_button(ui: &mut Ui, pal: &Palette, ic: MaterialIcon, name: &str) -> bool {
+    let button = egui::Button::new(widgets::icon(ic, 16.0).color(pal.muted))
+        .frame_when_inactive(false)
+        .min_size(Vec2::new(ROW_BUTTON, 24.0));
+    widgets::named(ui.add(button), name).clicked()
 }
 
 /// A check box centred in a table cell. Returns whether it was clicked.
@@ -1003,6 +1145,24 @@ fn about(ui: &mut Ui, pal: &Palette, state: &mut State, model: &Model, actions: 
         widgets::kv(ui, "Target", pal, |ui| mono(ui, env!("SKIFF_TARGET").to_string()));
         widgets::kv(ui, "Update channel", pal, |ui| mono(ui, model.updates.channel.name().to_string()));
         widgets::kv(ui, "Licence", pal, |ui| mono(ui, "MIT".to_string()));
+        ui.add_space(2.0);
+    });
+    ui.add_space(10.0);
+    widgets::caption(ui, "Right now", pal);
+    card(ui, pal, |ui| {
+        ui.add_space(2.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let plain = |ui: &mut Ui, text: String| {
+            ui.label(RichText::new(text).color(pal.text));
+        };
+        widgets::kv(ui, "Last frame", pal, |ui| plain(ui, format!("{:.1} ms of CPU", model.frame_time.as_secs_f32() * 1000.0)));
+        if let Some(memory) = model.memory {
+            widgets::kv(ui, "Memory", pal, |ui| plain(ui, skiff_core::fmt_bytes(memory as f64)));
+        }
+        let (clusters, watches) = model.connections;
+        widgets::kv(ui, "Connections", pal, |ui| {
+            plain(ui, format!("{} · {}", widgets::plural(clusters, "cluster"), widgets::plural(watches, "live watch")))
+        });
         ui.add_space(2.0);
     });
     ui.add_space(10.0);
