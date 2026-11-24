@@ -10,7 +10,7 @@ program as it is in this repository.
 ## Start here
 
 1. **[Install and update](install.md).** Downloads for macOS, Windows and
-   Linux, the first-launch warning of unsigned builds, checking a
+   Linux, what is signed on each system, checking a
    download, building from source.
 2. **[Clusters and sign-in](clusters.md).** EKS, GKE, AKS and OIDC through
    the credential plugins your kubeconfig names; proxies; read-only
@@ -22,18 +22,19 @@ program as it is in this repository.
 
 | Page | What is in it |
 | --- | --- |
-| [Install and update](install.md) | Files per system, first launch, update channels, checksums and attestations, building from source |
+| [Install and update](install.md) | Files per system, signatures and first launch, update channels, checksums and attestations, building from source |
 | [Clusters and sign-in](clusters.md) | Credential plugins, connection errors and what to do, proxies, read-only and ask-before-changes, limited accounts |
 | [Configuration](configuration.md) | Every key of `config.json`, which kubeconfig files are read, command-line options, environment variables |
 | [Keyboard](keyboard.md) | Shortcuts by place, the command palette, `keys.json` |
 | [Metrics and alerts](observability.md) | The Metrics tab, firing alerts, how Prometheus is found, the permission it needs, Grafana links |
-| [Troubleshooting and FAQ](troubleshooting.md) | First-launch warnings, no clusters shown, a plugin that is not found, Prometheus not detected, graphics problems, where files live |
+| [Troubleshooting and FAQ](troubleshooting.md) | The Windows first-launch warning, no clusters shown, a plugin that is not found, Prometheus not detected, graphics problems, where files live |
 
 ## How it behaves
 
 | Page | What is in it |
 | --- | --- |
 | [Security](security.md) | What Skiff connects to, what it does with credentials and Secrets, how it treats what a cluster sends, how updates are checked |
+| [Code signing policy](code-signing-policy.md) | Who may release Skiff, where the binaries are built, what is signed today, what the program sends over the network, how to report a problem |
 | [Benchmarks](benchmarks.md) | Start-up time, memory, CPU and size, measured on the launched binary, with the method and the script to repeat it |
 
 ## Project

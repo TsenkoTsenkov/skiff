@@ -7,15 +7,22 @@
         [--window <out>/<slug>.startup-window.json] \\
         [--download /path/to/the/downloaded/file] [--notes "..."]
 
-Copies numbers only: memory (PSS) and process count 5 s after the pod list
-was loaded, idle CPU, the time to a visible window, and the size of the
+Copies numbers only: memory and process count 5 s after the pod list was
+loaded, idle CPU, the time to a visible window, and the size of the
 downloaded file. With several --steady files the value is their median
-and the smallest and largest are kept. The label the run was made under,
+and the smallest and largest are kept.
+
+Memory is PSS for a run made on Linux (memory_pss_bytes) and the physical
+footprint for a run made on macOS (memory_footprint_bytes). They are
+different quantities: all --steady files of a row must be of one kind,
+and a results file holds rows of one kind only, so a row is refused when
+the file already has rows of the other. The label the run was made under,
 the command line and the paths stay in the raw files; the row gets the
 neutral label given here. See README.md, "The results file".
 """
 
 import argparse
+import copy
 import json
 import os
 import statistics
@@ -23,6 +30,23 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chart  # noqa: E402  (the schema lives there)
+
+
+# metric key -> (field of result.loaded.total in a .steady.json, what it is)
+MEMORY = {
+    "memory_pss_bytes": ("pss", "PSS, Linux"),
+    "memory_footprint_bytes": ("footprint", "physical footprint, macOS"),
+}
+assert tuple(MEMORY) == chart.MEMORY_KEYS
+
+
+def memory_kind(total):
+    """Which memory metric a run's totals give, or None. PSS when the run
+    has it; otherwise the footprint, which measure.py records on macOS."""
+    for key, (field, _) in MEMORY.items():
+        if total.get(field) is not None:
+            return key
+    return None
 
 
 def stat(values):
@@ -48,17 +72,25 @@ def main():
 
     with open(args.results) as f:
         doc = json.load(f)
-    steady = []
+    steady, kinds = [], {}
     for path in args.steady:
         with open(path) as f:
             r = json.load(f)["result"]
         if r.get("mode") != "steady":
             sys.exit(f"{path} is not a steady-state result")
-        if r["loaded"]["total"].get("pss") is None:
-            sys.exit(f"{path} has no PSS (not Linux, or smaps_rollup was not readable): this row cannot be compared")
+        kind = memory_kind(r["loaded"]["total"])
+        if kind is None:
+            sys.exit(f"{path} has neither PSS (Linux; smaps_rollup must be readable) nor a physical footprint (macOS): this row cannot be compared")
+        missing = [p.get("name", "?") for p in r["loaded"].get("procs", []) if p.get(MEMORY[kind][0]) is None]
+        if missing:
+            sys.exit(f"{path}: no {MEMORY[kind][1].split(',')[0]} for {len(missing)} process(es) of the tree ({', '.join(missing)}), so the total is too small: measure again")
+        kinds.setdefault(kind, []).append(path)
         steady.append(r)
+    if len(kinds) > 1:
+        sys.exit("the --steady files do not measure memory the same way (" + "; ".join(f"{MEMORY[k][1]}: {', '.join(v)}" for k, v in kinds.items()) + "): runs from Linux and macOS cannot make one row")
+    source, _ = MEMORY[kind]
     metrics = {
-        "memory_pss_bytes": stat([r["loaded"]["total"]["pss"] for r in steady]),
+        kind: stat([r["loaded"]["total"][source] for r in steady]),
         "processes": stat([r["loaded"]["total"]["processes"] for r in steady]),
         "idle_cpu_percent": stat([r["idle"]["percent_of_one_core"] for r in steady]),
     }
@@ -82,10 +114,12 @@ def main():
     rows = [r for r in doc.get("rows", []) if r.get("label") != args.label]
     replaced = len(rows) != len(doc.get("rows", []))
     doc["rows"] = rows + [row]
+    # Checked before anything is written: an invalid file (a second kind of
+    # memory, a second subject, ...) leaves the one on disk as it was.
+    chart.check(copy.deepcopy(doc), args.results)
     with open(args.results, "w") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    chart.load(args.results)  # complains if the file is no longer valid
     print(f"{'replaced' if replaced else 'added'} row {args.label!r} in {args.results}")
 
 

@@ -8,6 +8,9 @@
 #   pwsh hack\windows-package.ps1                 build and package
 #   pwsh hack\windows-package.ps1 -Exe <file>     package this skiff.exe, do not build
 #   pwsh hack\windows-package.ps1 -NoInstaller    only the zip (no NSIS needed)
+#   pwsh hack\windows-package.ps1 -Exe <file> -RequireSignedExe
+#                                                 package a skiff.exe that was signed
+#                                                 elsewhere; stop if it is not
 #
 # Needs Rust with the MSVC toolchain and, for the installer, NSIS 3
 # (winget install NSIS.NSIS, or choco install nsis).
@@ -26,6 +29,12 @@
 #     WINDOWS_CERT_PFX_BASE64  the .pfx, base64-encoded
 #     WINDOWS_CERT_PASSWORD    its password
 #
+# A third way does not sign here at all: the release workflow sends the
+# files to SignPath, which holds the key. It has skiff.exe signed first and
+# then runs this script with -Exe <signed file> -RequireSignedExe and none
+# of the variables above; the installer this script then makes is unsigned
+# and the workflow has it signed afterwards.
+#
 # Other environment:
 #   SKIFF_BUILD        build number (git rev-list --count HEAD); 0 locally
 #   SKIFF_UPDATE_REPO  owner/repo the update check asks, when not the default
@@ -34,7 +43,8 @@ param(
     [string]$Target = 'x86_64-pc-windows-msvc',
     [string]$Exe = '',
     [string]$OutDir = 'dist',
-    [switch]$NoInstaller
+    [switch]$NoInstaller,
+    [switch]$RequireSignedExe
 )
 
 Set-StrictMode -Version Latest
@@ -75,6 +85,13 @@ elseif ((Get-EnvValue 'WINDOWS_CERT_PFX_BASE64') -ne '') {
 elseif (@($azureNames | Where-Object { $_ -like 'AZURE_SIGNING_*' -and (Get-EnvValue $_) -ne '' }).Count -gt 0) {
     # Half-configured signing would silently ship an unsigned release.
     throw "Azure signing is only partly configured; missing: $($azureMissing -join ', ')"
+}
+
+if ($RequireSignedExe) {
+    if ($Exe -eq '') { throw '-RequireSignedExe needs -Exe <the signed skiff.exe>.' }
+    if ($signMode -ne 'none') {
+        throw "-RequireSignedExe is for a skiff.exe that is already signed, but the variables for signing here ($signMode) are set too. Use one or the other."
+    }
 }
 
 function Find-SignTool {
@@ -137,6 +154,13 @@ try {
         throw "no such file: $Exe"
     }
     $Exe = (Resolve-Path -LiteralPath $Exe).Path
+    if ($RequireSignedExe) {
+        $given = Get-AuthenticodeSignature -FilePath $Exe
+        if ($given.Status -ne 'Valid') {
+            throw "$Exe is not validly signed: $($given.Status) $($given.StatusMessage)"
+        }
+        Write-Host "Already signed: $Exe ($($given.SignerCertificate.Subject))"
+    }
 
     $versionLine = Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.*)"' | Select-Object -First 1
     if (-not $versionLine) { throw 'no version in Cargo.toml' }
@@ -208,7 +232,12 @@ try {
         Write-Host "Built $setup"
     }
 
-    if ($signMode -eq 'none') {
+    if ($RequireSignedExe) {
+        if (-not $NoInstaller) {
+            Write-Host 'skiff.exe was signed before it came here; the INSTALLER IS UNSIGNED until it is signed the same way.'
+        }
+    }
+    elseif ($signMode -eq 'none') {
         Write-Host 'UNSIGNED: no signing variables are set.'
     }
 }

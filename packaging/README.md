@@ -128,6 +128,13 @@ releases.
 | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | secrets | Signing the Windows program and installer with Azure Artifact Signing: the service principal that may sign. |
 | `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE` | variables | The signing account's regional endpoint (for example `https://weu.codesigning.azure.net`), its name, and the certificate profile's name. |
 | `WINDOWS_CERT_PFX_BASE64`, `WINDOWS_CERT_PASSWORD` | secrets | The alternative for Windows: a code-signing certificate as a `.pfx` file. Used only if the Azure values are not set. |
+| `SIGNPATH_API_TOKEN` | secret | Signing the Windows program and installer through SignPath: the API token of the SignPath user that submits the signing requests. Its presence switches the SignPath route on. |
+| `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG` | variables | Required together with `SIGNPATH_API_TOKEN`: the SignPath organization's ID, and the slugs of the project and of the signing policy to sign with. Not secrets. |
+
+Set up at most one of the three Windows routes. The Windows job stops
+before building if `SIGNPATH_API_TOKEN` is set together with
+`AZURE_CLIENT_SECRET` or `WINDOWS_CERT_PFX_BASE64`, and also if only some of
+the four `SIGNPATH_*` values are set.
 
 The Apple Team ID is not a setting of its own: it is taken from the signing
 identity and compiled into the app as `SKIFF_TEAM_ID`. A build that carries
@@ -199,28 +206,101 @@ Unsigned builds work, but Windows shows "Windows protected your PC"
 (SmartScreen) and the user has to choose More info → Run anyway. There are
 three ways out; none is both free and immediate.
 
-**SignPath Foundation** (free for open-source projects). Requirements, as
-published at <https://signpath.org/terms>: an OSI-approved licence (MIT
-qualifies), a public repository, releases built by CI, multi-factor
-authentication for the maintainers, and a code signing policy page in the
-repository. The certificate's publisher name is "SignPath Foundation".
+**SignPath Foundation** (free for open-source projects). Wired up, but
+never run: it cannot be tried before SignPath has set up an account for the
+project, so expect to adjust details on the first build that uses it. The
+Windows builds stay unsigned until the four `SIGNPATH_*` values exist.
+Requirements, as published at <https://signpath.org/terms> (read the current
+ones before applying): an OSI-approved licence (MIT qualifies), a public
+repository, releases built by CI, multi-factor authentication for the
+maintainers, and a code signing policy page in the repository. The
+certificate's publisher name is "SignPath Foundation", not the owner's.
 
-1. Make the repository public and publish at least one release.
-2. Add a "Code signing policy" section to the README or a
-   `CODE_SIGNING_POLICY.md` (their site has the wording they expect: who
-   may commit, who approves releases, a privacy statement).
-3. Apply at <https://signpath.org/apply>. Approval is at their discretion
-   and takes a while.
-4. They give you an organization ID, a project slug and an API token.
-   SignPath signs artifacts that were uploaded by a GitHub Actions run, so
-   this needs a change to the workflow rather than just secrets: after the
-   `windows` job's upload, call their `signpath/github-action-submit-signing-request`
-   action with the artifact's ID and replace the artifact with what it
-   returns. The installer contains `skiff.exe`, so their artifact
-   configuration has to sign the inner file too, or the job is split in two
-   (sign `skiff.exe`, build the installer from the signed file, sign the
-   installer). This is not wired up yet, because the details depend on the
-   project SignPath sets up for you.
+What the owner does:
+
+1. Publish the first stable release (tag `v0.1.0`), unsigned on Windows. The
+   repository is public and `docs/code-signing-policy.md` is the policy page.
+2. Apply at <https://signpath.org/apply>. Approval is at their discretion
+   and takes a while. When they accept, there is a SignPath organization
+   for the project; its ID is shown in the SignPath web application.
+3. In SignPath, create (or check, if they created it) the **project**:
+   - Repository URL `https://github.com/TsenkoTsenkov/skiff`.
+   - Trusted build system: the predefined "GitHub.com", added to the
+     organization and linked to the project.
+4. In the project, make this the default **artifact configuration**. GitHub
+   stores an artifact as a ZIP archive, so the root is a `<zip-file>`; each
+   request holds one of the two files, hence `min-matches="0"`:
+
+   ```xml
+   <artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+     <zip-file>
+       <pe-file path="skiff.exe" min-matches="0">
+         <authenticode-sign/>
+       </pe-file>
+       <pe-file path="Skiff-windows-x64-setup.exe" min-matches="0">
+         <authenticode-sign/>
+       </pe-file>
+     </zip-file>
+   </artifact-configuration>
+   ```
+
+   The workflow names no artifact configuration, so the project's default
+   one is used.
+5. The **signing policy**: the one for release signing (with the
+   certificate Windows trusts; a test-signing policy's certificate is not
+   trusted on the build machine and the job then fails). If it verifies the
+   origin, it must allow builds of the branch `main` and of `v*` tags. Add
+   as Submitter the user whose token the workflow uses (a CI user made for
+   this is what SignPath recommends), and generate that user's API token:
+   it is shown once.
+6. In the repository's `release` environment set the secret
+   `SIGNPATH_API_TOKEN` and the variables `SIGNPATH_ORGANIZATION_ID`,
+   `SIGNPATH_PROJECT_SLUG` and `SIGNPATH_SIGNING_POLICY_SLUG`. Set all four
+   before the next push to `main`: a build that finds only some of them
+   fails on purpose. Remove the Azure and certificate-file secrets if they
+   were ever set.
+7. Push to `main` and watch the nightly's Windows job. Its last check
+   prints the signature status of both files; the release notes say
+   "Signed" only if both are validly signed. Then update the Windows
+   statements listed in `docs/releasing.md`.
+
+What the Windows job then does. SignPath only signs a file that a run of
+the workflow has stored as an artifact of the run, and it cannot open an
+NSIS installer to sign what is inside. So there are two signing requests,
+each made with SignPath's action
+(`signpath/github-action-submit-signing-request`, pinned by commit), which
+waits for the result and downloads it:
+
+1. `skiff.exe` is compiled as always, in a step that has no secret.
+2. It is stored as the artifact `unsigned-skiff-exe` and sent to SignPath.
+3. `hack/windows-package.ps1 -Exe <signed skiff.exe> -RequireSignedExe`
+   makes the portable zip and the installer from the signed file, and stops
+   if that file's signature is not valid.
+4. The installer is stored as `unsigned-skiff-setup` and sent to SignPath.
+5. The signed installer replaces the unsigned one in `dist\`, after its
+   signature was checked. The checks, checksums and the release use only
+   what is in `dist\`.
+
+The two `unsigned-…` artifacts are kept with the run for a day; the publish
+job only gathers artifacts named `skiff-*`, so they never reach a release.
+As with the other routes, the uninstaller inside the installer is not
+signed.
+
+Things to know:
+
+- The action waits 10 minutes for each request. If the signing policy asks
+  for a manual approval, somebody has to approve two requests per build
+  within that time, for every nightly too; otherwise raise
+  `wait-for-completion-timeout-in-seconds` on the two steps (the job's own
+  limit is 60 minutes).
+- The token is given only to the two steps that run SignPath's action,
+  after the compiler has finished, and only in a build that will be
+  published. A pull request or a run started by hand never has it.
+- SignPath's documentation says the job's GitHub token needs to read
+  Actions data only when the repository is private and their GitHub App is
+  not installed. The workflow grants `contents: read` only; if the first
+  request fails for lack of permission, install the SignPath GitHub App on
+  the repository.
 
 **Azure Artifact Signing** (formerly Trusted Signing; about 10 USD a month at
 the time of writing). Wired up: set the six `AZURE_*` values. Whether an

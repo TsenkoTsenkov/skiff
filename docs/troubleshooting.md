@@ -19,19 +19,20 @@ and paste what Settings → About → **Copy version info** gives you.
 
 ## macOS says Skiff cannot be opened
 
-The Mac build is not yet signed with an Apple Developer ID and not
-notarized, so macOS stops the first start. Allow it once: **System
-Settings → Privacy & Security**, scroll down to the message about Skiff,
-**Open Anyway**. From a terminal the same is:
+This should not happen with a current download: 0.1.0 and the
+prereleases from `build-41` on are signed with an Apple Developer ID and
+notarized. You most likely have an older, unsigned prerelease. Download
+the current version, or allow the old one once: **System Settings →
+Privacy & Security**, scroll down to the message about Skiff, **Open
+Anyway**. From a terminal the same is:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Skiff.app
 ```
 
-After that it opens normally. Check the download first if you like:
-[install.md](install.md#checking-a-download). Each release's notes say
-whether that build is signed and notarized; a notarized build needs none
-of this.
+If a freshly downloaded current build is refused, do not override it:
+[check the download](install.md#checking-a-download) and
+[report it](code-signing-policy.md#reporting-a-problem).
 
 ## Windows shows "Windows protected your PC"
 
@@ -39,7 +40,9 @@ The Windows build is not yet signed, so SmartScreen warns about a program
 it has not seen before. Choose **More info**, then **Run anyway**. The
 installer writes only into your own user folder and does not ask for
 administrator rights. To check the file first, see
-[install.md](install.md#checking-a-download).
+[install.md](install.md#checking-a-download). The
+[code signing policy](code-signing-policy.md#what-is-signed-today) says
+what is planned for Windows signing.
 
 ## No clusters are shown
 

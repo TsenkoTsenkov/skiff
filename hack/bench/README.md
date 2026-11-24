@@ -11,20 +11,29 @@ the command that starts it.
 | `measure.py` | does the measuring |
 | `results/*.json` | the numbers that are published, one file for each machine and day |
 | `results.py` | copies numbers from a run into a results file |
-| `chart.py` | draws `docs/img/compare-light.svg` and `compare-dark.svg` from a results file |
+| `chart.py` | draws the figures in `docs/img` from a results file: `compare-*.svg` (Linux, Skiff alone) and `compare-macos-*.svg` (macOS, three apps) |
 
 The Python scripts need Python 3.8+ and nothing outside the standard
 library.
 
-Only Skiff has been measured so far. Rows for other programs are added
-only when they were measured by this procedure on the same machine, and
-they are identified by what kind of program they are, not by product
-name; [docs/benchmarks.md](../../docs/benchmarks.md#comparison-with-similar-software)
+Two sets of results are published. On Linux only Skiff has been measured
+(`results/2026-11-23-linux-x86_64-kvm.json`). On macOS Skiff and two
+similar programs were measured on one Mac
+(`results/2026-11-24-macos-arm64-m1pro.json`). Rows for other programs
+are added only when they were measured by this procedure on the same
+machine, and they are identified by what kind of program they are, never
+by product name or version;
+[docs/benchmarks.md](../../docs/benchmarks.md#comparison-with-similar-software)
 says why.
 
-Linux is the tested platform. macOS is supported for `app` through `ps`,
-`footprint` and `lsof`, and that path is **untested**: treat its output as
-unverified until someone has checked it against Activity Monitor.
+Linux is the tested platform. On macOS only `app` works, through `ps`,
+`footprint` and `lsof` (no `--xvfb`, `--trace` or `--window-runs`). That
+path has been run on one Mac, by the project's owner for the macOS
+results, and no test covers it. Memory on macOS is the **physical
+footprint**, the figure Activity Monitor shows. It is not PSS, which
+macOS does not have, so a macOS memory figure is never put next to a
+Linux one: the two have different metric keys and cannot share a results
+file or a figure.
 
 ## What you need
 
@@ -89,8 +98,9 @@ hack/bench/run.sh app --label "other 1.2.3" --installed /opt/other -- /opt/other
 hack/bench/run.sh app --label "tui 1.2.3 in xterm" --installed "$(command -v tui)" -- xterm -e tui
 ```
 
-The generic mode has been run here only against Skiff itself (to test
-the script), not against any other program.
+On Linux the generic mode has been run only against Skiff itself (to
+test the script). On macOS the project's owner ran it against Skiff and
+two other programs for the 2026-11-24 results.
 
 Rules that keep a comparison fair:
 
@@ -104,7 +114,12 @@ Rules that keep a comparison fair:
   rasterizer draws; that costs memory and CPU, differently for each app.
 - An app measured under a terminal emulator includes the terminal
   emulator, and a web interface includes the browser it is opened in:
-  they are part of what runs on the machine.
+  they are part of what runs on the machine. If a terminal client was
+  measured without a terminal app around it, its row's notes must say
+  so, because its numbers are then lower than what a user would see (the
+  terminal row of the macOS results is such a row).
+- Memory is PSS on Linux and the physical footprint on macOS. Never set
+  one beside the other.
 - One steady run gives one number. For a number you want to publish, run
   it three times and give all three files to `results.py`, which keeps
   the median and the range.
@@ -135,6 +150,7 @@ machines never share a file, so the figure cannot mix them.
     "rendering": "software rendering (Mesa 25.2.8 lavapipe on Xvfb 1440x900), which inflates memory and CPU",
     "cluster": "Local kwok cluster, context scale: kube-apiserver 1.37.2, 100 nodes, 5,415 pods",
     "state": "The list of all pods in all namespaces is open and loaded; nothing else was opened",
+    "caveats": ["a sentence printed under the figure", "another"],
     "notes": "free text"
   },
   "rows": [
@@ -161,29 +177,47 @@ machines never share a file, so the figure cannot mix them.
 | --- | --- |
 | `schema` | `1` |
 | `conditions.date`, `.machine`, `.rendering`, `.cluster`, `.state` | required; phrases that are printed under the figure, so write them to be read. `.machine` and `.rendering` complete "Measured DATE on ...; ...", `.cluster` and `.state` are sentences without the full stop |
+| `conditions.caveats` | optional list of sentences that are printed under the figure after the conditions: what a reader must know about every row (which kind of memory, that only medians were kept) |
 | `conditions.os`, `.notes` | optional; not printed |
 | `rows[].label` | required, unique. `Skiff <version>` for Skiff. For anything else a neutral description of the kind of program, with a letter when two are of one kind: "Electron-based client A", "terminal client in a terminal emulator". **Not a product name, and no version that identifies one** |
-| `rows[].category` | required: `native` (draws its own interface), `electron` (bundles a browser engine), `webview` (uses the system's web view), `browser` (a web interface opened in a browser, which is measured too), `terminal` (a terminal interface, measured with its terminal emulator), `other` (say what in `notes`) |
+| `rows[].category` | required: `native` (draws its own interface), `electron` (bundles a browser engine), `webview` (uses the system's web view), `browser` (a web interface opened in a browser, which is measured too), `terminal` (a terminal interface; `notes` says what it ran in, a terminal emulator that is measured too or a bare wrapper), `other` (say what in `notes`) |
 | `rows[].subject` | `true` on exactly one row, the one the figure is about (Skiff): drawn first and in the accent colour |
-| `rows[].version`, `.launch`, `.ready_by` | optional records of what was measured and how the pod list was judged ready; not printed |
+| `rows[].version`, `.launch`, `.ready_by`, `.other_hosts_first_minute` | optional records of what was measured, how the pod list was judged ready, and how many hosts other than the cluster the app connected to in its first minute; not printed. `version` is for Skiff's row only |
 | `rows[].notes` | optional; printed under the figure, so keep it neutral too |
-| `rows[].metrics` | any of the five keys below; a missing one is drawn as "not measured" |
+| `rows[].metrics` | any of the keys below, with one kind of memory per file. A metric that no row has gets no panel; one that only some rows have is drawn as "not measured" for the others |
 
 A metric is a number, or an object with `value` and optionally `min`,
-`max`, `n` (how many runs `value` is the median of) and `note` (printed
-under the figure).
+`max`, `n` (how many runs `value` is the median of), `note` (printed
+under the figure) and `decimals` (print a percentage with exactly this
+many decimals; for a value that was recorded already rounded, so that
+0.1 is not printed as 0.10). Leave `min` and `max` out when they are not
+known; never fill them in from the median.
 
 | Metric | Unit | From |
 | --- | --- | --- |
-| `memory_pss_bytes` | bytes | `result.loaded.total.pss` of a `.steady.json`: PSS of the whole process tree 5 s after the pod list was loaded |
+| `memory_pss_bytes` | bytes | Linux. `result.loaded.total.pss` of a `.steady.json`: PSS of the whole process tree 5 s after the pod list was loaded |
+| `memory_footprint_bytes` | bytes | macOS. `result.loaded.total.footprint` of a `.steady.json`: the physical footprint (`phys_footprint` from `footprint -p`, the "Memory" column of Activity Monitor) summed over the process tree at the same moment |
 | `processes` | count | `result.loaded.total.processes` of the same file |
 | `idle_cpu_percent` | % of one core | `result.idle.percent_of_one_core` of the same file |
 | `window_visible_s` | seconds | `window_s` of each run in a `.startup-window.json` |
 | `download_bytes` | bytes | size of the one file a user downloads to install the app on this platform |
 
+`memory_pss_bytes` and `memory_footprint_bytes` are different
+quantities. `chart.py` refuses a file in which both occur, and
+`results.py` refuses to add a row of one kind to a file that has rows of
+the other, or to build one row from runs of both kinds.
+
 Skiff's row in `results/2026-11-23-linux-x86_64-kvm.json` is the median
 of the five steady runs and ten window launches behind
 `docs/benchmarks.md`; its download is the `.tar.gz`.
+
+`results/2026-11-24-macos-arm64-m1pro.json` has three rows, each the
+median of three runs on an Apple M1 Pro. Its rows were written by hand
+from the medians the owner reported, rounded as reported (memory to
+1 MiB, idle CPU to 0.1%), because the raw files of those runs are on the
+owner's machine. That is why its metrics have `n` but no `min` and
+`max`. Download size and time to a visible window were not measured
+there.
 
 Add or replace a row from the files of a run (this copies the numbers,
 so nothing is retyped):
@@ -196,7 +230,9 @@ hack/bench/results.py add hack/bench/results/mine.json \
   --download ~/Downloads/the-file-you-downloaded
 ```
 
-`--steady` may be repeated; `--subject` marks Skiff's row. For a new
+`--steady` may be repeated; `--subject` marks Skiff's row. The memory
+metric is chosen by what the run holds: PSS from a Linux run, the
+footprint from a macOS run. For a new
 machine, copy an existing results file, rewrite its `conditions` from
 `machine.txt` and set `"rows": []` first. The label used for the run, the
 command line and all paths stay in the raw files under `target/`, which
@@ -208,25 +244,27 @@ are not checked in.
 hack/bench/chart.py --check hack/bench/results/mine.json    # only validate the file
 hack/bench/chart.py hack/bench/results/mine.json --out /tmp/figures
 hack/bench/chart.py hack/bench/results/2026-11-23-linux-x86_64-kvm.json --copy site/img
+hack/bench/chart.py hack/bench/results/2026-11-24-macos-arm64-m1pro.json --name compare-macos --copy site/img
 ```
 
-The last line is how the checked-in figures were made: without `--out`
-the SVGs go to `docs/img`, and `--copy` writes them to a second
-directory. Two files are written, `compare-light.svg` for light pages
-and `compare-dark.svg` for dark ones, in the colours of
-`crates/skiff/src/theme.rs`. A file with one row gives a strip of that
-row's five numbers. A file with two or more rows gives one panel of
-horizontal bars for each metric, each panel on its own scale from zero,
-the subject's bar in the accent colour. The conditions and every note
-are printed under the figure. To look at a figure as a PNG:
+The last two lines are how the checked-in figures were made: without
+`--out` the SVGs go to `docs/img`, and `--copy` writes them to a second
+directory. Two files are written for each, `<name>-light.svg` for light
+pages and `<name>-dark.svg` for dark ones (`--name`, default `compare`),
+in the colours of `crates/skiff/src/theme.rs`. A file with one row gives
+a strip of that row's numbers. A file with two or more rows gives one
+panel of horizontal bars for each metric that a row has, each panel on
+its own scale from zero, the subject's bar in the accent colour. The
+conditions, the caveats and every note are printed under the figure. To
+look at a figure as a PNG:
 `rsvg-convert -b white compare-light.svg -o compare-light.png`.
 
 ## What is measured, and how
 
-| Number | How (Linux) | macOS (untested) |
+| Number | How (Linux) | macOS (run on one Mac, no test) |
 | --- | --- | --- |
 | Process tree | the launched process, all its descendants, and anything else in its session (`/proc/*/stat`) | descendants (`ps -axo pid,ppid`) |
-| Memory, PSS | sum of `Pss` in `/proc/<pid>/smaps_rollup` over the tree: private pages in full, shared pages divided among the processes sharing them | sum of `phys_footprint` from `footprint -p` |
+| Memory, PSS | sum of `Pss` in `/proc/<pid>/smaps_rollup` over the tree: private pages in full, shared pages divided among the processes sharing them | no PSS. Instead the physical footprint: sum of `phys_footprint` from `footprint -p`. A different quantity, kept under its own key |
 | Memory, RSS | sum of `Rss` over the tree; pages shared between the app's own processes are counted once per process, so for a multi-process app this overstates | sum of `ps -o rss` |
 | Processes, threads | size of the tree; sum of `Threads` in `/proc/<pid>/status` | `ps`, `ps -M` |
 | Idle CPU | user + system CPU time of the tree (`/proc/<pid>/stat`) used during the 60 s window, as a percentage of one core | `ps -o time` |

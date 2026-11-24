@@ -9,11 +9,20 @@ binary from the outside. Every number on this page was produced by
   <img src="img/compare-light.svg" width="880" alt="Skiff 0.1.0, measured: memory 162 MiB (whole process tree, PSS, pod list loaded), 1 process, download 15.7 MB, window visible 161 ms after a warm launch, idle CPU 0.50% of one core. Measured 2026-11-23 on a 4-vCPU cloud VM without a GPU, with software rendering, against a local cluster of 5,415 simulated pods.">
 </picture>
 
-We publish only numbers we measured. Only Skiff has been measured so far,
-so the figure and the
-[comparison section](#comparison-with-similar-software) hold Skiff's row
-alone. The same script measures any app; that section says how to measure
-similar software on your own machine and add it.
+We publish only numbers we measured. There are two sets, from two
+machines, and they are kept apart:
+
+- **Linux, Skiff alone** (the figure above and everything down to
+  [Caveats](#caveats)): launch times, memory, CPU, network and size on a
+  cloud VM without a GPU. The conditions are the list that follows.
+- **macOS, Skiff and two similar programs**
+  ([Comparison with similar software](#comparison-with-similar-software)):
+  memory, processes and idle CPU on an Apple M1 Pro. That section has its
+  own figure, conditions and caveats. Memory there is a different
+  quantity from the Linux one, so do not compare numbers across the two
+  sets.
+
+The conditions of the Linux measurements:
 
 - **Date:** 2026-11-23
 - **Skiff:** 0.1.0, commit `65653da7bcf010df860f1d3ea6873bd00647032a`
@@ -47,7 +56,7 @@ prints the event (`SKIFF_TRACE_STARTUP=1`). 10 launches each.
 | | Median | Min - max |
 | --- | --- | --- |
 | First frame built, warm | 118 ms | 96 - 127 ms |
-| Window visible on the X display, warm | 161 ms | 149 - 256 ms |
+| Window visible on the X display, warm | 161 ms | 149 - 257 ms |
 | All 5,415 pods listed and live, warm | 0.58 s | 0.51 - 0.97 s |
 | First frame built, cold | 310 ms | 244 - 1,057 ms |
 | All 5,415 pods listed and live, cold | 0.78 s | 0.68 - 1.86 s |
@@ -102,8 +111,8 @@ Where the 162 MiB is (PSS by mapping, one launch, 161 MiB total):
 | everything else (libc, libstdc++, ...) | 7 MiB |
 
 At least 92 MiB (57%) is the software Vulkan stack; how much of the
-remaining heap is the rasterizer's cannot be told from outside. Memory on
-a machine with a GPU has not been measured.
+remaining heap is the rasterizer's cannot be told from outside. PSS on a
+Linux machine with a GPU has not been measured.
 
 ### Network and processes during the first 60 s
 
@@ -212,9 +221,11 @@ the pods table taken at the end of the idle window) are written to the
 
 - **Software rendering.** No GPU: every frame is rasterized on the CPU and
   the "GPU" memory is ordinary RAM. That raises memory (see the mapping
-  table) and makes each frame cost CPU. Numbers on real hardware, and on
-  macOS and Windows, have not been measured. They are expected to differ
-  and nothing here says in which direction for CPU.
+  table) and makes each frame cost CPU. Linux on a machine with a GPU has
+  not been measured. The macOS numbers in the
+  [comparison section](#comparison-with-similar-software) are from a
+  real Mac, but they use another memory metric and cannot be subtracted
+  from these to size the rasterizer's cost.
 - **Simulated pods.** kwok pods have no containers. Listing, watching,
   sorting and opening objects are real API traffic; logs, exec, port
   forwards and metrics from real kubelets are not exercised, and this page
@@ -230,129 +241,198 @@ the pods table taken at the end of the idle window) are written to the
   same machine during the run; timings have the spread the tables show.
 - **Small samples.** 10 launches per timing, 5 per steady-state figure,
   one per trace.
-- **Linux only.** macOS and Windows builds were not run.
+- **Linux, except the comparison.** Everything above this section was
+  measured on Linux. On macOS only memory, processes and idle CPU were
+  measured (next section); launch times, sizes and the syscall trace
+  were not. Nothing has been measured on Windows.
 
 ## Comparison with similar software
 
-**Only Skiff has been measured so far.** No number for any other program
-appears on this page, and the figure at the top shows Skiff's row
-alone.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/compare-macos-dark.svg">
+  <img src="img/compare-macos-light.svg" width="880" alt="Skiff 0.1.0 and similar software, measured on an Apple M1 Pro Mac on 2026-11-24 with each app's pod list open. Memory (physical footprint): Skiff 146 MiB, a terminal UI client 397 MiB, an Electron-based client 893 MiB. Processes: 1, 2 and 6. Idle CPU of one core: 0.1%, 16.2% and 7.9%. Medians of three runs. The terminal client ran without a terminal app around it; the Electron-based client ran in a fresh, empty profile.">
+</picture>
 
-Why: a number is published here only when it was measured by this
-procedure under the same conditions as the rows next to it, which means
-the same machine, the same cluster, the same day and the same state (the
-list of all pods, loaded, nothing else opened). Memory, CPU and launch
-time depend on all of these. On this machine a software rasterizer alone
-accounts for more than half of Skiff's memory (see
-[Caveats](#caveats)), and it would cost a different amount in a program
-that draws differently. Figures taken from somewhere else, such as a
-vendor's page, a review or another machine, cannot be set beside ours
-honestly, so we do not use them. Other programs have not been installed
-or run in the environment where Skiff's numbers were taken.
+Skiff 0.1.0 (build 41) and two similar programs
+were measured by the project's owner on 2026-11-24, on one Apple M1 Pro
+Mac, with [`hack/bench/run.sh`](../hack/bench/README.md). All three
+looked at the same local kwok test cluster (100 nodes, 5,415 pods), each
+with its pod list open. Every value is the median of three runs.
 
-When other rows exist they are identified by what kind of program they
-are ("Electron-based client A", "terminal client in a terminal
-emulator"), not by product name. The point of the comparison is what an
-architecture costs, and a neutral label keeps it from reading as a claim
-about somebody's product that they have had no chance to check.
+| Row | Memory, physical footprint | Processes | Idle CPU, % of one core |
+| --- | --- | --- | --- |
+| Skiff 0.1.0 | 146 MiB | 1 | 0.1 |
+| Terminal UI client | 397 MiB | 2 | 16.2 |
+| Electron-based client | 893 MiB | 6 | 7.9 |
 
-The numbers behind the figure are in
-[`hack/bench/results/`](../hack/bench/results/), one file for each
-machine and day:
+In these runs the terminal UI client's footprint was about 2.7 times
+Skiff's and the Electron-based client's about 6.1 times.
 
-| Row | Memory, PSS | Processes | Download | Window visible, warm | Idle CPU, % of one core |
-| --- | --- | --- | --- | --- | --- |
-| Skiff 0.1.0 (`65653da`), update check off, software rendering | 162 MiB (161 - 163) | 1 | 15.7 MB (.tar.gz; .deb 11.3 MB, AppImage 15.4 MB) | 161 ms (149 - 256) | 0.50 (0.47 - 0.55) |
+The numbers are in
+[`hack/bench/results/2026-11-24-macos-arm64-m1pro.json`](../hack/bench/results/2026-11-24-macos-arm64-m1pro.json),
+and the figure is drawn from that file.
 
-### Measure similar software on your own machine
+### What to keep in mind when reading it
 
-You need a Linux machine with an X display (or `Xvfb`), `python3`,
-`xdotool` and the programs you want to compare. Do everything on **one**
-machine, on one day, against the same cluster.
+- **Memory here is not PSS.** macOS has no PSS figure. The memory column
+  is the physical footprint, the number Activity Monitor shows, summed
+  over each app's process tree. It is not comparable with the Linux PSS
+  numbers on the rest of this page: 146 MiB here and 162 MiB there are
+  two quantities on two machines, not a difference between platforms.
+- **The terminal UI client ran without a terminal app.** It was started
+  inside a minimal wrapper, with no terminal app around it. Somebody
+  using it runs a terminal app as well, and that would add to its
+  memory, processes and CPU. Its row is therefore lower than what a user
+  would see.
+- **The Electron-based client ran in a fresh, empty profile** limited to
+  the test cluster: no other clusters, no extensions, no earlier state.
+- **Medians only.** Each value is the median of three runs. The smallest
+  and largest run are not given because only the medians were recorded
+  in this repository; the raw files of the runs are on the owner's
+  machine and are not checked in. Three runs is a small sample.
+- **One machine, one day, one state.** An M1 Pro, the pod list of a
+  cluster of 5,415 simulated pods, nothing else opened. Other views,
+  other clusters, a long session and other machines were not measured.
+- **Not measured on macOS:** download size, time to a visible window and
+  the launch timings. The script cannot time launches on macOS.
+- **Skiff's update check was on** in these runs (see the next
+  paragraph); it was off in the Linux steady-state runs.
 
-1. Start the test cluster and build Skiff:
+### Hosts contacted in the first minute
+
+Observed in the same runs: in its first minute Skiff made one connection
+to a host other than the cluster, its update check (what that request
+is and how to turn it off is under
+[Network and processes](#network-and-processes-during-the-first-60-s)).
+The Electron-based client, in its fresh profile, made connections to 7
+hosts other than the cluster in its first minute. No count was reported
+for the terminal UI client.
+
+This is a count of hosts on one first start. It does not say what was
+sent, and a profile that is not fresh may behave differently.
+
+### Why the rows have no product names
+
+Other programs are identified by what kind of program they are
+("Terminal UI client", "Electron-based client"), never by product name
+or version, here and everywhere else in this repository. The comparison
+is about what an architecture costs, and a neutral label keeps it from
+reading as a claim about somebody's product that they have had no chance
+to check. The price is that the two rows cannot be checked by name; the
+way to check them is to run the procedure below on similar software of
+your choice.
+
+A row is published only when it was measured by this procedure under the
+same conditions as the rows next to it: the same machine, the same
+cluster, the same day and the same state. Figures taken from somewhere
+else, such as a vendor's page, a review or another machine, are not
+used.
+
+On Linux only Skiff has been measured. Its row is in
+[`hack/bench/results/2026-11-23-linux-x86_64-kvm.json`](../hack/bench/results/2026-11-23-linux-x86_64-kvm.json)
+and in the figure at the top of this page; no other program was
+installed or run on that machine.
+
+### Measure similar software on your own Mac
+
+This is the procedure behind the figure above. You need `python3`, the
+tools the test cluster needs (see `hack/cluster-up.sh`), and the
+programs you want to compare. Do everything on **one** machine, on one
+day, against the same cluster. The macOS path of the script has been run
+on one Mac only; see
+[hack/bench/README.md](../hack/bench/README.md).
+
+1. Start the test cluster and install Skiff (the release `.dmg`, or
+   build it with `hack/macos-app.sh`):
 
    ```sh
    hack/cluster-up.sh
    export KUBECONFIG=$PWD/hack/kubeconfig
-   cargo build --release -p skiff
-   hack/linux-package.sh --binary target/release/skiff --out target/dist
    ```
 
-2. Measure Skiff. This writes its results to `target/bench/mine` and
-   takes about eight minutes:
+2. Measure each program with the generic mode, three times. `--label`
+   names the raw files and stays on your machine; the launch command
+   follows `--`:
 
    ```sh
-   hack/bench/run.sh skiff --runs 10 --out target/bench/mine
+   for run in 1 2 3; do
+     hack/bench/run.sh app --label "skiff" --out target/bench/mine/run$run \
+       -- /Applications/Skiff.app/Contents/MacOS/Skiff --context scale --view pods
+     hack/bench/run.sh app --label "other" --out target/bench/mine/run$run \
+       -- /path/to/the/other/program
+   done
    ```
 
-   Add `--xvfb` only if every program in the comparison will be measured
-   under Xvfb; see the rules below.
+   Each time, the script starts the program and asks you to open the pod
+   list of the `scale` context. **Press Enter in the terminal when the
+   list is fully loaded**, then leave the program alone. Five seconds
+   later the script records memory and processes, watches CPU for 60
+   idle seconds and closes the program. The row it prints also lists the
+   remote addresses the program's sockets had during the first 60
+   seconds (from `lsof` snapshots five times a second, which can miss a
+   connection shorter than that).
 
-3. Measure the other program with the generic mode. `--label` names the
-   raw files and stays on your machine; `--installed` is the installed
-   program; the launch command follows `--`:
+   A terminal client needs something to run in. Start it in a terminal
+   app if you can, which is then measured with it, or in a bare wrapper
+   as was done here; say which in the row's notes. The wrapper used for
+   the published row is not in this repository.
 
-   ```sh
-   hack/bench/run.sh app --label "other 1.2.3" --window-runs 10 \
-     --installed /path/to/installed/app --out target/bench/mine \
-     -- /path/to/installed/app
-   ```
-
-   The script first launches the program ten times and times each launch
-   until a window is visible. Then it starts it once more and asks you to
-   open the list of all pods in all namespaces of the `scale` context.
-   **Press Enter in the terminal when the list is fully loaded**, then
-   leave the program alone. Five seconds later the script records memory
-   and processes, watches CPU for 60 idle seconds, saves a screenshot and
-   closes the program. Do this three times (a different `--out` each
-   time, or move the files) if you intend to publish the result.
-
-4. Start a results file for your machine by copying ours and editing its
-   `conditions` (the facts are in `target/bench/mine/machine.txt`), then
-   add the rows:
+3. Start a results file by copying ours, edit its `conditions`, set
+   `"rows"` to `[]`, and add the rows:
 
    ```sh
-   cp hack/bench/results/2026-11-23-linux-x86_64-kvm.json hack/bench/results/mine.json
+   cp hack/bench/results/2026-11-24-macos-arm64-m1pro.json hack/bench/results/mine.json
    # edit "conditions" in mine.json, and set "rows" to []
    hack/bench/results.py add hack/bench/results/mine.json --subject \
      --label "Skiff 0.1.0" --category native \
-     --steady "target/bench/mine/Skiff-0.1.0-x86_64-unknown-linux-gnu.steady.json" \
-     --window "target/bench/mine/Skiff-0.1.0-x86_64-unknown-linux-gnu.startup-window.json" \
-     --download target/dist/skiff-linux-x86_64.tar.gz
+     --steady target/bench/mine/run1/skiff.steady.json \
+     --steady target/bench/mine/run2/skiff.steady.json \
+     --steady target/bench/mine/run3/skiff.steady.json
    hack/bench/results.py add hack/bench/results/mine.json \
-     --label "Electron-based client A" --category electron \
-     --steady target/bench/mine/other-1.2.3.steady.json \
-     --window target/bench/mine/other-1.2.3.startup-window.json \
-     --download ~/Downloads/the-file-you-downloaded
+     --label "Electron-based client" --category electron \
+     --steady target/bench/mine/run1/other.steady.json \
+     --steady target/bench/mine/run2/other.steady.json \
+     --steady target/bench/mine/run3/other.steady.json
    ```
 
-   Repeat `--steady` for each of several runs; the row then holds the
-   median and the range. The label in the results file is a neutral
-   description, never a product name. The categories and the file format
-   are described in
+   The row then holds the median and the range of the three runs. From a
+   run made on macOS `results.py` takes the physical footprint, from a
+   run made on Linux the PSS, and it refuses to put the two in one file.
+   The label in the results file is a neutral description, never a
+   product name. The categories and the file format are described in
    [hack/bench/README.md](../hack/bench/README.md#the-results-file).
 
-5. Draw the figures:
+4. Draw the figures:
 
    ```sh
    hack/bench/chart.py hack/bench/results/mine.json --out target/bench/mine
    ```
 
-   This writes `compare-light.svg` and `compare-dark.svg`. With two or
-   more rows the figure is one panel of bars for each metric. Without
-   `--out` the figures in `docs/img` are replaced; `--copy site/img`
-   writes the website's copies too.
+   This writes `compare-light.svg` and `compare-dark.svg` into
+   `target/bench/mine`, one panel of bars for each metric.
+
+### On Linux
+
+The same steps work on a Linux machine with an X display (or `Xvfb`) and
+`xdotool`, with three differences. Memory is PSS. `hack/bench/run.sh
+skiff --runs 10 --out target/bench/mine` measures Skiff in full (launch
+timings, steady state, trace; about eight minutes). And `--window-runs
+10` on `run.sh app` first times ten launches until a window is visible,
+which `results.py add --window <slug>.startup-window.json` puts in the
+row; `--download <file>` adds the size of the file a user downloads.
+Start from `hack/bench/results/2026-11-23-linux-x86_64-kvm.json`.
 
 Rules, in short (the full list is in
 [hack/bench/README.md](../hack/bench/README.md)):
 
 - Do not mix rows from different machines or days in one file, and do
   not copy a number from anywhere but the script's output.
-- Either every row is measured on the real display or every row under
-  `--xvfb`. Xvfb has no GPU.
+- Never put a macOS footprint next to a Linux PSS.
+- On Linux, either every row is measured on the real display or every
+  row under `--xvfb`. Xvfb has no GPU.
 - A program measured inside a terminal emulator or a browser includes
-  the terminal emulator or the browser.
+  the terminal emulator or the browser. A terminal client measured
+  without one says so in its notes.
 - "Window visible" is when any window of the program is on the display,
   even an empty one or a splash screen. It is not the time until pods are
   listed. That time is published for Skiff only (see [Launch](#launch)),
@@ -418,8 +498,14 @@ measurement on this page; the check is named.
   passes on the download, and a build compiled with `SKIFF_TEAM_ID`
   additionally requires that Developer ID team
   (`crates/skiff/src/update.rs`, `verify`). This is read from the code;
-  no macOS build was run here, and a build without `SKIFF_TEAM_ID` checks
-  only that the signature is intact, not who made it.
+  an update install was not exercised in any measurement on this page. A
+  build without `SKIFF_TEAM_ID` checks only that the signature is
+  intact, not who made it. The released macOS build is signed with a
+  Developer ID (Developer ID Application: Tsenko Tsenkov, team
+  `2632424VR2`) and notarized by Apple, as the release run for build 41
+  reported; the release workflow compiles the team ID into every build
+  it signs (`.github/workflows/release.yml`, step "Build"). Windows
+  builds are not signed.
 - **TLS.** `rustls` with `ring`; no OpenSSL is linked (`cargo tree`;
   `ldd` shows only libc, libm and libgcc_s).
 - **Licence.** MIT (`LICENSE`, `Cargo.toml`).
@@ -431,5 +517,8 @@ measurement on this page; the check is named.
   dependencies. This is a count, not a claim that it is small; CI runs
   `cargo-deny` against the advisory database.
 - **Not claimed.** That Skiff has no vulnerabilities (it is new and has
-  had no independent review), anything about memory or speed on a real
-  GPU, and anything about other software.
+  had no independent review), anything about memory or speed on Linux
+  with a real GPU or on Windows, and anything about other software
+  beyond the measurements in the
+  [comparison section](#comparison-with-similar-software), under the
+  conditions and caveats given there.

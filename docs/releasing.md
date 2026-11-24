@@ -10,6 +10,13 @@ Nothing below is required for a release to come out: with no secrets
 configured the pipeline publishes complete, **unsigned** builds, and the
 release notes say so.
 
+**Where things stand on 2026-11-24:** the repository is public and the
+site is live; the macOS build is signed with a Developer ID and notarized
+(seen in the release run of `build-41`); the Windows build is unsigned;
+the README, the docs and the site say exactly that, and the notes about
+download links that do not work yet are gone. The boxes below are not
+ticked here: this page cannot see the repository's settings.
+
 ## 1. Before making the repository public
 
 Going public cannot be undone in any useful sense: history, pull
@@ -57,7 +64,8 @@ Fix:
 Check:
 
 - [ ] Read the README, `docs/` and `site/index.html` once as a stranger
-      would. They describe unsigned builds; that stays true until step 5.
+      would. They describe which builds are signed; keep that in step
+      with [step 5](#5-signing-each-part-optional-any-order).
 - [ ] Build the documentation pages, `python3 hack/site-build.py`, and
       click through them (`python3 -m http.server -d site`).
 - [ ] Run the secret search yourself once more: `git log -p --all | grep
@@ -66,7 +74,7 @@ Check:
 - [ ] The download links and the release badge lead nowhere until a
       stable release exists: the three releases so far are prereleases,
       and `/releases/latest` answers 404 for those. The README and the
-      site say so. Plan [step 6](#6-cut-v010) for the same day, or accept
+      site no longer warn about this. Plan [step 6](#6-cut-v010) for the same day, or accept
       the gap.
 - [ ] After a rewrite, if any: do not rewrite the history of `main` from
       here on. The build number is the number of commits and must only
@@ -140,6 +148,31 @@ each are in [packaging/README.md](../packaging/README.md#secrets-and-variables).
 
 Linux packages are not signed; there is nothing to configure.
 
+**Windows through the SignPath Foundation.** The foundation signs
+open-source projects' Windows binaries free of charge, and Skiff is
+applying. The Windows job of `release.yml` has the steps for it, but they
+are skipped until the secret `SIGNPATH_API_TOKEN` and the three
+`SIGNPATH_*` variables exist, and they have never run
+([packaging/README.md](../packaging/README.md#secrets-and-variables)).
+Nothing is signed by SignPath today. Its conditions, as
+understood here (read the current ones on signpath.org before applying):
+an OSI licence, a "Code signing policy" page linked from the home page
+that names committers, reviewers and approvers and states the privacy
+policy ([code-signing-policy.md](code-signing-policy.md), linked from the
+README and the site's download section), binaries built from the public
+source by a verifiable CI, and two-factor authentication on the accounts
+involved.
+
+- [ ] Confirm two-factor authentication is on for the owner's GitHub
+      account; the policy states it as a rule.
+- [ ] Apply at signpath.org with the policy page's address.
+- [ ] If accepted: add the four `SIGNPATH_*` values to the `release`
+      environment as packaging/README.md describes, check that a nightly
+      comes out signed, then in the policy move the "once approved" note
+      into the table, and update the Windows statements in `README.md`,
+      `docs/install.md`, `docs/troubleshooting.md`, `docs/security.md`
+      and `site/index.html`.
+
 After adding secrets:
 
 - [ ] Actions → Release → Run workflow builds everything without
@@ -150,10 +183,10 @@ After adding secrets:
 - [ ] The first Developer ID build changes what installed Macs accept:
       copies of unsigned builds update to it normally; signed copies then
       refuse anything not signed by the same team.
-- [ ] When builds are notarized and signed, remove the "first launch"
-      notes from `README.md`, `docs/install.md`,
-      `docs/troubleshooting.md` and the FAQ in `site/index.html`, and
-      update the "Current limit" paragraph in `docs/security.md`.
+- [x] macOS: the "first launch" notes are removed from `README.md`,
+      `docs/install.md`, `docs/troubleshooting.md` and the FAQ in
+      `site/index.html`, and `docs/security.md` is updated. The Windows
+      notes stay until the Windows build is signed.
 
 ## 6. Cut v0.1.0
 
@@ -180,8 +213,8 @@ After adding secrets:
       authors beyond what CI does; the first release is the first real
       test of the installers and of the macOS updater.
 - [ ] Open the site and click each download button.
-- [ ] Remove the "until the first stable release" notes from the Install
-      section of `README.md` and the Download section of
+- [x] The "until the first stable release" notes are removed from the
+      Install section of `README.md` and the Download section of
       `site/index.html`.
 
 ## 7. After the release

@@ -10,8 +10,10 @@ here.
 
 ## [Unreleased]
 
-The first version meant for people other than its authors. It will be
-released as 0.1.0.
+## [0.1.0] - 2026-11-24
+
+The first stable release, and the first version meant for people other
+than its authors.
 
 ### Added
 
@@ -118,13 +120,19 @@ released as 0.1.0.
 - A credential plugin's output (where the token is) is never shown in
   error messages.
 - Release builds come from one workflow with pinned actions, checksums
-  and, for a public repository, build provenance attestations.
+  and build provenance attestations
+  ([checking a download](docs/install.md#checking-a-download)).
+- **The macOS build is signed with an Apple Developer ID and notarized by
+  Apple**; it opens without a first-launch warning.
+- A [code signing policy](CODE_SIGNING_POLICY.md) says who may release
+  Skiff, where the binaries are built and what the program sends over the
+  network.
 
 ### Known limits
 
-- Builds are not yet signed by Apple or Microsoft: macOS and Windows ask
-  for confirmation on first launch
-  ([docs/install.md](docs/install.md)).
+- The Windows build is not yet signed: Windows asks for confirmation on
+  first launch ([docs/install.md](docs/install.md#windows)). Linux
+  packages carry no signature.
 - The Windows build and the new installers and packages have had no use
   yet beyond automated checks.
 - Metrics queries have been tested against the project's simulated
@@ -138,4 +146,5 @@ YAML editing, logs, the built-in shell, port forwarding, the command
 palette, vim-style keys with custom bindings, and in-app updates on
 macOS.
 
-[Unreleased]: https://github.com/TsenkoTsenkov/skiff/commits/main
+[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/TsenkoTsenkov/skiff/releases/tag/v0.1.0
