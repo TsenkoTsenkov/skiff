@@ -1,5 +1,6 @@
 # Skiff
 
+[![Website](https://img.shields.io/badge/website-tsenkotsenkov.github.io%2Fskiff-2ea44f)](https://tsenkotsenkov.github.io/skiff/)
 [![CI](https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml/badge.svg)](https://github.com/TsenkoTsenkov/skiff/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/TsenkoTsenkov/skiff?label=release)](https://github.com/TsenkoTsenkov/skiff/releases)
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
@@ -15,6 +16,9 @@ and talks to the API server the way `kubectl` does.**
 a working kubeconfig, and you want a window that opens at once, stays
 quick on a cluster with thousands of pods, and does nothing with your
 credentials that `kubectl` would not do.
+
+**Website: <https://tsenkotsenkov.github.io/skiff/>**, with downloads,
+screenshots and [the documentation](https://tsenkotsenkov.github.io/skiff/docs/).
 
 [![Skiff demo: the cluster overview with firing alerts; the command palette jumping to pods and a filter typed into the table; a pod's CPU and memory charts; logs followed live; a shell in a container; a cluster made read-only, after which Delete is greyed out; the settings switching between light and dark](docs/demo/skiff-demo.gif)](docs/demo/skiff-demo.mp4)
 
@@ -36,7 +40,7 @@ cluster. Click it for the video.
 - **Guard rails.** Mark a cluster read-only and Skiff refuses every
   change to it.
 
-[Install](#install) · [Quick start](#quick-start) · [Common setups](#common-setups) · [Features](#features) · [How it compares](#how-it-compares) · [Docs](#documentation) · [Security](#security) · [Support](#support)
+[Website](https://tsenkotsenkov.github.io/skiff/) · [Install](#install) · [Quick start](#quick-start) · [Common setups](#common-setups) · [Features](#features) · [How it compares](#how-it-compares) · [Docs](#documentation) · [Security](#security) · [Support](#support)
 
 ## Install
 
