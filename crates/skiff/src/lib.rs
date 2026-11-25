@@ -13,6 +13,7 @@ pub mod metrics_view;
 pub mod motion;
 pub mod overview;
 pub mod pages;
+pub mod prom_connect;
 pub mod palette;
 pub mod settings;
 pub mod shell;

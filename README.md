@@ -169,7 +169,9 @@ Skiff stores none:
 }
 ```
 
-See [Prometheus outside the cluster](docs/observability.md#prometheus-outside-the-cluster).
+Or set it up without editing anything: Settings → Clusters → **Change…**
+next to "Prometheus", pick the service, and **Test connection**. See
+[Prometheus outside the cluster](docs/observability.md#prometheus-outside-the-cluster).
 
 `production` in these examples is the kubeconfig context name. Every key
 of `config.json` is in [docs/configuration.md](docs/configuration.md).

@@ -27,7 +27,7 @@ pub use kubeconfig::{find_executable, KubeconfigProblem, KubeconfigSources, Load
 pub use logs::{LogLine, LogOptions, LogStream, LogTarget, SourceState};
 pub use ops::{ContainerInfo, ObjectData};
 pub use prom::{
-    Alert, AlertKind, AlertTarget, ExternalAuth, ExternalEndpoint, Prom, PromConfig, PromEndpoint, PromError, SampleRing,
+    Alert, AlertKind, AlertTarget, ConnectionTest, ExternalAuth, ExternalEndpoint, Prom, PromConfig, PromEndpoint, PromError, SampleRing,
     SecretSource, TimeRange,
 };
 pub use session::{
