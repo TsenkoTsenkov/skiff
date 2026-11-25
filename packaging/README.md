@@ -17,6 +17,7 @@ The scripts that use them are in `hack/`:
 | Script | Runs on | Makes |
 |---|---|---|
 | `hack/macos-app.sh --universal --dmg --zip` | a Mac | `Skiff.app`, `Skiff-macos-universal.dmg`, the updater zips |
+| `hack/macos-app.sh --target aarch64-apple-darwin --dmg` | a Mac | `Skiff.app` for Apple Silicon only, `Skiff-macos-arm64.dmg` |
 | `hack/linux-package.sh` | Linux | `dist/skiff-linux-<arch>.tar.gz`, `dist/skiff_<amd64\|arm64>.deb`, `dist/Skiff-linux-<arch>.AppImage` |
 | `hack/windows-package.ps1` | Windows | `dist\Skiff-windows-x64.zip`, `dist\Skiff-windows-x64-setup.exe` |
 
@@ -62,6 +63,7 @@ always points at the current stable one:
 
 ```
 Skiff-macos-universal.dmg
+Skiff-macos-arm64.dmg                (the Apple Silicon half on its own)
 Skiff-macos-arm64-build-<N>.zip      (for the in-app updater)
 Skiff-macos-x86_64-build-<N>.zip     (the same app, for Intel Macs' updater)
 Skiff-windows-x64-setup.exe

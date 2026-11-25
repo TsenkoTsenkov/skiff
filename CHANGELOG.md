@@ -10,6 +10,13 @@ here.
 
 ## [Unreleased]
 
+### Added
+
+- **An Apple Silicon-only download for macOS**, `Skiff-macos-arm64.dmg`:
+  the native arm64 build without the Intel half, so about half the size
+  of the universal disk image. The universal image stays, and both update
+  themselves the same way.
+
 ## [0.1.1] - 2026-11-25
 
 ### Added
