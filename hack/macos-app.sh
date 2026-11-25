@@ -315,7 +315,20 @@ if [ "$dmg" = 1 ]; then
   ditto "$app" "$stage/Skiff.app"
   ln -s /Applications "$stage/Applications"
   rm -f "$image"
-  hdiutil create -volname Skiff -srcfolder "$stage" -ov -format UDZO "$image" >/dev/null
+  # hdiutil sometimes fails with "Resource busy" while a background process
+  # (on CI runners, often the scan of the previous image) still holds the
+  # disk-image device; that passes after a few seconds.
+  tries=0
+  until hdiutil create -volname Skiff -srcfolder "$stage" -ov -format UDZO "$image" >/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 5 ]; then
+      echo "hdiutil create failed $tries times" >&2
+      exit 1
+    fi
+    echo "hdiutil create failed; trying again in $((tries * 5)) s" >&2
+    rm -f "$image"
+    sleep $((tries * 5))
+  done
   rm -rf "$stage"
   if [ -n "$identity" ]; then
     codesign --force --timestamp ${keychain_args[@]+"${keychain_args[@]}"} --sign "$identity" "$image"
