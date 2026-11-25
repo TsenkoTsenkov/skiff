@@ -30,6 +30,14 @@ Skiff connects to two places.
    `SKIFF_NO_UPDATE_CHECK=1`. On macOS, choosing **Update** also downloads
    the new app from GitHub.
 
+A third destination exists only when you set one: a Prometheus outside
+the cluster (`clusters.<context>.prometheus.url`), queried directly over
+HTTPS. Its credential is obtained when needed by a program you choose or
+by your cloud's CLI (`az`, `aws`, `gcloud`), or read from an environment
+variable or file you name; it is held in memory only and never written by
+Skiff, and it is sent only over HTTPS (or to this computer)
+([observability.md](observability.md#prometheus-outside-the-cluster)).
+
 Links (a release page, the project page, your Grafana) are opened in your
 browser, not fetched by Skiff.
 

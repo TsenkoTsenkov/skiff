@@ -255,7 +255,7 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
     };
     let alerts = session.alerts();
     let shown: Vec<&Alert> = alerts.items.iter().filter(|a| alert_in_scope(a, ns)).collect();
-    let source = format!("Prometheus · {}/{}", prom.endpoint().namespace, prom.endpoint().service);
+    let source = format!("Prometheus · {}", prom.source());
     let mut action = None;
 
     ui.add_space(16.0);
@@ -271,9 +271,14 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
     });
     ui.add_space(4.0);
     if let Some(error) = &alerts.error {
+        let text = match error {
+            // Not a failure: a managed Prometheus keeps its alerts elsewhere.
+            PromError::Unsupported(msg) => msg.clone(),
+            other => format!("The alerts could not be loaded. {other}"),
+        };
         ui.horizontal(|ui| {
             ui.label(widgets::icon(icons::ICON_INFO, 16.0).color(pal.faint));
-            ui.add(egui::Label::new(RichText::new(format!("The alerts could not be loaded. {error}")).color(pal.muted)).wrap());
+            ui.add(egui::Label::new(RichText::new(text).color(pal.muted)).wrap());
         });
         return None;
     }

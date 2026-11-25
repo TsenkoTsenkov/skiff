@@ -10,6 +10,21 @@ here.
 
 ## [Unreleased]
 
+### Added
+
+- **Prometheus outside the cluster**, such as a cloud's managed
+  Prometheus: set `clusters.<context>.prometheus.url` to its address.
+  Azure Monitor (`"auth": "azure"`, a token from `az`), Amazon Managed
+  Service for Prometheus (`"auth": "aws"`, signed requests with
+  credentials from the AWS CLI), Google Cloud (`"auth": "gcp"`) and
+  anything that takes a bearer token or a user name and password (from
+  a command, an environment variable or a file) work. Skiff stores no
+  credential for it. `labels` narrows every query to one cluster of a
+  workspace that holds several, and `headers` adds a tenant header for
+  Mimir, Cortex or Thanos. Charts work as for a Prometheus in the
+  cluster; services without an alerts API (Azure, Google) say so on the
+  overview.
+
 ### Changed
 
 - **Searching logs keeps every line on screen** and highlights the

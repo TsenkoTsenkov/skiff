@@ -50,6 +50,10 @@ back after you edited it. There are no secrets in it.
 | `clusters.<context>.prometheus.port` | number, 1 to 65535 | `9090` | Port of the Prometheus Service. |
 | `clusters.<context>.prometheus.scheme` | `"http"` or `"https"` | `"http"` | What Prometheus itself speaks inside the cluster. |
 | `clusters.<context>.prometheus.path_prefix` | text | `""` | Path in front of `/api/v1`, for example `/select/0/prometheus` for VictoriaMetrics. |
+| `clusters.<context>.prometheus.url` | http or https URL | none | A Prometheus outside the cluster, such as a cloud's managed Prometheus (Azure Monitor, Amazon, Google Cloud, Grafana Cloud): the address in front of `/api/v1`. It is used instead of namespace and service, and reached directly rather than through the API server. |
+| `clusters.<context>.prometheus.auth` | object | no credentials | How Skiff signs in to the Prometheus at url. `"type"` is `"azure"`, `"aws"`, `"gcp"`, `"bearer"` or `"basic"`. The credential comes from the cloud's command line tool, a command, an environment variable or a file; it is never written in this file. |
+| `clusters.<context>.prometheus.labels` | object of label names to values | none | With url: label matchers added to every query, for a Prometheus that holds the metrics of several clusters, such as `{"cluster": "aks-prod"}`. Alerts labelled for another cluster are left out. |
+| `clusters.<context>.prometheus.headers` | object of header names to values | none | With url: extra request headers that are not secret, such as `X-Scope-OrgID` for a Grafana Mimir, Cortex or Thanos tenant. |
 | `clusters.<context>.grafana_url` | http or https URL | none | Address of your Grafana, for "Open in Grafana" links. Opened in the browser; no login is stored. |
 
 `<context>` is the name of a kubeconfig context. This table is the one in
@@ -80,6 +84,14 @@ A complete file using every key:
         "path_prefix": ""
       },
       "grafana_url": "https://grafana.example.com"
+    },
+    "aks-prod": {
+      "prometheus": {
+        "url": "https://myworkspace-abcd.westeurope.prometheus.monitor.azure.com",
+        "auth": { "type": "azure" },
+        "labels": { "cluster": "aks-prod" },
+        "headers": {}
+      }
     }
   }
 }
@@ -87,9 +99,12 @@ A complete file using every key:
 
 JSON has no comments. Notes on single keys:
 
-- `prometheus`: a mistake in one of its fields drops the whole override,
-  with a warning, and the automatic search is used. See
-  [observability.md](observability.md).
+- `prometheus`: either `namespace` and `service` (a Prometheus in the
+  cluster) or `url` (one outside it, with `auth`, `labels` and `headers`).
+  A mistake in one of its fields drops the whole override, with a
+  warning, and the automatic search is used. See
+  [observability.md](observability.md#prometheus-outside-the-cluster)
+  for every kind of `auth`.
 - `grafana_url`: must be an `http://` or `https://` address without a user
   name or password in it.
 - `read_only` and `confirm` are also in the cluster menu and in

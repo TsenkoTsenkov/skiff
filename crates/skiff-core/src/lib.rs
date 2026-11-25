@@ -12,6 +12,7 @@ pub mod kubeconfig;
 pub mod logs;
 pub mod ops;
 pub mod prom;
+mod prom_external;
 pub mod session;
 pub mod table;
 pub mod util;
@@ -25,7 +26,10 @@ pub use kinds::{Builtin, Category, Discovered, ResourceKey, BUILTINS};
 pub use kubeconfig::{find_executable, KubeconfigProblem, KubeconfigSources, LoadedKubeconfig};
 pub use logs::{LogLine, LogOptions, LogStream, LogTarget, SourceState};
 pub use ops::{ContainerInfo, ObjectData};
-pub use prom::{Alert, AlertKind, AlertTarget, Prom, PromEndpoint, PromError, SampleRing, TimeRange};
+pub use prom::{
+    Alert, AlertKind, AlertTarget, ExternalAuth, ExternalEndpoint, Prom, PromConfig, PromEndpoint, PromError, SampleRing,
+    SecretSource, TimeRange,
+};
 pub use session::{
     load_contexts, load_contexts_from, Alerts, ConnStatus, ContextInfo, Contexts, Core, Metrics, PromStatus, Session, Usage,
     UsageHistory,

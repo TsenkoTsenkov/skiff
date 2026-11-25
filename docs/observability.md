@@ -5,12 +5,19 @@ already runs in your cluster. It reaches it through the Kubernetes API
 server, with the cluster credentials it already has: there is nothing to
 install, no second address to open, and no extra login to store.
 
+It can also use a Prometheus outside the cluster, such as a cloud's
+managed Prometheus (Azure Monitor, Amazon Managed Service for
+Prometheus, Google Cloud Managed Service for Prometheus, Grafana Cloud)
+or any Prometheus-compatible API: see
+[Prometheus outside the cluster](#prometheus-outside-the-cluster).
+
 ![CPU, memory and network charts on a pod's Metrics tab](img/metrics.png)
 
 - [The Metrics tab](#the-metrics-tab)
 - [Firing alerts](#firing-alerts)
 - [How Prometheus is found](#how-prometheus-is-found)
 - [Telling Skiff where Prometheus is](#telling-skiff-where-prometheus-is)
+- [Prometheus outside the cluster](#prometheus-outside-the-cluster)
 - [The permission it needs](#the-permission-it-needs)
 - [Without Prometheus: metrics-server](#without-prometheus-metrics-server)
 - [Grafana links](#grafana-links)
@@ -148,8 +155,123 @@ With `namespace` and `service` set, nothing is searched:
 `scheme` to `http` (what Prometheus speaks inside the cluster, not how you
 reach the API server). `path_prefix` is what comes before `/api/v1`: empty
 for Prometheus, `/select/0/prometheus` for VictoriaMetrics' vmselect. This
-must be a Service inside the cluster; a Prometheus outside it, or a hosted
-one that needs its own credentials, cannot be used.
+must be a Service inside the cluster; for a Prometheus outside it, see the
+next section.
+
+## Prometheus outside the cluster
+
+Many clusters send their metrics to a Prometheus that is not in the
+cluster: a cloud's managed service, or a central Prometheus, Thanos,
+Mimir or VictoriaMetrics for every cluster. Give its address as `url`
+instead of `namespace` and `service`, say how to sign in with `auth`,
+and, when it holds the metrics of more than one cluster, which of them
+is this one with `labels`:
+
+```json
+{
+  "clusters": {
+    "aks-prod": {
+      "prometheus": {
+        "url": "https://myworkspace-abcd.westeurope.prometheus.monitor.azure.com",
+        "auth": { "type": "azure" },
+        "labels": { "cluster": "aks-prod" }
+      }
+    }
+  }
+}
+```
+
+`aks-prod` is the kubeconfig context name. `url` is everything in front
+of `/api/v1` (pasting an address that ends in `/api/v1` works too). Skiff
+connects to it directly, not through the API server: TLS is checked
+against your computer's trust store, and `HTTPS_PROXY` / `NO_PROXY`
+apply as they do for clusters. The source line of the Metrics tab names
+the host.
+
+**Skiff stores no secret for it.** As with a kubeconfig's exec plugin,
+the credential is obtained when it is needed: from the command line tool
+you already sign in with, or from a command, environment variable or
+file you name. Tokens from a command are kept in memory only, until
+shortly before they expire, and are asked for again when the service
+refuses one. A credential is only sent over `https` (or to this
+computer).
+
+### Signing in: `auth`
+
+| Service | `auth` | What it runs |
+| --- | --- | --- |
+| Azure Monitor managed service for Prometheus | `{ "type": "azure" }` | `az account get-access-token --resource https://prometheus.monitor.azure.com` |
+| Amazon Managed Service for Prometheus | `{ "type": "aws" }` | `aws configure export-credentials --format process`, then signs each request (Signature Version 4) |
+| Google Cloud Managed Service for Prometheus | `{ "type": "gcp" }` | `gcloud auth print-access-token` |
+| Anything that takes a bearer token | `{ "type": "bearer", "token_command": [...] }` | your command |
+| Grafana Cloud, or anything with a user name and password | `{ "type": "basic", "username": "…", "password_env": "…" }` | — |
+| No sign-in (a private network or VPN) | leave `auth` out | — |
+
+`"auth": "azure"` is short for `"auth": { "type": "azure" }`; the same
+works for `aws`, `gcp` and `none`.
+
+**Azure.** `url` is the *Query endpoint* on the Overview page of the
+Azure Monitor workspace. Sign in with `az login` first; your account needs
+the **Monitoring Data Reader** role on the workspace. Options: `tenant`
+(passed to `az` as `--tenant`, when the workspace is in another tenant
+than your default) and `resource` (for a sovereign cloud, e.g.
+`https://prometheus.monitor.azure.us`). The AKS metrics add-on labels
+every series with `cluster`, the name of the AKS cluster, so set
+`"labels": { "cluster": "<AKS cluster name>" }` when the workspace holds
+more than one cluster.
+
+**Amazon.** `url` is the workspace's endpoint without `/api/v1`, for
+example `https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1234abcd`.
+The region is read from that address (or set `region`). Options:
+`profile` (an AWS CLI profile; `AWS_PROFILE` works too) and
+`credentials_command` (any command that prints credentials the way a
+`credential_process` does). The credentials need `aps:QueryMetrics`, and
+`aps:ListAlerts` for alerts. AWS CLI version 2 is needed for
+`export-credentials`.
+
+**Google Cloud.** `url` is
+`https://monitoring.googleapis.com/v1/projects/<project>/location/global/prometheus`.
+Sign in with `gcloud auth login`; the account needs the Monitoring Viewer
+role. For a service account use `"type": "bearer"` with
+`"token_command": ["gcloud", "auth", "application-default", "print-access-token"]`.
+
+**A bearer token or a password** comes from exactly one of:
+
+- `token_command` / `password_command`: a program and its arguments as
+  a list, such as `["vault", "read", "-field=token", "secret/prometheus"]`.
+  It is run without a shell; what it prints is the secret. Its result is
+  used for five minutes.
+- `token_env` / `password_env`: the name of an environment variable.
+- `token_file` / `password_file`: a file (`~` works), read for every
+  request, so a rotated token is picked up.
+
+For Grafana Cloud, `username` is the instance ID of the Prometheus data
+source and the password an access policy token with `metrics:read`.
+
+The commands are looked up on your `PATH` (started from a launcher,
+Skiff takes it from your login shell). One that is missing, fails or
+takes longer than 60 seconds is reported on the Metrics tab with what
+it printed, for example "Please run 'az login'"; sign in, then choose
+**Look for Prometheus again**.
+
+### `labels` and `headers`
+
+- `labels`: label matchers added to every query (and used to leave out
+  alerts labelled for another cluster). `{ "cluster": "aks-prod" }` turns
+  `container_cpu_usage_seconds_total{namespace="shop"}` into
+  `container_cpu_usage_seconds_total{cluster="aks-prod",namespace="shop"}`.
+  The Open in Grafana link carries them too.
+- `headers`: extra request headers that are not secret, such as
+  `{ "X-Scope-OrgID": "team-a" }` for a Mimir, Cortex or Thanos tenant.
+  `Authorization` and `Host` are Skiff's to set.
+
+### Alerts from a managed Prometheus
+
+Firing alerts are read from `/api/v1/alerts` as for a Prometheus in the
+cluster. Amazon's service has it (rules in the workspace's rule groups);
+Azure's and Google's do not, because their alert rules live in the
+cloud's own alerting. For those the overview says so instead of listing
+alerts, and the charts work as usual.
 
 ## The permission it needs
 
@@ -250,8 +372,9 @@ program with no stored credentials and no web view:
   Grafana instead.
 - **A custom query box or dashboard builder.** Grafana's Explore, one
   click away, does this better.
-- **Prometheus outside the cluster, or with its own login.** That means
-  credentials Skiff would have to keep.
+- **Storing credentials for Prometheus.** A Prometheus outside the
+  cluster is supported, but its credential always comes from a tool,
+  command, variable or file you control, never from Skiff's own files.
 - **Log search across history** (Loki, Elasticsearch). Live logs are
   built in; history may come later.
 - **A plugin system.** More code to trust in a tool that holds cluster

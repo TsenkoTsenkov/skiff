@@ -258,13 +258,17 @@ fn system_clipboard_text() -> Option<String> {
 /// neither, asking for one does nothing at all.
 /// `clusters.<context>.prometheus` of the config file, as the endpoint the
 /// session should use instead of searching the cluster.
-fn prometheus_endpoint(config: &Config, context: &str) -> Option<skiff_core::PromEndpoint> {
-    config.cluster(context).prometheus.map(|p| skiff_core::PromEndpoint {
-        namespace: p.namespace,
-        service: p.service,
-        port: p.port,
-        scheme: p.scheme,
-        path_prefix: p.path_prefix,
+fn prometheus_endpoint(config: &Config, context: &str) -> Option<skiff_core::PromConfig> {
+    use crate::config::PrometheusOverride;
+    config.cluster(context).prometheus.map(|p| match p {
+        PrometheusOverride::Service(p) => skiff_core::PromConfig::Service(skiff_core::PromEndpoint {
+            namespace: p.namespace,
+            service: p.service,
+            port: p.port,
+            scheme: p.scheme,
+            path_prefix: p.path_prefix,
+        }),
+        PrometheusOverride::External(endpoint) => skiff_core::PromConfig::External(endpoint),
     })
 }
 

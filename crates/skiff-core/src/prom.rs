@@ -20,11 +20,15 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use kube::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ops::{collect_capped, BodyError};
+pub use crate::prom_external::{ExternalAuth, ExternalEndpoint, SecretSource, AZURE_PROMETHEUS_RESOURCE};
+use crate::prom_external::External;
 use crate::util::{classify, enc, enc_segment, get_request, ErrorKind};
 
 const JSON: &str = "application/json";
@@ -65,6 +69,12 @@ pub enum PromError {
     TooLarge,
     /// Anything else, including an answer that is not Prometheus' format.
     Other(String),
+    /// A Prometheus outside the cluster: no credential could be obtained,
+    /// or the service refused it.
+    Credentials(String),
+    /// The service does not offer this part of the Prometheus API (managed
+    /// services keep alert rules elsewhere and have no `/api/v1/alerts`).
+    Unsupported(String),
 }
 
 impl fmt::Display for PromError {
@@ -81,6 +91,8 @@ impl fmt::Display for PromError {
             PromError::Query(msg) => write!(f, "Prometheus rejected the query: {msg}"),
             PromError::TooLarge => f.write_str("Prometheus returned too much data. Pick a shorter time range."),
             PromError::Other(msg) => f.write_str(msg),
+            PromError::Credentials(msg) => write!(f, "Can't sign in to Prometheus: {msg}"),
+            PromError::Unsupported(msg) => f.write_str(msg),
         }
     }
 }
@@ -97,7 +109,7 @@ fn clip(s: &str) -> String {
     out
 }
 
-fn transport_error(e: &kube::Error) -> PromError {
+pub(crate) fn transport_error(e: &kube::Error) -> PromError {
     let info = classify(e);
     match info.kind {
         ErrorKind::Forbidden | ErrorKind::Unauthorized => PromError::Forbidden(info.summary),
@@ -108,7 +120,7 @@ fn transport_error(e: &kube::Error) -> PromError {
 
 /// Sorts a non-success answer. The body is either Prometheus' own error
 /// envelope (it did answer) or a Kubernetes `Status` from the proxy.
-fn classify_response(status: u16, body: &[u8]) -> PromError {
+pub(crate) fn classify_response(status: u16, body: &[u8]) -> PromError {
     if let Ok(env) = serde_json::from_slice::<Envelope>(body) {
         if env.status == "error" {
             return PromError::Query(env.error_text());
@@ -592,7 +604,7 @@ pub(crate) async fn search(client: &Client, extra_namespaces: &[&str]) -> Result
     let mut forbidden = None;
     let mut silent: Option<(String, PromEndpoint)> = None;
     for endpoint in candidates(&services).into_iter().take(MAX_PROBES) {
-        let prom = Prom::new(client.clone(), endpoint);
+        let prom = Prom::new(client.clone(), endpoint.clone());
         match probe_outcome(prom.ping_with_status().await) {
             Probe::Prometheus => return Ok(prom),
             Probe::Forbidden(msg) => {
@@ -600,7 +612,7 @@ pub(crate) async fn search(client: &Client, extra_namespaces: &[&str]) -> Result
             }
             Probe::Silent(reason) => {
                 if silent.is_none() {
-                    silent = Some((format!("{} ({reason})", prom.endpoint.display()), prom.endpoint));
+                    silent = Some((format!("{} ({reason})", endpoint.display()), endpoint));
                 }
             }
             // A lookalike. Saying "not answering" about it would be
@@ -620,20 +632,113 @@ pub(crate) async fn search(client: &Client, extra_namespaces: &[&str]) -> Result
 // ---------------------------------------------------------------------------
 // Client
 
-/// A Prometheus endpoint on one cluster connection. Cheap to clone.
+/// Where Skiff gets its Prometheus data from: the shape of
+/// `clusters.<context>.prometheus` in the config file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromConfig {
+    /// A Service in the cluster, reached through the API server.
+    Service(PromEndpoint),
+    /// A Prometheus-compatible API outside the cluster, such as a cloud's
+    /// managed Prometheus.
+    External(ExternalEndpoint),
+}
+
+impl From<PromEndpoint> for PromConfig {
+    fn from(endpoint: PromEndpoint) -> Self {
+        PromConfig::Service(endpoint)
+    }
+}
+
+impl From<ExternalEndpoint> for PromConfig {
+    fn from(endpoint: ExternalEndpoint) -> Self {
+        PromConfig::External(endpoint)
+    }
+}
+
+#[derive(Clone)]
+enum Transport {
+    /// Through the API server's service proxy, on the cluster connection.
+    Proxy { client: Client, endpoint: PromEndpoint },
+    External(Arc<External>),
+}
+
+/// A Prometheus endpoint Skiff can query. Cheap to clone.
 #[derive(Clone)]
 pub struct Prom {
-    client: Client,
-    endpoint: PromEndpoint,
+    transport: Transport,
+    /// Label matchers added to every selector (escaped, comma-separated;
+    /// empty for none).
+    scope: Arc<str>,
 }
 
 impl Prom {
+    /// A Prometheus Service in the cluster, through the API server.
     pub fn new(client: Client, endpoint: PromEndpoint) -> Self {
-        Prom { client, endpoint }
+        Prom { transport: Transport::Proxy { client, endpoint }, scope: Arc::from("") }
     }
 
-    pub fn endpoint(&self) -> &PromEndpoint {
-        &self.endpoint
+    /// A Prometheus outside the cluster. Checks the endpoint and sets up
+    /// its client; nothing is sent yet (see [`Self::ping`]).
+    pub async fn external(endpoint: ExternalEndpoint) -> Result<Self, PromError> {
+        let scope = Arc::from(endpoint.scope());
+        let external = External::connect(endpoint).await?;
+        Ok(Prom { transport: Transport::External(Arc::new(external)), scope })
+    }
+
+    /// The Service, for a Prometheus in the cluster.
+    pub fn service(&self) -> Option<&PromEndpoint> {
+        match &self.transport {
+            Transport::Proxy { endpoint, .. } => Some(endpoint),
+            Transport::External(_) => None,
+        }
+    }
+
+    /// The configured endpoint, for a Prometheus outside the cluster.
+    pub fn external_endpoint(&self) -> Option<&ExternalEndpoint> {
+        match &self.transport {
+            Transport::Proxy { .. } => None,
+            Transport::External(ext) => Some(ext.endpoint()),
+        }
+    }
+
+    /// Where the data comes from, for the source line of a view:
+    /// `monitoring/prometheus-operated`, or the host (and path) of a
+    /// Prometheus outside the cluster.
+    pub fn source(&self) -> String {
+        match &self.transport {
+            Transport::Proxy { endpoint, .. } => format!("{}/{}", endpoint.namespace, endpoint.service),
+            Transport::External(ext) => ext.endpoint().display(),
+        }
+    }
+
+    /// Identifies the endpoint (for messages and as a cache key):
+    /// `namespace/service:port`, or the host and path.
+    pub fn display(&self) -> String {
+        match &self.transport {
+            Transport::Proxy { endpoint, .. } => endpoint.display(),
+            Transport::External(ext) => ext.endpoint().display(),
+        }
+    }
+
+    /// The label matchers every query is narrowed with (for a managed
+    /// Prometheus that holds several clusters), as PromQL; empty for none.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// One GET of the Prometheus HTTP API.
+    async fn fetch(
+        &self,
+        api: &str,
+        params: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, (PromError, Option<u16>)> {
+        match &self.transport {
+            Transport::Proxy { client, endpoint } => {
+                get_with_status(client, &endpoint.api_path(api, params), MAX_BODY_BYTES, timeout).await
+            }
+            Transport::External(ext) => ext.get(api, params, MAX_BODY_BYTES, timeout).await,
+        }
     }
 
     /// Confirms that the endpoint speaks the Prometheus API, with a query
@@ -643,19 +748,21 @@ impl Prom {
     }
 
     async fn ping_with_status(&self) -> Result<(), (PromError, Option<u16>)> {
-        let path = self.endpoint.api_path("query", &[("query", "vector(1)")]);
-        let body = get_with_status(&self.client, &path, MAX_BODY_BYTES, PROBE_TIMEOUT).await?;
+        let body = self.fetch("query", &[("query", "vector(1)")], PROBE_TIMEOUT).await?;
         parse_query_response(&body).map(|_| ()).map_err(|e| (e, Some(200)))
     }
 
     /// Evaluates `expr` over a time range.
     pub async fn query_range(&self, expr: &str, range: &TimeRange) -> Result<QueryResult, PromError> {
         let (start, end, step) = (range.start.to_string(), range.end.to_string(), range.step.to_string());
-        let path = self.endpoint.api_path(
-            "query_range",
-            &[("query", expr), ("start", &start), ("end", &end), ("step", &step)],
-        );
-        let body = get(&self.client, &path, MAX_BODY_BYTES, QUERY_TIMEOUT).await?;
+        let body = self
+            .fetch(
+                "query_range",
+                &[("query", expr), ("start", &start), ("end", &end), ("step", &step)],
+                QUERY_TIMEOUT,
+            )
+            .await
+            .map_err(|(e, _)| e)?;
         parse_query_response(&body)
     }
 
@@ -667,27 +774,32 @@ impl Prom {
         if let Some(at) = &at {
             params.push(("time", at));
         }
-        let body = get(
-            &self.client,
-            &self.endpoint.api_path("query", &params),
-            MAX_BODY_BYTES,
-            QUERY_TIMEOUT,
-        )
-        .await?;
+        let body = self.fetch("query", &params, QUERY_TIMEOUT).await.map_err(|(e, _)| e)?;
         parse_query_response(&body)
     }
 
     /// The alerts that are firing right now, most severe first, and how
-    /// many more are firing than were kept (see [`MAX_ALERTS`]).
+    /// many more are firing than were kept (see [`MAX_ALERTS`]). With a
+    /// [`Self::scope`], alerts labelled for another cluster are left out.
+    /// A managed Prometheus without an alerts API answers
+    /// [`PromError::Unsupported`].
     pub async fn firing_alerts(&self) -> Result<(Vec<Alert>, usize), PromError> {
-        let body = get(
-            &self.client,
-            &self.endpoint.api_path("alerts", &[]),
-            MAX_BODY_BYTES,
-            QUERY_TIMEOUT,
-        )
-        .await?;
-        parse_alerts_counted(&body)
+        let body = match self.fetch("alerts", &[], QUERY_TIMEOUT).await {
+            Ok(body) => body,
+            Err((_, Some(400 | 404 | 405 | 501))) if matches!(self.transport, Transport::External(_)) => {
+                return Err(PromError::Unsupported(format!(
+                    "{} does not report firing alerts (it has no /api/v1/alerts). A cloud's managed \
+                     Prometheus keeps its alert rules in the cloud's own alerting.",
+                    self.display()
+                )))
+            }
+            Err((e, _)) => return Err(e),
+        };
+        let (mut alerts, omitted) = parse_alerts_counted(&body)?;
+        if let Some(ext) = self.external_endpoint() {
+            alerts.retain(|a| ext.labels.iter().all(|(k, v)| a.labels.get(k).is_none_or(|x| x == v)));
+        }
+        Ok((alerts, omitted))
     }
 
     /// Runs every query of a panel (concurrently) and names the series.
@@ -1107,7 +1219,21 @@ fn pod_like_panels(sel: &str, by: &'static str, range: &TimeRange) -> Vec<Panel>
 /// Charts for one pod: CPU and memory by container (with request and limit
 /// lines), network received/sent, restarts.
 pub fn pod_panels(namespace: &str, pod: &str, range: &TimeRange) -> Vec<Panel> {
-    let sel = format!("{},{}", eq("namespace", namespace), eq("pod", pod));
+    pod_panels_in("", namespace, pod, range)
+}
+
+/// `scope` and `sel` as one list of matchers. `scope` is already-escaped
+/// PromQL (see [`Prom::scope`]); empty for none.
+fn scoped(scope: &str, sel: String) -> String {
+    if scope.is_empty() {
+        sel
+    } else {
+        format!("{scope},{sel}")
+    }
+}
+
+fn pod_panels_in(scope: &str, namespace: &str, pod: &str, range: &TimeRange) -> Vec<Panel> {
+    let sel = scoped(scope, format!("{},{}", eq("namespace", namespace), eq("pod", pod)));
     pod_like_panels(&sel, "container", range)
 }
 
@@ -1115,12 +1241,16 @@ pub fn pod_panels(namespace: &str, pod: &str, range: &TimeRange) -> Vec<Panel> {
 /// split by pod. Only the first [`MAX_WORKLOAD_PODS`] pods are included
 /// (the query travels in a URL); no pods, no charts.
 pub fn workload_panels(namespace: &str, pods: &[&str], range: &TimeRange) -> Vec<Panel> {
+    workload_panels_in("", namespace, pods, range)
+}
+
+fn workload_panels_in(scope: &str, namespace: &str, pods: &[&str], range: &TimeRange) -> Vec<Panel> {
     let pods = &pods[..pods.len().min(MAX_WORKLOAD_PODS)];
     if pods.is_empty() {
         // An empty alternation would match every series without a pod label.
         return Vec::new();
     }
-    let sel = format!("{},{}", eq("namespace", namespace), one_of("pod", pods));
+    let sel = scoped(scope, format!("{},{}", eq("namespace", namespace), one_of("pod", pods)));
     pod_like_panels(&sel, "pod", range)
 }
 
@@ -1138,6 +1268,10 @@ pub enum NodeBy {
 /// Charts for one node: CPU and memory of the root cgroup, with the
 /// node's allocatable as a reference line.
 pub fn node_panels(node: &str, by: NodeBy, range: &TimeRange) -> Vec<Panel> {
+    node_panels_in("", node, by, range)
+}
+
+fn node_panels_in(scope: &str, node: &str, by: NodeBy, range: &TimeRange) -> Vec<Panel> {
     let w = range.rate_window();
     let sel = match by {
         NodeBy::Label => eq("node", node),
@@ -1150,10 +1284,11 @@ pub fn node_panels(node: &str, by: NodeBy, range: &TimeRange) -> Vec<Panel> {
             )
         }
     };
+    let sel = scoped(scope, sel);
     let allocatable = |res: &str| {
         format!(
             "sum(kube_node_status_allocatable{{{},resource=\"{res}\"}})",
-            eq("node", node)
+            scoped(scope, eq("node", node))
         )
     };
     vec![
@@ -1222,20 +1357,31 @@ impl ChartTarget {
     /// The panels for this target. Nodes are selected by their `node`
     /// label here; [`Prom::charts`] falls back to `instance`.
     pub fn panels(&self, range: &TimeRange) -> Vec<Panel> {
+        self.panels_in("", range)
+    }
+
+    /// [`Self::panels`], every selector narrowed by `scope` (see
+    /// [`Prom::scope`]).
+    pub fn panels_in(&self, scope: &str, range: &TimeRange) -> Vec<Panel> {
         match self {
-            ChartTarget::Pod { namespace, name } => pod_panels(namespace, name, range),
+            ChartTarget::Pod { namespace, name } => pod_panels_in(scope, namespace, name, range),
             ChartTarget::Workload { namespace, pods } => {
                 let pods: Vec<&str> = pods.iter().map(String::as_str).collect();
-                workload_panels(namespace, &pods, range)
+                workload_panels_in(scope, namespace, &pods, range)
             }
-            ChartTarget::Node { name } => node_panels(name, NodeBy::Label, range),
+            ChartTarget::Node { name } => node_panels_in(scope, name, NodeBy::Label, range),
         }
     }
 
     /// The CPU and memory usage queries, for handing to another tool
     /// (Grafana's Explore). Empty for a workload without pods.
     pub fn usage_queries(&self) -> Vec<String> {
-        self.panels(&TimeRange::last(3600, 0))
+        self.usage_queries_in("")
+    }
+
+    /// [`Self::usage_queries`] narrowed by `scope`.
+    pub fn usage_queries_in(&self, scope: &str) -> Vec<String> {
+        self.panels_in(scope, &TimeRange::last(3600, 0))
             .into_iter()
             .filter(|p| matches!(p.unit, Unit::Cores | Unit::Bytes))
             .filter_map(|p| p.queries.into_iter().find(|q| !q.reference).map(|q| q.expr))
@@ -1261,12 +1407,12 @@ impl Prom {
     /// carries its own error; the others are unaffected. For a node whose
     /// series are not labelled with `node`, the `instance` label is tried.
     pub async fn charts(&self, target: &ChartTarget, range: &TimeRange) -> Vec<Chart> {
-        let charts = self.run_panels(target.panels(range), range).await;
+        let charts = self.run_panels(target.panels_in(&self.scope, range), range).await;
         if let ChartTarget::Node { name } = target {
             let nothing = charts.iter().all(|c| matches!(&c.data, Ok(d) if d.is_empty()));
             if nothing && !charts.is_empty() {
                 let by_instance = self
-                    .run_panels(node_panels(name, NodeBy::Instance, range), range)
+                    .run_panels(node_panels_in(&self.scope, name, NodeBy::Instance, range), range)
                     .await;
                 if by_instance.iter().any(|c| matches!(&c.data, Ok(d) if !d.is_empty())) {
                     return by_instance;

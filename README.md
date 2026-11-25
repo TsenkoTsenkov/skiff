@@ -31,6 +31,8 @@ cluster. Click it for the video.
   you open it, and dropped a few minutes after you leave it.
 - **Metrics and alerts from the Prometheus you already run**, reached
   through the Kubernetes API server: no second login, no port-forward.
+  A cloud's managed Prometheus (Azure, AWS, Google Cloud) works too,
+  signed in with the CLI you already use.
 - **Guard rails.** Mark a cluster read-only and Skiff refuses every
   change to it.
 
@@ -147,6 +149,28 @@ If yours is named differently, name it:
 It is reached through the API server, so your account needs `get` on
 `services/proxy` for that Service: [docs/observability.md](docs/observability.md).
 
+**A managed Prometheus outside the cluster** (Azure Monitor, Amazon
+Managed Service for Prometheus, Google Cloud, Grafana Cloud, Mimir,
+Thanos): give its address and how to sign in. The token comes from
+`az`, `aws` or `gcloud` (or a command, variable or file you name);
+Skiff stores none:
+
+```json
+{
+  "clusters": {
+    "aks-prod": {
+      "prometheus": {
+        "url": "https://myworkspace-abcd.westeurope.prometheus.monitor.azure.com",
+        "auth": { "type": "azure" },
+        "labels": { "cluster": "aks-prod" }
+      }
+    }
+  }
+}
+```
+
+See [Prometheus outside the cluster](docs/observability.md#prometheus-outside-the-cluster).
+
 `production` in these examples is the kubeconfig context name. Every key
 of `config.json` is in [docs/configuration.md](docs/configuration.md).
 
@@ -178,7 +202,8 @@ of `config.json` is in [docs/configuration.md](docs/configuration.md).
   **port forwarding** for pods and services
 - **Metrics**: CPU, memory, network and restart charts for pods, workloads
   and nodes from the Prometheus already in your cluster, with no extra
-  credentials; a short history from metrics-server where there is none
+  credentials, or from a managed Prometheus outside it; a short history
+  from metrics-server where there is none
 - **Alerts**: the alerts firing in Prometheus, on the overview and on the
   object each one is about. Links into your Grafana if you set its address
 - **Read-only clusters**: mark a cluster read-only and Skiff refuses every
@@ -269,7 +294,9 @@ The same pages, with navigation, are on the site:
   account and stores no cluster credentials of its own.
 - **Two network destinations.** The API server of the cluster you open,
   and `api.github.com` for the update check (anonymous; off with one
-  setting). Prometheus is reached through the API server, not directly.
+  setting). Prometheus is reached through the API server, not directly,
+  unless you give the address of one outside the cluster
+  (`prometheus.url`).
 - **No telemetry**, no crash reporting and no analytics.
 - **Lists do not fetch secret values.** Tables ask the server for rows,
   not objects; a Secret is fetched in full only when you open it, and a

@@ -24,7 +24,7 @@ use crate::kinds::{self, Discovered, ResourceKey};
 use crate::kubeconfig::{self, KubeconfigSources, LoadedKubeconfig};
 use crate::logs::{self, LogOptions, LogStream, LogTarget};
 use crate::ops::{self, ContainerInfo, ObjectData};
-use crate::prom::{self, Alert, Chart, ChartTarget, Prom, PromEndpoint, PromError, SampleRing, TimeRange};
+use crate::prom::{self, Alert, Chart, ChartTarget, Prom, PromConfig, PromEndpoint, PromError, SampleRing, TimeRange};
 use crate::table::{LoadState, Snapshot, TableStore};
 use crate::util::{self, classify, classify_kube, friendly, get_request, ErrorInfo, ErrorKind, Job, Notifier};
 use crate::watch::{self, ListQuery};
@@ -324,7 +324,7 @@ struct Observability {
     /// How an unreachable Prometheus is asked again.
     retry: Mutex<PromRetry>,
     /// `clusters.<context>.prometheus` from the config file.
-    endpoint: Mutex<Option<PromEndpoint>>,
+    endpoint: Mutex<Option<PromConfig>>,
     alerts: ArcSwap<Alerts>,
     alerts_wanted: AtomicI64,
     alerts_started: AtomicBool,
@@ -417,15 +417,31 @@ impl Observability {
 /// Asks one Service whether it is Prometheus. Also returns the Service
 /// when it did not answer, as the one to ask again later.
 async fn ask_prometheus(client: Client, endpoint: PromEndpoint) -> (PromStatus, Option<PromEndpoint>) {
-    let prom = Prom::new(client, endpoint);
+    let prom = Prom::new(client, endpoint.clone());
     match prom.ping().await {
         Ok(()) => (PromStatus::Ready(prom), None),
         // Say which Service it was: the user may know it by name.
         Err(PromError::Unreachable(msg)) => {
-            let error = PromError::Unreachable(format!("{} ({msg})", prom.endpoint().display()));
-            (PromStatus::Unavailable(error), Some(prom.endpoint().clone()))
+            let error = PromError::Unreachable(format!("{} ({msg})", endpoint.display()));
+            (PromStatus::Unavailable(error), Some(endpoint))
         }
         Err(e) => (PromStatus::Unavailable(e), None),
+    }
+}
+
+/// Asks a Prometheus outside the cluster whether it answers. One that
+/// does not is asked again later like a Service that did not answer
+/// (there is nothing to search for instead).
+async fn ask_external(endpoint: prom::ExternalEndpoint) -> PromStatus {
+    let display = endpoint.display();
+    let prom = match Prom::external(endpoint).await {
+        Ok(prom) => prom,
+        Err(e) => return PromStatus::Unavailable(e),
+    };
+    match prom.ping().await {
+        Ok(()) => PromStatus::Ready(prom),
+        Err(PromError::Unreachable(msg)) => PromStatus::Unavailable(PromError::Unreachable(format!("{display} ({msg})"))),
+        Err(e) => PromStatus::Unavailable(e),
     }
 }
 
@@ -434,11 +450,12 @@ async fn ask_prometheus(client: Client, endpoint: PromEndpoint) -> (PromStatus, 
 /// Also returns the Service to ask again when none answered.
 async fn find_prometheus(
     client: Client,
-    endpoint: Option<PromEndpoint>,
+    endpoint: Option<PromConfig>,
     namespaces: &[String],
 ) -> (PromStatus, Option<PromEndpoint>) {
     match endpoint {
-        Some(endpoint) => match endpoint.validate() {
+        Some(PromConfig::External(endpoint)) => (ask_external(endpoint).await, None),
+        Some(PromConfig::Service(endpoint)) => match endpoint.validate() {
             Err(problem) => {
                 let error = PromError::Other(format!("The Prometheus set in Skiff's config can't be used: {problem}"));
                 (PromStatus::Unavailable(error), None)
@@ -1214,7 +1231,7 @@ impl Session {
     /// Sets `clusters.<context>.prometheus` from the config file: the
     /// endpoint to use instead of detecting one (`None`: detect). A change
     /// takes effect at once.
-    pub fn set_prometheus_endpoint(&self, endpoint: Option<PromEndpoint>) {
+    pub fn set_prometheus_endpoint(&self, endpoint: Option<PromConfig>) {
         let mut current = self.obs.endpoint.lock();
         if *current != endpoint {
             *current = endpoint;
@@ -1276,6 +1293,12 @@ impl Session {
                     last = Some((generation, now_unix()));
                     let alerts = match fetched {
                         Ok((items, omitted)) => Alerts { loaded: true, items, omitted, error: None },
+                        // Not going to change: asked again only after
+                        // the endpoint does (a new generation).
+                        Err(e @ PromError::Unsupported(_)) => {
+                            last = Some((generation, i64::MAX / 2));
+                            Alerts { loaded: true, items: Vec::new(), omitted: 0, error: Some(e) }
+                        }
                         Err(e) => Alerts { loaded: true, items: Vec::new(), omitted: 0, error: Some(e) },
                     };
                     let _publishing = obs.lock.lock();
@@ -1989,12 +2012,12 @@ mod tests {
         assert!(matches!(&*s.prometheus_known(), PromStatus::Detecting));
         s.prometheus(&[]);
         wait_until("the second outcome", || !matches!(&*s.prometheus_known(), PromStatus::Detecting));
-        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090)));
+        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090).into()));
         assert!(matches!(&*s.prometheus_known(), PromStatus::Detecting));
         // Setting the same endpoint again changes nothing.
         s.prometheus(&[]);
         wait_until("the third outcome", || !matches!(&*s.prometheus_known(), PromStatus::Detecting));
-        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090)));
+        s.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "prom", 9090).into()));
         assert!(!matches!(&*s.prometheus_known(), PromStatus::Detecting));
     }
 
