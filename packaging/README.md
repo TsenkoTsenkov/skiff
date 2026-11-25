@@ -28,20 +28,23 @@ unsigned packages; the header of each script lists its options.
 
 `.github/workflows/release.yml` does everything.
 
-- **Stable release.** Set the version in the root `Cargo.toml`
-  (`[workspace.package] version`), run `cargo check` so that `Cargo.lock`
-  follows, merge that, then tag the merged commit:
-
-  ```bash
-  git tag v1.2.3 && git push origin v1.2.3
-  ```
-
-  The tag must equal the version in `Cargo.toml`, or the run stops before
-  building. The release is published as `v1.2.3` and marked "Latest".
-- **Nightly.** Every push to `main` that touches the code or the packaging
-  publishes the prerelease `build-<N>`. The newest 10 are kept. People get
-  these only if they set `"updates": {"channel": "nightly"}` in Skiff's
-  config.
+- **Stable release (the normal way).** The pull request bumps the
+  version with `hack/bump-version.py` (patch by default; `minor`, `major`
+  or an exact `X.Y.Z` also work). It changes `Cargo.toml`, `Cargo.lock`
+  and `CHANGELOG.md`, whose "Unreleased" entries become the new version's
+  section. When that is merged, the push to `main` finds a version that
+  has no `vX.Y.Z` tag yet, publishes it as the stable release `vX.Y.Z`,
+  marked "Latest", and creates the tag on that commit.
+- **Nightly (experimental).** A push to `main` whose version is already
+  released publishes the prerelease `build-<N>` instead. So a change that
+  is merged *without* a version bump reaches only people on the nightly
+  channel (`"updates": {"channel": "nightly"}` in Skiff's config); use
+  that for changes that could break things badly and should be tried
+  first. The newest 10 nightlies are kept. The next version bump ships
+  everything merged since the last release.
+- **Stable release by hand.** Pushing a tag `vX.Y.Z` also publishes a
+  stable release. The tag must equal the version in `Cargo.toml`, or the
+  run stops before building.
 - **Trying the pipeline.** Actions → Release → Run workflow (or push a branch
   named `release/…`) builds everything and attaches it to the run as
   artifacts. Nothing is published.

@@ -225,9 +225,10 @@ After adding secrets:
       unsigned build.
 - [ ] Homebrew: only once the Mac build is signed and notarized
       ([packaging/README.md](../packaging/README.md#homebrew-macos)).
-- [ ] For every later release: version in `Cargo.toml`, changelog, tag.
-      Nightlies need nothing; every push to `main` that touches the code
-      or the packaging publishes one, and the newest ten are kept.
+- [ ] For every later release: `hack/bump-version.py` in the pull
+      request; merging it publishes the release and makes the tag.
+      Nightlies need nothing: a push to `main` without a version bump
+      publishes one, and the newest ten are kept.
 
 ## The name
 

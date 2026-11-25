@@ -51,10 +51,12 @@ authentication on GitHub and on any signing service.
   [`.github/workflows/release.yml`](../.github/workflows/release.yml) in
   this repository, on GitHub-hosted runners. No release file is built or
   signed on anyone's own machine.
-- A stable release is built from the source at its `vX.Y.Z` tag, and the
-  tag must equal the version in `Cargo.toml` or the build stops. Builds of
-  the `main` branch are published as prereleases named `build-N` and are
-  never marked as the latest release.
+- A stable release is built from a commit of the `main` branch whose
+  version in `Cargo.toml` has not been released yet, and its `vX.Y.Z` tag
+  is made on that commit; or from a pushed `vX.Y.Z` tag, which must equal
+  the version in `Cargo.toml` or the build stops. Other builds of `main`
+  are published as prereleases named `build-N` and are never marked as
+  the latest release.
 - Only Skiff's own program is signed. It is compiled from this
   repository's source and the crates pinned in `Cargo.lock`, all of which
   come from crates.io. Two things in the packages are not compiled here:
