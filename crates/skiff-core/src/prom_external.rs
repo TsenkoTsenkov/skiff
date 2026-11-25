@@ -945,6 +945,7 @@ mod tests {
         assert!(read_now(&SecretSource::File(path)).is_err());
     }
 
+    #[cfg(unix)]
     /// A one-connection-at-a-time HTTP server that records each request
     /// (request line and headers) and answers with `respond`.
     async fn serve(
@@ -984,7 +985,9 @@ mod tests {
         (format!("http://127.0.0.1:{}/prom", addr.port()), seen)
     }
 
+    #[cfg(unix)]
     const VECTOR: &str = r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}"#;
+    #[cfg(unix)]
     const MATRIX: &str = r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"container":"app"},"values":[[1,"0.5"]]}]}}"#;
 
     #[cfg(unix)]
