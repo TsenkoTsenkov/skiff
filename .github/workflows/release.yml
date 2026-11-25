@@ -755,6 +755,12 @@ jobs:
           else
             attest="Each file also has a build provenance attestation: \`gh attestation verify <file> -R $GH_REPO\` shows that it was built by this repository's release workflow."
           fi
+          # A file of this release as a link that downloads it. (The
+          # address is fixed by the tag and the file's name, so it can be
+          # written before the release exists.)
+          file() {
+            printf '[`%s`](https://github.com/%s/releases/download/%s/%s)' "$1" "$GH_REPO" "$TAG" "$1"
+          }
           # This version's section of CHANGELOG.md, without its heading
           # (empty when there is none), read at the commit being released:
           # this job has no checkout. The app's update button shows its
@@ -778,13 +784,15 @@ jobs:
             fi
             echo "## Downloads"
             echo
-            echo "| System | File |"
+            echo "Click a file to download it. (The **Assets** list at the bottom of this page has the same files.)"
+            echo
+            echo "| System | Download |"
             echo "|---|---|"
-            echo "| macOS 11 or newer, Apple Silicon and Intel | \`Skiff-macos-universal.dmg\` |"
-            echo "| macOS 11 or newer, Apple Silicon only (M1 and later; half the download) | \`Skiff-macos-arm64.dmg\` |"
-            echo "| Windows 10 or 11, 64-bit | \`Skiff-windows-x64-setup.exe\` (installer, no administrator rights needed) or \`Skiff-windows-x64.zip\` (portable) |"
-            echo "| Linux x86_64 | \`Skiff-linux-x86_64.AppImage\`, \`skiff_amd64.deb\` or \`skiff-linux-x86_64.tar.gz\` |"
-            echo "| Linux arm64 | \`Skiff-linux-aarch64.AppImage\`, \`skiff_arm64.deb\` or \`skiff-linux-aarch64.tar.gz\` |"
+            echo "| macOS 11 or newer, Apple Silicon and Intel | $(file Skiff-macos-universal.dmg) |"
+            echo "| macOS 11 or newer, Apple Silicon only (M1 and later; half the download) | $(file Skiff-macos-arm64.dmg) |"
+            echo "| Windows 10 or 11, 64-bit | $(file Skiff-windows-x64-setup.exe) (installer, no administrator rights needed) or $(file Skiff-windows-x64.zip) (portable) |"
+            echo "| Linux x86_64 | $(file Skiff-linux-x86_64.AppImage), $(file skiff_amd64.deb) or $(file skiff-linux-x86_64.tar.gz) |"
+            echo "| Linux arm64 | $(file Skiff-linux-aarch64.AppImage), $(file skiff_arm64.deb) or $(file skiff-linux-aarch64.tar.gz) |"
             echo
             echo "The \`Skiff-macos-…-build-$BUILD.zip\` files are what the app's own updater downloads; nobody needs to pick them by hand."
             echo
