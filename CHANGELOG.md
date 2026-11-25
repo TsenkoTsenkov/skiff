@@ -16,6 +16,10 @@ here.
   version, once. It can be opened again from the palette ("What's new")
   and from Settings, Updates. The Update button's tooltip and the release
   page on GitHub show the same list before you update.
+- **An Apple Silicon-only download for macOS**, `Skiff-macos-arm64.dmg`:
+  the native arm64 build without the Intel half, so about half the size
+  of the universal disk image. The universal image stays, and both update
+  themselves the same way.
 
 ### Changed
 

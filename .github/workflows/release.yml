@@ -137,9 +137,11 @@ jobs:
           echo "Skiff $version, build $build, channel: $channel ${tag:+(release $tag)}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   macos:
-    name: macOS (universal)
+    name: macOS (universal and Apple Silicon)
     needs: meta
     # Apple Silicon; the Intel half is cross-compiled and the two are joined.
+    # The Apple Silicon half is also published on its own, as a download
+    # half the size for the Macs that need nothing else.
     runs-on: macos-15
     timeout-minutes: 90
     concurrency:
@@ -191,6 +193,9 @@ jobs:
             export SKIFF_TEAM_ID="$APPLE_TEAM_ID"
           fi
           hack/macos-app.sh --universal --build-only
+          # Compiles nothing new (the universal build made this binary); it
+          # records the Team ID next to it for the Apple Silicon-only app.
+          hack/macos-app.sh --target aarch64-apple-darwin --build-only
 
       - name: Import the Developer ID certificate
         if: env.HAVE_CERT == 'true'
@@ -250,7 +255,18 @@ jobs:
       # Signs with the Developer ID and notarizes when the two steps above
       # ran; makes an ad-hoc signed app otherwise. (--no-build: it wraps
       # what the Build step compiled and runs no compiler.)
-      - name: Sign and package
+      # The Apple Silicon-only disk image first: each run rebuilds
+      # target/release/Skiff.app, and the universal one is the app the
+      # steps after this check and start. (The updater zips stay universal,
+      # so an app copied to another Mac keeps running there after an update.)
+      - name: Sign and package (Apple Silicon only)
+        run: |
+          hack/macos-app.sh --target aarch64-apple-darwin --no-build --dmg
+          lipo -archs target/release/Skiff.app/Contents/MacOS/Skiff
+          test "$(lipo -archs target/release/Skiff.app/Contents/MacOS/Skiff)" = arm64
+          target/release/Skiff.app/Contents/MacOS/Skiff --version
+
+      - name: Sign and package (universal)
         run: hack/macos-app.sh --universal --no-build --dmg --zip
 
       - name: Remove the signing material
@@ -281,12 +297,14 @@ jobs:
           # not the version of its tag, which is the one in Cargo.toml.
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$WANT_VERSION"
           ls -l target/release/Skiff-macos-universal.dmg \
+            target/release/Skiff-macos-arm64.dmg \
             "target/release/Skiff-macos-arm64-build-$SKIFF_BUILD.zip" \
             "target/release/Skiff-macos-x86_64-build-$SKIFF_BUILD.zip"
           # What the files really are, not what was intended.
           signature=$(codesign -dv --verbose=4 "$app" 2>&1)
           if xcrun stapler validate "$app" >/dev/null 2>&1 &&
-            xcrun stapler validate target/release/Skiff-macos-universal.dmg >/dev/null 2>&1; then
+            xcrun stapler validate target/release/Skiff-macos-universal.dmg >/dev/null 2>&1 &&
+            xcrun stapler validate target/release/Skiff-macos-arm64.dmg >/dev/null 2>&1; then
             signing=notarized
           elif grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<<"$signature"; then
             signing=signed
@@ -301,6 +319,7 @@ jobs:
           name: skiff-macos
           path: |
             target/release/Skiff-macos-universal.dmg
+            target/release/Skiff-macos-arm64.dmg
             target/release/Skiff-macos-arm64-build-*.zip
             target/release/Skiff-macos-x86_64-build-*.zip
           if-no-files-found: error
@@ -691,6 +710,7 @@ jobs:
         working-directory: dist
         run: |
           expected="Skiff-macos-universal.dmg
+          Skiff-macos-arm64.dmg
           Skiff-macos-arm64-build-$BUILD.zip
           Skiff-macos-x86_64-build-$BUILD.zip
           Skiff-windows-x64-setup.exe
@@ -761,6 +781,7 @@ jobs:
             echo "| System | File |"
             echo "|---|---|"
             echo "| macOS 11 or newer, Apple Silicon and Intel | \`Skiff-macos-universal.dmg\` |"
+            echo "| macOS 11 or newer, Apple Silicon only (M1 and later; half the download) | \`Skiff-macos-arm64.dmg\` |"
             echo "| Windows 10 or 11, 64-bit | \`Skiff-windows-x64-setup.exe\` (installer, no administrator rights needed) or \`Skiff-windows-x64.zip\` (portable) |"
             echo "| Linux x86_64 | \`Skiff-linux-x86_64.AppImage\`, \`skiff_amd64.deb\` or \`skiff-linux-x86_64.tar.gz\` |"
             echo "| Linux arm64 | \`Skiff-linux-aarch64.AppImage\`, \`skiff_arm64.deb\` or \`skiff-linux-aarch64.tar.gz\` |"
