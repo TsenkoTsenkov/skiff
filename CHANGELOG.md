@@ -36,6 +36,14 @@ here.
 - The cluster's version in the top bar reads "Kubernetes v1.32.3", so it
   is not taken for Skiff's own version (which is in Settings, About).
 
+### Security
+
+- The Kubernetes client library (kube) is updated to 5.2.0, which fixes
+  RUSTSEC-2026-0600: its OpenSSL connector trusted the system's
+  certificate authorities in addition to the cluster's own. Skiff was not
+  affected, since it connects with rustls and has no OpenSSL in it; the
+  update keeps the dependency audit clean.
+
 ## [0.1.1] - 2026-11-25
 
 ### Added

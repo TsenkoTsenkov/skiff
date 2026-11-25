@@ -272,9 +272,9 @@ with `cargo-deny`.
 | [k8s-openapi](https://crates.io/crates/k8s-openapi/0.29.0) | 0.29.0 | Apache-2.0 |
 | [khronos-egl](https://crates.io/crates/khronos-egl/6.0.0) | 6.0.0 | MIT/Apache-2.0 |
 | [khronos_api](https://crates.io/crates/khronos_api/3.1.0) | 3.1.0 | Apache-2.0 |
-| [kube](https://crates.io/crates/kube/5.1.0) | 5.1.0 | Apache-2.0 |
-| [kube-client](https://crates.io/crates/kube-client/5.1.0) | 5.1.0 | Apache-2.0 |
-| [kube-core](https://crates.io/crates/kube-core/5.1.0) | 5.1.0 | Apache-2.0 |
+| [kube](https://crates.io/crates/kube/5.2.0) | 5.2.0 | Apache-2.0 |
+| [kube-client](https://crates.io/crates/kube-client/5.2.0) | 5.2.0 | Apache-2.0 |
+| [kube-core](https://crates.io/crates/kube-core/5.2.0) | 5.2.0 | Apache-2.0 |
 | [kurbo](https://crates.io/crates/kurbo/0.13.1) | 0.13.1 | Apache-2.0 OR MIT |
 | [libc](https://crates.io/crates/libc/0.2.191) | 0.2.191 | MIT OR Apache-2.0 |
 | [libloading](https://crates.io/crates/libloading/0.8.9) | 0.8.9 | ISC |

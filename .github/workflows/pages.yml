@@ -20,7 +20,7 @@ on:
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
-# Nothing is granted by default; the one job below asks for what
+# Nothing is granted by default; the deploy job below asks for what
 # publishing needs.
 permissions:
   contents: read
@@ -30,18 +30,17 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+# Two jobs, as GitHub's own Pages workflows have it. In one job the deploy
+# step asked for the site's artifact less than a second after the upload
+# step had stored it, and now and then GitHub's list of the run's
+# artifacts did not show it yet ("No artifacts named github-pages were
+# found"): the site was not published and the run was red. Starting a
+# second job takes longer than that list needs.
 jobs:
-  deploy:
-    name: Deploy to GitHub Pages
+  build:
+    name: Build the site
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    permissions:
-      contents: read
-      pages: write      # publish the site
-      id-token: write   # prove to Pages that this workflow is the publisher
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,9 +59,21 @@ jobs:
             echo "::error::site/ loads something from another host, or could (see the lines above)."
             exit 1
           fi
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write      # publish the site
+      id-token: write   # prove to Pages that this workflow is the publisher
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
