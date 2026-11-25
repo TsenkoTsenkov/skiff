@@ -59,7 +59,7 @@ impl LogsTab {
             scanned: 0,
             matched_filter: String::new(),
             matched_stream: 0,
-            only_matching: true,
+            only_matching: false,
             current: None,
             reveal_current: false,
             focus_filter: false,
