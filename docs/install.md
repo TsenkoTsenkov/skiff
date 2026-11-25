@@ -7,6 +7,7 @@ the current stable release:
 | System | File |
 | --- | --- |
 | macOS 11 or newer (Apple Silicon and Intel, one universal app) | `Skiff-macos-universal.dmg` |
+| macOS 11 or newer, Apple Silicon only (M1 and later; half the download) | `Skiff-macos-arm64.dmg` |
 | Windows 10 or 11 (x64), installer | `Skiff-windows-x64-setup.exe` |
 | Windows 10 or 11 (x64), portable | `Skiff-windows-x64.zip` |
 | Linux, any distribution | `Skiff-linux-x86_64.AppImage`, `Skiff-linux-aarch64.AppImage` |
@@ -19,7 +20,8 @@ in-app updater; you do not need them.
 
 ## macOS
 
-1. Open `Skiff-macos-universal.dmg` and drag Skiff to Applications.
+1. Open `Skiff-macos-universal.dmg` (or, on an Apple Silicon Mac,
+   `Skiff-macos-arm64.dmg`) and drag Skiff to Applications.
 2. Open Skiff from Applications.
 
 The app is signed with an Apple Developer ID (`Developer ID Application:
