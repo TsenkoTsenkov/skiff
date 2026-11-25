@@ -1,9 +1,17 @@
 # Builds Skiff for macOS, Windows and Linux and publishes it.
 #
-#   A tag vX.Y.Z      publishes the stable release X.Y.Z, marked "latest". The
-#                     tag must equal the version in Cargo.toml.
-#   A push to main    publishes the prerelease build-<N> (the nightly channel).
-#                     Only the newest 10 are kept; it is never "latest".
+#   A push to main    whose Cargo.toml version has no vX.Y.Z tag yet publishes
+#                     the stable release X.Y.Z, marked "latest", and creates
+#                     the tag. This is how a change normally ships: its pull
+#                     request bumps the version (hack/bump-version.py).
+#                     When the version is already released, the push publishes
+#                     the prerelease build-<N> (the nightly channel) instead:
+#                     a change merged without a version bump is experimental.
+#                     Only the newest 10 nightlies are kept; one is never
+#                     "latest".
+#   A tag vX.Y.Z      publishes the stable release X.Y.Z too, for a commit
+#                     that is to be released by hand. The tag must equal the
+#                     version in Cargo.toml.
 #   Run by hand, a push to a release/... branch, or a pull request that
 #   changes how the packages are made
 #                     builds everything, tries it out and offers it as
@@ -120,8 +128,16 @@ jobs:
               tag=$GITHUB_REF_NAME
               ;;
             push:refs/heads/main)
-              channel=nightly
-              tag="build-$build"
+              # A version that is not released yet is released now: the
+              # pull request that bumped it is the release. (The whole
+              # history was fetched, tags included.)
+              if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+                channel=nightly
+                tag="build-$build"
+              else
+                channel=stable
+                tag="v$version"
+              fi
               ;;
             *)
               channel=none
@@ -825,9 +841,16 @@ jobs:
             gh release delete "$TAG" --yes
           fi
           if [ "$CHANNEL" = stable ]; then
-            # (The tag exists: it started this run. GitHub's generated list
-            # of changes follows the notes above.)
-            gh release create "$TAG" dist/* --verify-tag --title "Skiff $VERSION" \
+            # A pushed tag started this run; on main the tag is made here,
+            # on this commit. A version released meanwhile by an earlier
+            # push is not released again. (GitHub's generated list of
+            # changes follows the notes above.)
+            if [ "$GITHUB_REF_TYPE" = branch ] && gh release view "$TAG" > /dev/null 2>&1; then
+              echo "::warning::$TAG is already released; bump the version in Cargo.toml to release this commit."
+              exit 0
+            fi
+            if [ "$GITHUB_REF_TYPE" = tag ]; then where=--verify-tag; else where="--target=$GITHUB_SHA"; fi
+            gh release create "$TAG" dist/* "$where" --title "Skiff $VERSION" \
               --notes-file notes.md --generate-notes --latest
           else
             gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "Skiff $VERSION (build $BUILD)" \

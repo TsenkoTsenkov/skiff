@@ -200,8 +200,12 @@ regenerates the PNG sizes, `skiff.ico` and `Skiff.icns` from it (needs
 
 ## Releases
 
-A push to `main` publishes a prerelease `build-<N>` (the *nightly*
-channel); a tag `vX.Y.Z` publishes a stable release. Both are made by
+A change ships as a stable release when its pull request bumps the
+version: run `hack/bump-version.py` (patch by default) and commit what it
+changes. On the push to `main` the new version, which has no tag yet, is
+published as the stable release `vX.Y.Z`. A change merged without a bump
+is experimental: it is published only as a prerelease `build-<N>` on the
+*nightly* channel, and goes out with the next version bump. Both are made by
 `.github/workflows/release.yml`, which builds, packages, optionally
 signs, checksums and publishes for macOS, Windows and Linux. The owner's
 checklist is [releasing.md](releasing.md); the pipeline, the signing

@@ -122,8 +122,8 @@ is open. The request goes to GitHub's API, anonymously.
 Settings → Updates shows the version, build number and channel.
 
 **Channels.** *Stable* (the default) offers released versions, tagged
-`vX.Y.Z`. *Nightly* offers every build of the `main` branch, which may be
-rough. Choose in Settings → Updates, or in `config.json`:
+`vX.Y.Z`. *Nightly* also offers the experimental builds of the `main`
+branch made between releases, which may be rough. Choose in Settings → Updates, or in `config.json`:
 
 ```json
 { "updates": { "check": true, "channel": "nightly" } }

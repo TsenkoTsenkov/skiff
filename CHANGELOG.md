@@ -10,6 +10,8 @@ here.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-25
+
 ### Changed
 
 - **Searching logs keeps every line on screen** and highlights the
@@ -224,7 +226,8 @@ YAML editing, logs, the built-in shell, port forwarding, the command
 palette, vim-style keys with custom bindings, and in-app updates on
 macOS.
 
-[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TsenkoTsenkov/skiff/releases/tag/v0.1.0
