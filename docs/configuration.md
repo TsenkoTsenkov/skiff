@@ -40,6 +40,7 @@ back after you edited it. There are no secrets in it.
 | `terminal` | text | Skiff picks one | The terminal app for "open in terminal": a name such as `iTerm`, `Ghostty` or `kitty`, or on Linux a program path. `$SKIFF_TERMINAL` wins over it. |
 | `theme` | `"dark"`, `"light"` or `"system"` | `"dark"` | The colours of the window. `"system"` follows the light or dark mode of your computer. |
 | `zoom` | number, 0.5 to 3.0 | `1.0` | Size of everything in the window. Also changed by the zoom shortcuts. |
+| `animations` | true or false | `true` | Panels slide, and dialogs and notifications fade, instead of appearing at once. false shows every change immediately. |
 | `log_history` | number of lines, or `"all"` | `1000` | How many earlier lines a new log tab loads. Each log tab can still be given another amount while it is open. |
 | `clusters.<context>.hidden` | true or false | `false` | Leave this cluster out of the cluster menu and the command palette. The kubeconfig is not changed, and the cluster stays listed in Settings, Clusters. |
 | `clusters.<context>.read_only` | true or false | `false` | Refuse every change in this cluster: no edit, delete, scale or restart, and no new shell or port-forward. Shells and port-forwards that are already open keep running until closed. |
@@ -64,6 +65,7 @@ A complete file using every key:
   "terminal": "iTerm",
   "theme": "system",
   "zoom": 1.0,
+  "animations": true,
   "log_history": 1000,
   "clusters": {
     "production": {

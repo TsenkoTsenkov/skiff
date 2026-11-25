@@ -197,6 +197,13 @@ pub const KEYS: &[KeyDoc] = &[
         doc: "Size of everything in the window. Also changed by the zoom shortcuts.",
     },
     KeyDoc {
+        key: "animations",
+        kind: "true or false",
+        default: "true",
+        doc: "Panels slide, and dialogs and notifications fade, instead of appearing at once. \
+              false shows every change immediately.",
+    },
+    KeyDoc {
         key: "log_history",
         kind: "number of lines, or \"all\"",
         default: "1000",
@@ -272,6 +279,7 @@ pub const EXAMPLE: &str = r#"{
   "terminal": "iTerm",
   "theme": "system",
   "zoom": 1.0,
+  "animations": true,
   "log_history": 1000,
   "clusters": {
     "production": {
@@ -457,6 +465,7 @@ struct Settings {
     terminal: Option<String>,
     theme: Option<Theme>,
     zoom: Option<f32>,
+    animations: Option<bool>,
     log_history: Option<LogHistory>,
     clusters: BTreeMap<String, ClusterConfig>,
 }
@@ -567,6 +576,11 @@ impl Config {
         self.settings.zoom
     }
 
+    /// Whether the interface animates (it does unless the file says no).
+    pub fn animations(&self) -> bool {
+        self.settings.animations.unwrap_or(true)
+    }
+
     /// How much history a new log tab loads, if the file says.
     pub fn log_history(&self) -> Option<LogHistory> {
         self.settings.log_history
@@ -651,6 +665,10 @@ impl Config {
         // (1.100000023841858) out of the file.
         let z = (f64::from(zoom.clamp(ZOOM_MIN, ZOOM_MAX)) * 100.0).round() / 100.0;
         self.edit(&["zoom"], Some(json!(z)));
+    }
+
+    pub fn set_animations(&mut self, on: bool) {
+        self.edit(&["animations"], Some(json!(on)));
     }
 
     /// Sets how much history a new log tab loads.
@@ -953,6 +971,12 @@ fn interpret(raw: &Map<String, Value>, warnings: &mut Vec<String>) -> Settings {
             "zoom: should be a number from {ZOOM_MIN:?} to {ZOOM_MAX:?}, not {}; ignored",
             kind_of(other)
         )),
+    }
+
+    match raw.get("animations") {
+        None => {}
+        Some(Value::Bool(on)) => s.animations = Some(*on),
+        Some(other) => warnings.push(format!("animations: should be true or false, not {}; ignored", kind_of(other))),
     }
 
     match raw.get("log_history") {
@@ -1331,7 +1355,7 @@ mod tests {
 
     #[test]
     fn known_keys_come_from_the_docs() {
-        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "theme", "zoom", "log_history", "clusters"]);
+        assert_eq!(known_keys(""), ["kubeconfigs", "updates", "terminal", "theme", "zoom", "animations", "log_history", "clusters"]);
         assert_eq!(known_keys("updates"), ["check", "channel"]);
         assert_eq!(known_keys("clusters.<context>"), ["hidden", "read_only", "confirm", "prometheus", "grafana_url"]);
         assert_eq!(
@@ -1535,6 +1559,17 @@ mod tests {
         assert!(!config.cluster("staging").hidden);
         assert_eq!(lookup(&config.raw, &["clusters", "staging", "hidden"]), None);
         one_warning(r#"{"clusters": {"a": {"hidden": "yes"}}}"#, "clusters.a.hidden", "true or false");
+    }
+
+    #[test]
+    fn animations_are_on_unless_turned_off() {
+        assert!(Config::from_json("{}").0.animations());
+        assert!(!Config::from_json(r#"{ "animations": false }"#).0.animations());
+        assert!(one_warning(r#"{ "animations": "slow" }"#, "animations:", "true or false").animations());
+        let mut c = Config::default();
+        c.set_animations(false);
+        assert!(!c.animations());
+        assert_eq!(c.raw["animations"], json!(false));
     }
 
     #[test]

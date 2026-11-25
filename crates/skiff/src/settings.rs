@@ -313,6 +313,7 @@ pub struct Model {
     /// What "System" resolves to now, if the system says.
     pub system_dark: Option<bool>,
     pub zoom: f32,
+    pub animations: bool,
     /// Earlier lines a new log tab loads (`None`: all of them).
     pub log_history: Option<i64>,
     /// Tables whose columns or widths were chosen by hand.
@@ -345,6 +346,7 @@ pub enum Action {
     Close,
     SetTheme(Theme),
     SetZoom(f32),
+    SetAnimations(bool),
     /// Earlier lines a new log tab loads (`None`: all).
     SetLogHistory(Option<i64>),
     /// Every table back to its default columns and widths.
@@ -607,6 +609,18 @@ fn appearance(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Actio
             actions.push(Action::SetZoom(less));
         }
     });
+    setting(
+        ui,
+        pal,
+        "Animations",
+        "Panels slide, and dialogs and notifications fade, instead of appearing at once. Turn this off if movement on screen bothers you.",
+        60.0,
+        |ui| {
+            if toggle_cell(ui, pal, 40.0, model.animations, true, "Animations") {
+                actions.push(Action::SetAnimations(!model.animations));
+            }
+        },
+    );
     let columns = match model.tables_customised {
         0 => "Every table shows its default columns at their default widths.".to_string(),
         n => format!(
