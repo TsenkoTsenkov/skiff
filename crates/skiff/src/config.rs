@@ -263,6 +263,36 @@ pub const KEYS: &[KeyDoc] = &[
         doc: "Path in front of /api/v1, for example /select/0/prometheus for VictoriaMetrics.",
     },
     KeyDoc {
+        key: "clusters.<context>.prometheus.url",
+        kind: "http or https URL",
+        default: "none",
+        doc: "A Prometheus outside the cluster, such as a cloud's managed Prometheus (Azure Monitor, \
+              Amazon, Google Cloud, Grafana Cloud): the address in front of /api/v1. It is used \
+              instead of namespace and service, and reached directly rather than through the API server.",
+    },
+    KeyDoc {
+        key: "clusters.<context>.prometheus.auth",
+        kind: "object",
+        default: "no credentials",
+        doc: "How Skiff signs in to the Prometheus at url. \"type\" is \"azure\", \"aws\", \"gcp\", \
+              \"bearer\" or \"basic\". The credential comes from the cloud's command line tool, a command, \
+              an environment variable or a file; it is never written in this file.",
+    },
+    KeyDoc {
+        key: "clusters.<context>.prometheus.labels",
+        kind: "object of label names to values",
+        default: "none",
+        doc: "With url: label matchers added to every query, for a Prometheus that holds the metrics of \
+              several clusters, such as {\"cluster\": \"aks-prod\"}. Alerts labelled for another cluster are left out.",
+    },
+    KeyDoc {
+        key: "clusters.<context>.prometheus.headers",
+        kind: "object of header names to values",
+        default: "none",
+        doc: "With url: extra request headers that are not secret, such as X-Scope-OrgID for a \
+              Grafana Mimir, Cortex or Thanos tenant.",
+    },
+    KeyDoc {
         key: "clusters.<context>.grafana_url",
         kind: "http or https URL",
         default: "none",
@@ -294,6 +324,14 @@ pub const EXAMPLE: &str = r#"{
         "path_prefix": ""
       },
       "grafana_url": "https://grafana.example.com"
+    },
+    "aks-prod": {
+      "prometheus": {
+        "url": "https://myworkspace-abcd.westeurope.prometheus.monitor.azure.com",
+        "auth": { "type": "azure" },
+        "labels": { "cluster": "aks-prod" },
+        "headers": {}
+      }
     }
   }
 }
@@ -434,10 +472,19 @@ impl Default for Updates {
 }
 
 /// `clusters.<context>.prometheus`: where Prometheus is, when the
-/// automatic search should be skipped. Plain data, the same shape as
+/// automatic search should be skipped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrometheusOverride {
+    /// A Service in the cluster (`namespace` and `service`).
+    Service(PrometheusService),
+    /// A Prometheus outside the cluster (`url`).
+    External(skiff_core::ExternalEndpoint),
+}
+
+/// A Prometheus Service in the cluster. Plain data, the same shape as
 /// `skiff_core::prom::PromEndpoint`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrometheusOverride {
+pub struct PrometheusService {
     pub namespace: String,
     pub service: String,
     pub port: u16,
@@ -1065,7 +1112,13 @@ fn interpret_prometheus(
     warnings: &mut Vec<String>,
 ) -> Option<PrometheusOverride> {
     warn_unknown(p, "clusters.<context>.prometheus", label, warnings);
+    if p.contains_key("url") {
+        return interpret_external(p, label, warnings).map(PrometheusOverride::External);
+    }
     let before = warnings.len();
+    for key in EXTERNAL_KEYS.iter().filter(|k| **k != "url" && p.contains_key(**k)) {
+        warnings.push(format!("{label}.{key}: only used together with url"));
+    }
     let mut name = |key: &str| match p.get(key) {
         Some(Value::String(v)) if !v.trim().is_empty() => Some(v.trim().to_string()),
         Some(Value::String(_)) | None => {
@@ -1111,13 +1164,193 @@ fn interpret_prometheus(
         warnings.push(format!("{label}: not used because of the above; Prometheus is searched for automatically"));
         return None;
     }
-    Some(PrometheusOverride {
+    Some(PrometheusOverride::Service(PrometheusService {
         namespace: namespace?,
         service: service?,
         port: port?,
         scheme: scheme?,
         path_prefix: path_prefix?,
-    })
+    }))
+}
+
+/// The keys of a Prometheus outside the cluster; the others of
+/// `clusters.<context>.prometheus` are for a Service in it.
+const EXTERNAL_KEYS: &[&str] = &["url", "auth", "labels", "headers"];
+
+/// `clusters.<context>.prometheus` with a `url`. As for a Service, any
+/// mistake drops the whole override: a half-understood sign-in would only
+/// fail later, with a less useful message.
+fn interpret_external(
+    p: &Map<String, Value>,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<skiff_core::ExternalEndpoint> {
+    use skiff_core::{ExternalAuth, ExternalEndpoint};
+    let before = warnings.len();
+    for key in p.keys().filter(|k| !EXTERNAL_KEYS.contains(&k.as_str()) && known_keys("clusters.<context>.prometheus").contains(&k.as_str())) {
+        warnings.push(format!("{label}.{key}: not used together with url (that is a Service in the cluster)"));
+    }
+    let url = match p.get("url") {
+        Some(Value::String(url)) if !url.trim().is_empty() => url.trim().to_string(),
+        Some(other) => {
+            warnings.push(format!(
+                "{label}.url: should be an address like \"https://prometheus.example.com\", not {}",
+                if matches!(other, Value::String(_)) { "an empty one" } else { kind_of(other) }
+            ));
+            String::new()
+        }
+        None => String::new(),
+    };
+    let auth = match p.get("auth") {
+        None => ExternalAuth::None,
+        Some(Value::String(kind)) => {
+            // A type without options can be given on its own: "auth": "azure".
+            let mut object = Map::new();
+            object.insert("type".into(), Value::String(kind.clone()));
+            interpret_auth(&object, &format!("{label}.auth"), warnings).unwrap_or_default()
+        }
+        Some(Value::Object(a)) => interpret_auth(a, &format!("{label}.auth"), warnings).unwrap_or_default(),
+        Some(other) => {
+            warnings.push(format!("{label}.auth: should be an object such as {{ \"type\": \"azure\" }}, not {}", kind_of(other)));
+            ExternalAuth::None
+        }
+    };
+    let labels = string_map(p, "labels", label, warnings);
+    let headers = string_map(p, "headers", label, warnings);
+    if warnings.len() == before {
+        let endpoint = ExternalEndpoint { url, auth, headers, labels };
+        match endpoint.validate() {
+            Ok(()) => return Some(endpoint),
+            Err(problem) => warnings.push(format!("clusters.{}: {problem}", label.trim_start_matches("clusters."))),
+        }
+    }
+    warnings.push(format!("{label}: not used because of the above; Prometheus is searched for in the cluster"));
+    None
+}
+
+/// An object of names to text values (`labels`, `headers`), in the order
+/// of the file.
+fn string_map(p: &Map<String, Value>, key: &str, label: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    match p.get(key) {
+        None => Vec::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Value::String(v) => Some((k.clone(), v.clone())),
+                other => {
+                    warnings.push(format!("{label}.{key}.{k}: should be text in quotes, not {}", kind_of(other)));
+                    None
+                }
+            })
+            .collect(),
+        Some(other) => {
+            warnings.push(format!("{label}.{key}: should be an object of names to values, not {}", kind_of(other)));
+            Vec::new()
+        }
+    }
+}
+
+/// The options each kind of `auth` takes, besides `type`.
+const AUTH_OPTIONS: &[(&str, &[&str])] = &[
+    ("none", &[]),
+    ("azure", &["tenant", "resource"]),
+    ("gcp", &[]),
+    ("aws", &["region", "profile", "credentials_command"]),
+    ("bearer", &["token_command", "token_env", "token_file"]),
+    ("basic", &["username", "password_command", "password_env", "password_file"]),
+];
+
+/// `prometheus.auth`, or `None` (with warnings) when anything in it is wrong.
+fn interpret_auth(a: &Map<String, Value>, label: &str, warnings: &mut Vec<String>) -> Option<skiff_core::ExternalAuth> {
+    use skiff_core::{ExternalAuth, SecretSource};
+    let kinds: Vec<&str> = AUTH_OPTIONS.iter().map(|(k, _)| *k).collect();
+    let kind = match a.get("type") {
+        Some(Value::String(t)) => t.trim().to_ascii_lowercase(),
+        Some(other) => {
+            warnings.push(format!("{label}.type: should be one of {}, not {}", kinds.join(", "), kind_of(other)));
+            return None;
+        }
+        None => {
+            warnings.push(format!("{label}.type: missing; one of {}", kinds.join(", ")));
+            return None;
+        }
+    };
+    let Some((_, options)) = AUTH_OPTIONS.iter().find(|(k, _)| *k == kind) else {
+        warnings.push(format!("{label}.type: {kind:?} is not one of {}", kinds.join(", ")));
+        return None;
+    };
+    let before = warnings.len();
+    for key in a.keys().filter(|k| *k != "type" && !options.contains(&k.as_str())) {
+        warnings.push(format!(
+            "{label}.{key}: not an option of type {kind:?}{}",
+            if options.is_empty() { String::new() } else { format!(" (its options: {})", options.join(", ")) }
+        ));
+    }
+    let mut text = |key: &str| match a.get(key) {
+        None => None,
+        Some(Value::String(v)) if !v.trim().is_empty() => Some(v.trim().to_string()),
+        Some(other) => {
+            warnings.push(format!(
+                "{label}.{key}: should be text in quotes, not {}",
+                if matches!(other, Value::String(_)) { "an empty one" } else { kind_of(other) }
+            ));
+            None
+        }
+    };
+    let tenant = text("tenant");
+    let resource = text("resource");
+    let region = text("region");
+    let profile = text("profile");
+    let username = text("username");
+    let mut command = |key: &str| -> Option<Vec<String>> {
+        match a.get(key)? {
+            Value::Array(items) if !items.is_empty() && items.iter().all(|i| i.as_str().is_some_and(|s| !s.is_empty())) => {
+                Some(items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())
+            }
+            _ => {
+                warnings.push(format!("{label}.{key}: should be a program and its arguments, like [\"vault\", \"read\", \"-field=token\", \"secret/prom\"]"));
+                None
+            }
+        }
+    };
+    let credentials_command = command("credentials_command");
+    let token_command = command("token_command");
+    let password_command = command("password_command");
+    let mut secret = |prefix: &str, command: Option<Vec<String>>| -> Option<SecretSource> {
+        let env = a.get(&format!("{prefix}_env")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let file = a.get(&format!("{prefix}_file")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let given = [command.is_some(), env.is_some(), file.is_some()].iter().filter(|g| **g).count();
+        if given != 1 {
+            warnings.push(format!(
+                "{label}: give exactly one of {prefix}_command, {prefix}_env and {prefix}_file{}",
+                if a.contains_key(&format!("{prefix}_env")) || a.contains_key(&format!("{prefix}_file")) { " (as text in quotes)" } else { "" }
+            ));
+            return None;
+        }
+        Some(match (command, env, file) {
+            (Some(argv), _, _) => SecretSource::Command(argv),
+            (_, Some(env), _) => SecretSource::Env(env.to_string()),
+            (_, _, Some(file)) => SecretSource::File(file.into()),
+            _ => unreachable!(),
+        })
+    };
+    let auth = match kind.as_str() {
+        "none" => ExternalAuth::None,
+        "azure" => ExternalAuth::Azure { tenant, resource },
+        "gcp" => ExternalAuth::Gcp,
+        "aws" => ExternalAuth::Aws { region, profile, credentials_command },
+        "bearer" => ExternalAuth::Bearer(secret("token", token_command)?),
+        "basic" => {
+            let password = secret("password", password_command);
+            let Some(username) = username else {
+                warnings.push(format!("{label}.username: missing"));
+                return None;
+            };
+            ExternalAuth::Basic { username, password: password? }
+        }
+        _ => unreachable!("checked against AUTH_OPTIONS"),
+    };
+    (warnings.len() == before).then_some(auth)
 }
 
 /// Checks that `url` is a plain `http://` or `https://` address (it is
@@ -1302,22 +1535,31 @@ mod tests {
         assert_eq!(config.terminal(), Some("iTerm"));
         assert_eq!(config.zoom(), Some(1.0));
         assert_eq!(config.log_history(), Some(LogHistory::Lines(1000)));
-        assert_eq!(config.cluster_names().collect::<Vec<_>>(), ["production"]);
+        assert_eq!(config.cluster_names().collect::<Vec<_>>(), ["aks-prod", "production"]);
         assert_eq!(
             config.cluster("production"),
             ClusterConfig {
                 hidden: false,
                 read_only: true,
                 confirm: true,
-                prometheus: Some(PrometheusOverride {
+                prometheus: Some(PrometheusOverride::Service(PrometheusService {
                     namespace: "monitoring".into(),
                     service: "prometheus-operated".into(),
                     port: 9090,
                     scheme: "http".into(),
                     path_prefix: String::new(),
-                }),
+                })),
                 grafana_url: Some("https://grafana.example.com".into()),
             }
+        );
+        assert_eq!(
+            config.cluster("aks-prod").prometheus,
+            Some(PrometheusOverride::External(skiff_core::ExternalEndpoint {
+                url: "https://myworkspace-abcd.westeurope.prometheus.monitor.azure.com".into(),
+                auth: skiff_core::ExternalAuth::Azure { tenant: None, resource: None },
+                labels: vec![("cluster".into(), "aks-prod".into())],
+                headers: Vec::new(),
+            }))
         );
         assert_eq!(config.cluster("other"), ClusterConfig::default());
     }
@@ -1325,6 +1567,10 @@ mod tests {
     /// Every leaf key path of `v`, with cluster names as `<context>`.
     fn leaf_paths(v: &Value, prefix: &str, out: &mut Vec<String>) {
         match v {
+            // Objects of free-form names, documented as one key each.
+            Value::Object(_) if [".prometheus.auth", ".prometheus.labels", ".prometheus.headers"].iter().any(|s| prefix.ends_with(s)) => {
+                out.push(prefix.to_string())
+            }
             Value::Object(map) => {
                 for (k, child) in map {
                     let k = if prefix == "clusters" { "<context>" } else { k.as_str() };
@@ -1360,7 +1606,7 @@ mod tests {
         assert_eq!(known_keys("clusters.<context>"), ["hidden", "read_only", "confirm", "prometheus", "grafana_url"]);
         assert_eq!(
             known_keys("clusters.<context>.prometheus"),
-            ["namespace", "service", "port", "scheme", "path_prefix"]
+            ["namespace", "service", "port", "scheme", "path_prefix", "url", "auth", "labels", "headers"]
         );
     }
 
@@ -1445,7 +1691,7 @@ mod tests {
         // The rest of the file still counts, including the override with an unknown key.
         assert_eq!(config.zoom(), Some(2.0));
         assert!(config.cluster("prod").read_only);
-        assert_eq!(config.cluster("prod").prometheus.map(|p| p.service), Some("p".into()));
+        assert!(matches!(config.cluster("prod").prometheus, Some(PrometheusOverride::Service(p)) if p.service == "p"));
     }
 
     #[test]
@@ -1645,18 +1891,98 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(
             p,
-            Some(PrometheusOverride {
+            Some(PrometheusOverride::Service(PrometheusService {
                 namespace: "m".into(),
                 service: "p".into(),
                 port: 9090,
                 scheme: "http".into(),
                 path_prefix: String::new()
-            })
+            }))
         );
         let (p, w) = prom(r#"{ "namespace": "m", "service": "p", "port": 8481, "scheme": "HTTPS", "path_prefix": "/select/0/prometheus" }"#);
         assert!(w.is_empty());
-        let p = p.unwrap();
+        let Some(PrometheusOverride::Service(p)) = p else { panic!("{p:?}") };
         assert_eq!((p.port, p.scheme.as_str(), p.path_prefix.as_str()), (8481, "https", "/select/0/prometheus"));
+    }
+
+    #[test]
+    fn prometheus_outside_the_cluster() {
+        use skiff_core::{ExternalAuth, ExternalEndpoint, SecretSource};
+        let prom = |body: &str| {
+            let (c, w) = Config::from_json(&format!("{{ \"clusters\": {{ \"a\": {{ \"prometheus\": {body} }} }} }}"));
+            let external = match c.cluster("a").prometheus {
+                Some(PrometheusOverride::External(e)) => Some(e),
+                None => None,
+                Some(other) => panic!("{other:?}"),
+            };
+            (external, w)
+        };
+        let ok = |body: &str| {
+            let (p, w) = prom(body);
+            assert!(w.is_empty(), "{body}: {w:?}");
+            p.unwrap_or_else(|| panic!("{body}"))
+        };
+
+        let p = ok(r#"{ "url": "https://ws.westeurope.prometheus.monitor.azure.com", "auth": "azure" }"#);
+        assert_eq!(p.auth, ExternalAuth::Azure { tenant: None, resource: None });
+        let p = ok(r#"{ "url": "https://ws.prometheus.monitor.azure.us", "auth": { "type": "azure", "tenant": "t1", "resource": "https://prometheus.monitor.azure.us" } }"#);
+        assert_eq!(
+            p.auth,
+            ExternalAuth::Azure { tenant: Some("t1".into()), resource: Some("https://prometheus.monitor.azure.us".into()) }
+        );
+        let p = ok(r#"{ "url": "https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1", "auth": { "type": "aws", "profile": "prod" } }"#);
+        assert_eq!(p.auth, ExternalAuth::Aws { region: None, profile: Some("prod".into()), credentials_command: None });
+        let p = ok(r#"{ "url": "https://monitoring.googleapis.com/v1/projects/p/location/global/prometheus", "auth": { "type": "GCP" } }"#);
+        assert_eq!(p.auth, ExternalAuth::Gcp);
+        let p = ok(r#"{ "url": "https://mimir.example.com/prometheus", "auth": { "type": "bearer", "token_command": ["vault", "read", "-field=token", "secret/prom"] },
+                        "headers": { "X-Scope-OrgID": "team-a" }, "labels": { "cluster": "eks-1", "env": "prod" } }"#);
+        assert_eq!(
+            p,
+            ExternalEndpoint {
+                url: "https://mimir.example.com/prometheus".into(),
+                auth: ExternalAuth::Bearer(SecretSource::Command(vec![
+                    "vault".into(),
+                    "read".into(),
+                    "-field=token".into(),
+                    "secret/prom".into()
+                ])),
+                headers: vec![("X-Scope-OrgID".into(), "team-a".into())],
+                labels: vec![("cluster".into(), "eks-1".into()), ("env".into(), "prod".into())],
+            }
+        );
+        let p = ok(r#"{ "url": "https://prometheus-prod-01.grafana.net/api/prom", "auth": { "type": "basic", "username": "123456", "password_env": "GRAFANA_CLOUD_TOKEN" } }"#);
+        assert_eq!(p.auth, ExternalAuth::Basic { username: "123456".into(), password: SecretSource::Env("GRAFANA_CLOUD_TOKEN".into()) });
+        assert_eq!(ok(r#"{ "url": "http://10.0.0.5:9090" }"#).auth, ExternalAuth::None);
+
+        // Each mistake is named, then one line says the override is off.
+        for (body, said) in [
+            (r#"{ "url": "" }"#, "clusters.a.prometheus.url:"),
+            (r#"{ "url": 5 }"#, "clusters.a.prometheus.url:"),
+            (r#"{ "url": "ftp://x" }"#, "must start with https://"),
+            (r#"{ "url": "https://x", "namespace": "m" }"#, "clusters.a.prometheus.namespace: not used together with url"),
+            (r#"{ "url": "https://x", "auth": { "type": "kerberos" } }"#, "is not one of"),
+            (r#"{ "url": "https://x", "auth": { "tenant": "t" } }"#, "clusters.a.prometheus.auth.type: missing"),
+            (r#"{ "url": "https://x", "auth": { "type": "gcp", "tenant": "t" } }"#, "not an option of type \"gcp\""),
+            (r#"{ "url": "https://x", "auth": { "type": "bearer" } }"#, "exactly one of token_command"),
+            (r#"{ "url": "https://x", "auth": { "type": "bearer", "token_env": "A", "token_file": "/b" } }"#, "exactly one of"),
+            (r#"{ "url": "https://x", "auth": { "type": "bearer", "token_command": "az account get-access-token" } }"#, "a program and its arguments"),
+            (r#"{ "url": "https://x", "auth": { "type": "basic", "password_env": "P" } }"#, "username: missing"),
+            (r#"{ "url": "https://x", "auth": { "type": "aws" } }"#, "region is needed"),
+            (r#"{ "url": "http://prom.example.com", "auth": "azure" }"#, "only over https"),
+            (r#"{ "url": "https://x", "labels": { "cluster": 1 } }"#, "labels.cluster: should be text"),
+            (r#"{ "url": "https://x", "labels": { "a-b": "c" } }"#, "not a label name"),
+            (r#"{ "url": "https://x", "auth": "gcp", "headers": { "Authorization": "x" } }"#, "set by Skiff"),
+        ] {
+            let (p, w) = prom(body);
+            assert_eq!(p, None, "{body}");
+            assert!(w.len() >= 2, "{body}: {w:?}");
+            assert!(w.iter().any(|m| m.contains(said)), "{body}: {w:?}");
+            assert!(w.last().unwrap().starts_with("clusters.a.prometheus: not used"), "{body}: {w:?}");
+        }
+        // auth, labels and headers mean nothing without url.
+        let (c, w) = Config::from_json(r#"{ "clusters": { "a": { "prometheus": { "namespace": "m", "service": "p", "labels": { "cluster": "x" } } } } }"#);
+        assert_eq!(c.cluster("a").prometheus, None);
+        assert!(w[0].starts_with("clusters.a.prometheus.labels: only used together with url"), "{w:?}");
     }
 
     #[test]
