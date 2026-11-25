@@ -10,6 +10,8 @@ here.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-25
+
 ### Added
 
 - **Column filters** in the table filter: `node:worker-1`, `status:crash`,
@@ -37,6 +39,8 @@ here.
 
 ### Fixed
 
+- On macOS the Dock shows Skiff's own icon while it runs, not the egui
+  logo.
 - The overview no longer says "all ready" or "nothing is failing" for a
   list that could not be loaded, or while lists are still loading.
 - A Secret's overview no longer shows the
@@ -179,5 +183,6 @@ YAML editing, logs, the built-in shell, port forwarding, the command
 palette, vim-style keys with custom bindings, and in-app updates on
 macOS.
 
-[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TsenkoTsenkov/skiff/releases/tag/v0.1.0
