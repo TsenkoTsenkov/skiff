@@ -1,0 +1,55 @@
+# Rewrites the "Downloads" table of releases that are already published,
+# so that each file name is a link that downloads it. Releases made by
+# release.yml have those links from the start; this is for the ones
+# published before it wrote them. Run by hand:
+#
+#   Actions > Release notes links > Run workflow, tags: "v0.1.2 v0.1.1"
+#
+# Only the notes change: no file, tag or flag of the release is touched,
+# and a release whose table already has links is left alone.
+name: Release notes links
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Tags of the releases to rewrite, separated by spaces (v0.1.2 build-67)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  link:
+    name: Link the files in the Downloads table
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # edit the notes of a release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAGS: ${{ inputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rewrite the notes
+        run: |
+          for tag in $TAGS; do
+            if ! printf '%s' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+|build-[0-9]+'; then
+              echo "::error::\"$tag\" is not a release tag (vX.Y.Z or build-N)."
+              exit 1
+            fi
+            gh release view "$tag" --json body --jq .body > old.md
+            mapfile -t assets < <(gh release view "$tag" --json assets --jq '.assets[].name')
+            python3 .github/scripts/link-release-downloads.py "$GH_REPO" "$tag" "${assets[@]}" < old.md > new.md
+            if cmp -s old.md new.md; then
+              echo "$tag: nothing to change."
+              continue
+            fi
+            diff -u old.md new.md || true
+            gh release edit "$tag" --notes-file new.md
+            echo "$tag: the Downloads table now links its files."
+          done
