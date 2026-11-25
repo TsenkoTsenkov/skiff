@@ -10,6 +10,13 @@ here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Searching logs keeps every line on screen** and highlights the
+  matches, so you see them in context. Enter and Shift+Enter still step
+  through the matches. The filter button next to the match count still
+  narrows the view to matching lines only.
+
 ## [0.1.2] - 2026-11-25
 
 ### Added
