@@ -71,7 +71,7 @@ fn prometheus_is_detected_and_charts_and_alerts_load_through_the_proxy() {
     let Some(prom) = demo_prometheus(&session) else { return };
     // The operator-labelled Service wins over the plain `prometheus` one
     // (which points at a kwok pod that cannot answer).
-    assert_eq!(prom.endpoint().display(), "monitoring/prometheus-operated:9090");
+    assert_eq!(prom.display(), "monitoring/prometheus-operated:9090");
 
     // A pod's charts: one series per container, request and limit lines.
     let pods = std::process::Command::new("kubectl")
@@ -217,31 +217,31 @@ fn a_configured_endpoint_is_used_and_its_failures_are_told_apart() {
     // An auth proxy in front of Prometheus says no.
     let mut denied = PromEndpoint::new("monitoring", "prometheus-operated", 9090);
     denied.path_prefix = "/deny".into();
-    session.set_prometheus_endpoint(Some(denied));
+    session.set_prometheus_endpoint(Some(denied.into()));
     match &*outcome(&session) {
         PromStatus::Unavailable(PromError::Forbidden(msg)) => assert!(msg.contains("Forbidden"), "{msg}"),
         other => panic!(
             "expected Forbidden, got {:?}",
-            other.ready().map(|p| p.endpoint().display())
+            other.ready().map(|p| p.display())
         ),
     }
 
     // A Service that does not exist.
-    session.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "no-such-prometheus", 9090)));
+    session.set_prometheus_endpoint(Some(PromEndpoint::new("monitoring", "no-such-prometheus", 9090).into()));
     match &*outcome(&session) {
         PromStatus::Unavailable(PromError::Unreachable(msg)) => {
             assert!(msg.starts_with("monitoring/no-such-prometheus:9090 ("), "{msg}")
         }
         other => panic!(
             "expected Unreachable, got {:?}",
-            other.ready().map(|p| p.endpoint().display())
+            other.ready().map(|p| p.display())
         ),
     }
 
     // Something that answers, but not as Prometheus.
     let mut broken = PromEndpoint::new("monitoring", "prometheus-operated", 9090);
     broken.path_prefix = "/broken".into();
-    session.set_prometheus_endpoint(Some(broken));
+    session.set_prometheus_endpoint(Some(broken.into()));
     assert!(matches!(
         &*outcome(&session),
         PromStatus::Unavailable(PromError::Other(_))

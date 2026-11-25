@@ -268,7 +268,9 @@ impl MetricsView {
         }
     }
 
-    fn header(&mut self, ui: &mut Ui, pal: &Palette, subject: &Subject<'_>, with_range: bool) {
+    /// `scope`: the label matchers of the Prometheus in use (see
+    /// `Prom::scope`), for the Grafana link; empty for none.
+    fn header(&mut self, ui: &mut Ui, pal: &Palette, subject: &Subject<'_>, with_range: bool, scope: &str) {
         ui.add_space(4.0);
         // (A workload without pods has no queries to hand over.)
         let grafana = match (subject.grafana_url, &subject.target) {
@@ -312,7 +314,7 @@ impl MetricsView {
                     if ui.add(button).on_hover_text(tip).clicked() {
                         // The queries and the link are only put together
                         // when they are asked for, not on every frame.
-                        let queries = grafana_target(target).usage_queries();
+                        let queries = grafana_target(target).usage_queries_in(scope);
                         if !queries.is_empty() {
                             let url = grafana_explore_url(base, &queries, self.span);
                             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
@@ -331,9 +333,8 @@ impl MetricsView {
         subject: &Subject<'_>,
         prom: &Prom,
     ) {
-        self.header(ui, pal, subject, true);
-        let endpoint = prom.endpoint();
-        let source = format!("Prometheus · {}/{}", endpoint.namespace, endpoint.service);
+        self.header(ui, pal, subject, true, prom.scope());
+        let source = format!("Prometheus · {}", prom.source());
 
         let Some(target) = &subject.target else {
             source_line(ui, pal, &source);
@@ -356,7 +357,7 @@ impl MetricsView {
         }
 
         // Load, and load again while the tab stays open.
-        let key: Key = (target.clone(), self.span, endpoint.display());
+        let key: Key = (target.clone(), self.span, prom.display());
         if let Some((job_key, range, job)) = &self.job {
             if let Some(result) = job.take() {
                 if let Ok(charts) = result {
@@ -471,7 +472,7 @@ impl MetricsView {
         subject: &Subject<'_>,
         error: &PromError,
     ) {
-        self.header(ui, pal, subject, false);
+        self.header(ui, pal, subject, false, "");
         // The history is put together once per sample of the metrics (and
         // per object), not once per frame.
         let metrics = session.metrics();

@@ -94,8 +94,11 @@ server's identity is not checked.
 - The update check is made by the system's `curl`, which follows the same
   variables.
 
-Prometheus needs no proxy settings of its own: it is reached through the
-API server.
+A Prometheus in the cluster needs no proxy settings of its own: it is
+reached through the API server. One outside the cluster
+([`prometheus.url`](observability.md#prometheus-outside-the-cluster))
+follows `HTTPS_PROXY` and `NO_PROXY` like a cluster without a
+`proxy-url`.
 
 ## Managing clusters
 
