@@ -272,6 +272,15 @@ fn prometheus_endpoint(config: &Config, context: &str) -> Option<skiff_core::Pro
     })
 }
 
+/// Where a configured Prometheus is, in a few words: the Service, or the
+/// host of one outside the cluster.
+pub fn prometheus_source(p: &crate::config::PrometheusOverride) -> String {
+    match p {
+        crate::config::PrometheusOverride::Service(s) => format!("{}/{}", s.namespace, s.service),
+        crate::config::PrometheusOverride::External(e) => e.display(),
+    }
+}
+
 fn native_file_dialog_available() -> bool {
     if cfg!(any(target_os = "macos", windows)) {
         return true;
@@ -423,6 +432,8 @@ pub struct SkiffApp {
     legacy_light: bool,
     /// The Settings window, while it is open.
     pub settings: Option<settings::State>,
+    /// The "Prometheus for this cluster" dialog, when it is open.
+    pub prom_connect: Option<crate::prom_connect::PromConnect>,
     /// The list of keyboard shortcuts is open.
     pub help_open: bool,
     /// The "What's new" window, while it is open, with what it shows.
@@ -759,6 +770,7 @@ impl SkiffApp {
             theme_override,
             legacy_light: saved.light,
             settings: None,
+            prom_connect: None,
             help_open: false,
             whats_new: None,
             hint_seen: saved.hint_seen,
@@ -1306,6 +1318,7 @@ impl SkiffApp {
                     confirm: cluster.confirm,
                     plugin: c.exec_command.clone(),
                     plugin_missing: c.exec_missing,
+                    prometheus: cluster.prometheus.as_ref().map(prometheus_source),
                 }
             })
             .collect();
@@ -1340,7 +1353,7 @@ impl SkiffApp {
         let Some(state) = &mut self.settings else { return };
         // (A dialog or question on top of the window has the keyboard
         // and the clicks; closing is for when it is the window's turn.)
-        let covered = self.dialog.is_some() || self.confirm.is_some();
+        let covered = self.dialog.is_some() || self.confirm.is_some() || self.prom_connect.is_some();
         for action in settings::show(ctx, &pal, state, &model) {
             use settings::Action as A;
             match action {
@@ -1371,6 +1384,7 @@ impl SkiffApp {
                 A::SetReadOnly(context, on) => self.set_read_only(&context, on),
                 A::SetConfirm(context, on) => self.set_confirm(&context, on),
                 A::SetHidden(context, on) => self.set_cluster_hidden(&context, on),
+                A::ConnectPrometheus(context) => self.open_prom_connect(&context),
                 // (Opening closes the window: the cluster is what the
                 // user asked to see. An unsaved edit keeps both.)
                 A::OpenCluster(context) => {
@@ -1399,6 +1413,53 @@ impl SkiffApp {
                     ctx.copy_text(settings::version_info(self.config.updates().channel));
                     self.toast("Copied the version info", Tone::Normal);
                 }
+            }
+        }
+    }
+
+    /// Opens the "Prometheus for this cluster" dialog for `context`.
+    pub fn open_prom_connect(&mut self, context: &str) {
+        let current = self.config.cluster(context).prometheus;
+        self.prom_connect = Some(crate::prom_connect::PromConnect::new(context, current.as_ref()));
+    }
+
+    fn prom_connect_ui(&mut self, ctx: &egui::Context) {
+        use crate::prom_connect::{self, Outcome};
+        // A view's "Connect a Prometheus…" link.
+        if let Some(context) = prom_connect::take_request(ctx) {
+            if let Some(context) = context.or_else(|| self.active.clone()) {
+                self.open_prom_connect(&context);
+            }
+        }
+        let pal = self.pal;
+        let Some(dialog) = &mut self.prom_connect else { return };
+        let session = self.sessions.get(&dialog.context).cloned();
+        let connected = session.as_ref().is_some_and(|s| matches!(&*s.status(), ConnStatus::Connected { .. }));
+        match prom_connect::show(ctx, &pal, dialog, connected) {
+            Outcome::Open => {}
+            Outcome::Close => self.prom_connect = None,
+            Outcome::Test(config) => {
+                let job = self.core.test_prometheus(session.as_deref(), config);
+                dialog.start_test(job);
+            }
+            Outcome::Save(prometheus) => {
+                let context = dialog.context.clone();
+                self.edit_config(|c| c.set_prometheus(&context, prometheus.as_ref()));
+                if self.config.is_dirty() {
+                    // Not saved: edit_config said why.
+                    return;
+                }
+                self.prom_connect = None;
+                // Asked again even when nothing changed: the user may just
+                // have signed in.
+                if let Some(session) = &session {
+                    session.retry_prometheus();
+                }
+                let what = match &prometheus {
+                    None => "found in the cluster".to_string(),
+                    Some(p) => prometheus_source(p),
+                };
+                self.toast(format!("Prometheus for {context}: {what}"), Tone::Normal);
             }
         }
     }
@@ -2347,6 +2408,7 @@ impl SkiffApp {
 
         self.palette_ui(&ctx);
         self.settings_ui(&ctx);
+        self.prom_connect_ui(&ctx);
         self.help_ui(&ctx);
         self.whats_new_ui(&ctx);
         self.dialog_ui(&ctx);

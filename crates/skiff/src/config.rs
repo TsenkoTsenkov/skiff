@@ -741,6 +741,12 @@ impl Config {
         self.edit(&["clusters", context, "confirm"], Some(json!(confirm)));
     }
 
+    /// Sets where this cluster's Prometheus is; `None` removes the key
+    /// (Skiff looks for one in the cluster again).
+    pub fn set_prometheus(&mut self, context: &str, prometheus: Option<&PrometheusOverride>) {
+        self.edit(&["clusters", context, "prometheus"], prometheus.map(prometheus_json));
+    }
+
     /// Records one change, unless the file already says so.
     fn edit(&mut self, path: &[&str], value: Option<Value>) {
         if lookup(&self.raw, path) == value.as_ref() {
@@ -1171,6 +1177,77 @@ fn interpret_prometheus(
         scheme: scheme?,
         path_prefix: path_prefix?,
     }))
+}
+
+/// `clusters.<context>.prometheus` as it is written to the file: what
+/// [`interpret_prometheus`] reads back as the same override. Defaults are
+/// left out.
+pub fn prometheus_json(p: &PrometheusOverride) -> Value {
+    use skiff_core::{ExternalAuth, SecretSource};
+    let mut out = Map::new();
+    match p {
+        PrometheusOverride::Service(s) => {
+            out.insert("namespace".into(), json!(s.namespace));
+            out.insert("service".into(), json!(s.service));
+            if s.port != 9090 {
+                out.insert("port".into(), json!(s.port));
+            }
+            if s.scheme != "http" {
+                out.insert("scheme".into(), json!(s.scheme));
+            }
+            if !s.path_prefix.is_empty() {
+                out.insert("path_prefix".into(), json!(s.path_prefix));
+            }
+        }
+        PrometheusOverride::External(e) => {
+            out.insert("url".into(), json!(e.url));
+            let mut auth = Map::new();
+            let opt = |auth: &mut Map<String, Value>, key: &str, value: &Option<String>| {
+                if let Some(v) = value {
+                    auth.insert(key.into(), json!(v));
+                }
+            };
+            let secret = |auth: &mut Map<String, Value>, prefix: &str, source: &SecretSource| match source {
+                SecretSource::Command(argv) => auth.insert(format!("{prefix}_command"), json!(argv)),
+                SecretSource::Env(name) => auth.insert(format!("{prefix}_env"), json!(name)),
+                SecretSource::File(path) => auth.insert(format!("{prefix}_file"), json!(path.to_string_lossy())),
+            };
+            match &e.auth {
+                ExternalAuth::None => {}
+                ExternalAuth::Azure { tenant, resource } => {
+                    opt(&mut auth, "tenant", tenant);
+                    opt(&mut auth, "resource", resource);
+                }
+                ExternalAuth::Gcp => {}
+                ExternalAuth::Aws { region, profile, credentials_command } => {
+                    opt(&mut auth, "region", region);
+                    opt(&mut auth, "profile", profile);
+                    if let Some(argv) = credentials_command {
+                        auth.insert("credentials_command".into(), json!(argv));
+                    }
+                }
+                ExternalAuth::Bearer(source) => {
+                    secret(&mut auth, "token", source);
+                }
+                ExternalAuth::Basic { username, password } => {
+                    auth.insert("username".into(), json!(username));
+                    secret(&mut auth, "password", password);
+                }
+            }
+            if e.auth != ExternalAuth::None {
+                auth.insert("type".into(), json!(e.auth.kind()));
+                out.insert("auth".into(), Value::Object(auth));
+            }
+            let map = |pairs: &[(String, String)]| Value::Object(pairs.iter().map(|(k, v)| (k.clone(), json!(v))).collect());
+            if !e.labels.is_empty() {
+                out.insert("labels".into(), map(&e.labels));
+            }
+            if !e.headers.is_empty() {
+                out.insert("headers".into(), map(&e.headers));
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 /// The keys of a Prometheus outside the cluster; the others of
@@ -1983,6 +2060,45 @@ mod tests {
         let (c, w) = Config::from_json(r#"{ "clusters": { "a": { "prometheus": { "namespace": "m", "service": "p", "labels": { "cluster": "x" } } } } }"#);
         assert_eq!(c.cluster("a").prometheus, None);
         assert!(w[0].starts_with("clusters.a.prometheus.labels: only used together with url"), "{w:?}");
+    }
+
+    #[test]
+    fn a_prometheus_written_by_the_app_reads_back_the_same() {
+        use skiff_core::{ExternalAuth, ExternalEndpoint, SecretSource};
+        let external = |auth: ExternalAuth| {
+            PrometheusOverride::External(ExternalEndpoint {
+                url: "https://prom.example.com/workspaces/ws-1".into(),
+                auth,
+                labels: vec![("cluster".into(), "aks-prod".into())],
+                headers: vec![("X-Scope-OrgID".into(), "team-a".into())],
+            })
+        };
+        let cases = [
+            PrometheusOverride::Service(PrometheusService {
+                namespace: "monitoring".into(),
+                service: "vmselect".into(),
+                port: 8481,
+                scheme: "https".into(),
+                path_prefix: "/select/0/prometheus".into(),
+            }),
+            external(ExternalAuth::None),
+            external(ExternalAuth::Azure { tenant: Some("t".into()), resource: None }),
+            external(ExternalAuth::Gcp),
+            external(ExternalAuth::Aws { region: Some("eu-west-1".into()), profile: Some("prod".into()), credentials_command: None }),
+            external(ExternalAuth::Bearer(SecretSource::Command(vec!["vault".into(), "read".into()]))),
+            external(ExternalAuth::Bearer(SecretSource::File("~/.prom-token".into()))),
+            external(ExternalAuth::Basic { username: "123".into(), password: SecretSource::Env("GC_TOKEN".into()) }),
+        ];
+        for p in cases {
+            let (mut c, _) = Config::from_json("{}");
+            c.set_prometheus("ctx", Some(&p));
+            let text = serde_json::to_string(&Value::Object(c.raw.clone())).unwrap();
+            let (back, warnings) = Config::from_json(&text);
+            assert!(warnings.is_empty(), "{text}: {warnings:?}");
+            assert_eq!(back.cluster("ctx").prometheus.as_ref(), Some(&p), "{text}");
+            c.set_prometheus("ctx", None);
+            assert_eq!(c.cluster("ctx").prometheus, None);
+        }
     }
 
     #[test]

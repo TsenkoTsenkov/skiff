@@ -243,11 +243,15 @@ fn firing_alerts(ui: &mut Ui, pal: &Palette, session: &Arc<Session>, ns: &BTreeS
                     ui.add(egui::Label::new(RichText::new(error.to_string()).color(pal.muted)).wrap());
                     let link = egui::Label::new(RichText::new("Look for Prometheus again").color(pal.accent).size(12.0))
                         .sense(Sense::click());
-                    let resp = ui.add(link).on_hover_cursor(egui::CursorIcon::PointingHand);
-                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Look for Prometheus again"));
-                    if resp.clicked() {
-                        session.retry_prometheus();
-                    }
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(link).on_hover_cursor(egui::CursorIcon::PointingHand);
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Look for Prometheus again"));
+                        if resp.clicked() {
+                            session.retry_prometheus();
+                        }
+                        ui.label(RichText::new("·").color(pal.faint));
+                        crate::prom_connect::link(ui, pal, None, "Change Prometheus…");
+                    });
                 });
             });
             return None;

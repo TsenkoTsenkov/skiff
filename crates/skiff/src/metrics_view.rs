@@ -525,7 +525,9 @@ impl MetricsView {
             PromError::NotFound => (
                 icons::ICON_INFO,
                 format!(
-                    "{} Skiff found none in this cluster. If yours runs under an unusual name, set {} in Skiff's config file.",
+                    "{} Skiff found none in this cluster. If your metrics are in a managed Prometheus (Azure Monitor, \
+                     Amazon, Google Cloud, Grafana Cloud) or one with an unusual name, connect it below (it is saved \
+                     as {} in Skiff's config file).",
                     if has_metrics || !empty {
                         "Longer history, network and restarts need Prometheus."
                     } else {
@@ -544,11 +546,15 @@ impl MetricsView {
                 ui.add(egui::Label::new(RichText::new(text).color(pal.muted).size(12.0)).wrap());
                 let link = egui::Label::new(RichText::new("Look for Prometheus again").color(pal.accent).size(12.0))
                     .sense(egui::Sense::click());
-                let resp = ui.add(link).on_hover_cursor(egui::CursorIcon::PointingHand);
-                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Look for Prometheus again"));
-                if resp.clicked() {
-                    session.retry_prometheus();
-                }
+                ui.horizontal(|ui| {
+                    let resp = ui.add(link).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Look for Prometheus again"));
+                    if resp.clicked() {
+                        session.retry_prometheus();
+                    }
+                    ui.label(RichText::new("·").color(pal.faint));
+                    crate::prom_connect::link(ui, pal, Some(subject.context), "Connect a Prometheus…");
+                });
             });
         });
     }

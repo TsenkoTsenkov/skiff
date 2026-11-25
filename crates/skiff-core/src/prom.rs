@@ -830,6 +830,50 @@ impl Prom {
     }
 }
 
+/// What [`test_connection`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectionTest {
+    /// It answers, and has container metrics (this many series) within
+    /// its [`Prom::scope`].
+    Ready { source: String, series: u64 },
+    /// It answers, but nothing matches: no container metrics at all, or
+    /// none with these labels (a wrong `cluster` value, typically).
+    NoData { source: String, scope: String },
+}
+
+/// Tries a Prometheus the way the views will use it: it must answer, and
+/// is asked how many container memory series it has for its scope. The
+/// error is a sentence for the user. A Service in the cluster needs the
+/// cluster's `client`.
+pub async fn test_connection<F>(client: Option<F>, config: PromConfig) -> Result<ConnectionTest, String>
+where
+    F: std::future::Future<Output = Result<Client, String>>,
+{
+    let prom = match config {
+        PromConfig::Service(endpoint) => {
+            endpoint.validate()?;
+            let Some(client) = client else {
+                return Err("Connect to the cluster first: a Prometheus in it is reached through its API server.".into());
+            };
+            Prom::new(client.await?, endpoint)
+        }
+        PromConfig::External(endpoint) => Prom::external(endpoint).await.map_err(|e| e.to_string())?,
+    };
+    prom.ping().await.map_err(|e| e.to_string())?;
+    let sel = scoped(prom.scope(), "container!=\"\"".to_string());
+    let result = prom
+        .query(&format!("count(container_memory_working_set_bytes{{{sel}}})"), None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let series = result.series.first().and_then(|s| s.points.last()).map_or(0.0, |p| p.1);
+    let source = prom.source();
+    Ok(if series >= 1.0 {
+        ConnectionTest::Ready { source, series: series as u64 }
+    } else {
+        ConnectionTest::NoData { source, scope: prom.scope().to_string() }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Responses
 

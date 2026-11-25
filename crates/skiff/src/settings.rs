@@ -305,6 +305,8 @@ pub struct ClusterRow {
     /// That plugin is certain not to start: the check a connection makes
     /// first (`ContextInfo::exec_missing`), so both say the same.
     pub plugin_missing: bool,
+    /// Where its Prometheus is set to be (`None`: found automatically).
+    pub prometheus: Option<String>,
 }
 
 /// Everything the window shows, as it is in effect now.
@@ -361,6 +363,8 @@ pub enum Action {
     SetReadOnly(String, bool),
     SetConfirm(String, bool),
     SetHidden(String, bool),
+    /// Open the "Prometheus for this cluster" dialog.
+    ConnectPrometheus(String),
     OpenCluster(String),
     Reconnect(String),
     Disconnect(String),
@@ -787,6 +791,9 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
                     if let Some(plugin) = &row.plugin {
                         plugin_line(ui, pal, plugin, row.plugin_missing, model.kube.plugins.get(plugin).and_then(|p| p.as_deref()));
                     }
+                    if prometheus_line(ui, pal, &row.name, row.prometheus.as_deref()) {
+                        actions.push(Action::ConnectPrometheus(row.name.clone()));
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -826,6 +833,31 @@ fn clusters(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>
             });
         }
     });
+}
+
+/// "Prometheus: found automatically · Change…" under a cluster's name.
+/// Returns whether Change was clicked.
+fn prometheus_line(ui: &mut Ui, pal: &Palette, name: &str, prometheus: Option<&str>) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let text = match prometheus {
+            Some(source) => format!("Prometheus: {source}"),
+            None => "Prometheus: found in the cluster".to_string(),
+        };
+        ui.label(widgets::icon(icons::ICON_SPEED, 13.0).color(pal.faint));
+        // As wide as the text, leaving room for Change… (a long host is cut).
+        let galley = ui.painter().layout_no_wrap(text.clone(), egui::FontId::proportional(11.5), pal.faint);
+        let room = galley.size().x.min((ui.available_width() - 56.0).max(40.0)) + 2.0;
+        ui.allocate_ui_with_layout(Vec2::new(room, 16.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.add(egui::Label::new(RichText::new(&text).color(pal.faint).size(11.5)).truncate()).on_hover_text(&text);
+        });
+        let change = egui::Button::new(RichText::new("Change…").color(pal.accent).size(11.5)).frame(false);
+        if widgets::named(ui.add(change), &format!("Prometheus for {name}")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            clicked = true;
+        }
+    });
+    clicked
 }
 
 /// The width of one [`row_button`].

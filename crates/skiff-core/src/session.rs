@@ -1686,6 +1686,20 @@ impl Core {
         kubeconfig::load(&self.sources.load())
     }
 
+    /// Tries a Prometheus before it is saved (see
+    /// [`prom::test_connection`]). `session` is the cluster's, needed for
+    /// a Service in the cluster.
+    pub fn test_prometheus(&self, session: Option<&Session>, config: PromConfig) -> Job<prom::ConnectionTest> {
+        let job = Job::new();
+        let (j, notify) = (job.clone(), self.notify.clone());
+        let client = session.map(|s| s.client());
+        self.handle.spawn(async move {
+            j.finish(prom::test_connection(client, config).await);
+            notify.ping();
+        });
+        job
+    }
+
     pub fn connect(&self, context: &str) -> Arc<Session> {
         Session::connect(self.handle.clone(), self.notify.clone(), context, self.sources.clone())
     }

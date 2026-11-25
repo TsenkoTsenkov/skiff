@@ -10,6 +10,20 @@ here.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-25
+
+### Added
+
+- **Connect a Prometheus from the app.** Settings → Clusters shows where
+  each cluster's metrics come from, with **Change…**; the Metrics tab and
+  the overview offer **Connect a Prometheus…** where none is in use. The
+  dialog lists Azure Monitor, Amazon, Google Cloud, Grafana Cloud, any
+  other address, or a Service in the cluster, asks only for what that
+  one needs (with where to find it), fills in the cluster label from the
+  context name, and **Test connection** says whether it answers and has
+  metrics for this cluster before anything is saved. No more editing
+  `config.json` by hand for this.
+
 ## [0.1.3] - 2026-11-25
 
 ### Added
@@ -241,7 +255,8 @@ YAML editing, logs, the built-in shell, port forwarding, the command
 palette, vim-style keys with custom bindings, and in-app updates on
 macOS.
 
-[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...v0.1.1

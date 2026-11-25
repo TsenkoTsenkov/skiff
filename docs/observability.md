@@ -162,7 +162,19 @@ next section.
 
 Many clusters send their metrics to a Prometheus that is not in the
 cluster: a cloud's managed service, or a central Prometheus, Thanos,
-Mimir or VictoriaMetrics for every cluster. Give its address as `url`
+Mimir or VictoriaMetrics for every cluster.
+
+**From the app:** Settings → Clusters → **Change…** next to "Prometheus"
+under the cluster (or **Connect a Prometheus…** on the Metrics tab).
+Pick the service, fill in the fields it asks for (each says where to
+find it), and choose **Test connection**: it says whether the
+Prometheus answers and how many container series it has for this
+cluster, or what is wrong ("Please run 'az login'", a missing role, a
+label that matches nothing). **Save** writes the settings below into
+`config.json` and connects at once. Choosing "Find it in the cluster"
+removes them again.
+
+**By hand:** give its address as `url`
 instead of `namespace` and `service`, say how to sign in with `auth`,
 and, when it holds the metrics of more than one cluster, which of them
 is this one with `labels`:
