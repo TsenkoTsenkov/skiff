@@ -57,7 +57,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libx11-dev
+        run: .github/scripts/apt-install.sh pkg-config libx11-dev
       # The program and its tests must be free of warnings.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -80,8 +80,7 @@ jobs:
       # software Vulkan driver (lavapipe) draws for them.
       - name: Build dependencies and a software Vulkan driver
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          .github/scripts/apt-install.sh \
             pkg-config libx11-dev libxkbcommon0 libxkbcommon-x11-0 libvulkan1 mesa-vulkan-drivers
       - name: cargo check
         run: cargo check --workspace --all-targets --locked
@@ -150,11 +149,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils appstream nsis python3-yaml
+        run: .github/scripts/apt-install.sh shellcheck desktop-file-utils appstream nsis python3-yaml
       - name: Shell scripts
-        run: shellcheck hack/macos-app.sh hack/linux-package.sh
+        run: shellcheck hack/macos-app.sh hack/linux-package.sh .github/scripts/apt-install.sh
       # What a linter cannot see: the toolchain's name is read correctly
       # from a CRLF checkout, the release workflow compiles nothing within
       # reach of a signing secret, and only its publish job may write.

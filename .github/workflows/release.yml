@@ -622,8 +622,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build and packaging tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          .github/scripts/apt-install.sh \
             pkg-config libx11-dev binutils dpkg-dev desktop-file-utils appstream \
             xvfb libxkbcommon0 libxkbcommon-x11-0 libvulkan1 mesa-vulkan-drivers
       # tar.gz, .deb and AppImage (appimagetool and the AppImage runtime
