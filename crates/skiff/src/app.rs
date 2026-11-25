@@ -124,6 +124,10 @@ pub struct Toast {
     pub text: String,
     pub tone: Tone,
     until: Instant,
+    /// Tells this notification's fade from every other one's.
+    id: u64,
+    /// It has been drawn once (its fade-in starts from there).
+    entered: bool,
 }
 
 enum Pending {
@@ -356,6 +360,11 @@ pub struct SkiffApp {
     tables: HashMap<String, TableUi>,
     cache: ViewCache,
     pub detail: Option<Detail>,
+    /// The cluster the open detail panel was last drawn for.
+    detail_session: Option<Arc<Session>>,
+    /// A detail panel that was closed and is still sliding out of view,
+    /// with its cluster. Only drawn; nothing in it can be used any more.
+    detail_leaving: Option<(Detail, Arc<Session>)>,
     pub dock: Dock,
     updater: crate::update::Updater,
     /// The user asked for the current update check (so "up to date" is
@@ -363,6 +372,8 @@ pub struct SkiffApp {
     update_check_asked: bool,
     pub palette: Option<PaletteState>,
     toasts: Vec<Toast>,
+    /// The id given to the newest notification.
+    toast_ids: u64,
     pending: Vec<Pending>,
     pub dialog: Option<Dialog>,
     pub sidebar_open: bool,
@@ -649,6 +660,7 @@ impl SkiffApp {
         let choice = theme_override.or(config.theme()).unwrap_or(if saved.light { Theme::Light } else { Theme::Dark });
         let pal = if choice == Theme::Light { Palette::light() } else { Palette::dark() };
         theme::apply(ctx, &pal);
+        crate::motion::apply(ctx, config.animations());
         // Zoom is Skiff's own (saved in config.json), not egui's.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let repaint = ctx.clone();
@@ -698,7 +710,10 @@ impl SkiffApp {
             updater: Default::default(),
             update_check_asked: false,
             palette: None,
+            detail_session: None,
+            detail_leaving: None,
             toasts: Vec::new(),
+            toast_ids: 0,
             pending: Vec::new(),
             dialog: None,
             sidebar_open: !saved.sidebar_closed,
@@ -973,6 +988,7 @@ impl SkiffApp {
             session.set_prometheus_endpoint(prometheus_endpoint(&self.config, name));
         }
         self.ctx.set_zoom_factor(self.zoom());
+        crate::motion::apply(&self.ctx, self.config.animations());
         self.sync_theme();
     }
 
@@ -1257,6 +1273,7 @@ impl SkiffApp {
             theme: self.theme_choice(),
             system_dark: self.ctx.system_theme().map(|t| t == egui::Theme::Dark),
             zoom: self.zoom(),
+            animations: self.config.animations(),
             log_history: self.log_history(),
             tables_customised: self.tables.values().filter(|t| !t.col_visible.is_empty() || !t.widths.is_empty()).count(),
             kube_source: self.kube_source(),
@@ -1294,6 +1311,7 @@ impl SkiffApp {
                 }
                 A::SetTheme(theme) => self.choose_theme(theme),
                 A::SetZoom(zoom) => self.set_zoom(zoom),
+                A::SetAnimations(on) => self.edit_config(|c| c.set_animations(on)),
                 A::SetLogHistory(tail) => {
                     self.edit_config(|c| c.set_log_history(crate::config::LogHistory::from_tail(tail)));
                 }
@@ -1696,7 +1714,7 @@ impl SkiffApp {
         }
         self.active = Some(name.to_string());
         self.ns_filter = self.saved_ns.get(name).map(|v| v.iter().cloned().collect()).unwrap_or_default();
-        self.detail = None;
+        self.close_detail();
         self.cache = ViewCache::default();
     }
 
@@ -1711,7 +1729,7 @@ impl SkiffApp {
         if self.active.as_deref() == Some(name) {
             self.remember_namespaces();
             self.active = None;
-            self.detail = None;
+            self.close_detail();
             self.dialog = None;
             self.confirm = None;
         }
@@ -1755,9 +1773,18 @@ impl SkiffApp {
         }
     }
 
+    /// Closes the detail panel. With animations on it is kept, unusable,
+    /// for the moment it takes to slide out.
+    fn close_detail(&mut self) {
+        let session = self.detail_session.take();
+        if let Some(detail) = self.detail.take() {
+            self.detail_leaving = session.filter(|_| crate::motion::on(&self.ctx)).map(|s| (detail, s));
+        }
+    }
+
     pub fn go(&mut self, view: View) {
         if self.view != view && !self.blocked_by_edit() {
-            self.detail = None;
+            self.close_detail();
             self.view = view;
         }
     }
@@ -1768,7 +1795,10 @@ impl SkiffApp {
         // Saying the same thing again just keeps it on screen longer.
         match self.toasts.iter_mut().find(|t| t.text == text) {
             Some(existing) => existing.until = until,
-            None => self.toasts.push(Toast { text, tone, until }),
+            None => {
+                self.toast_ids += 1;
+                self.toasts.push(Toast { text, tone, until, id: self.toast_ids, entered: false });
+            }
         }
     }
 
@@ -1862,8 +1892,8 @@ impl SkiffApp {
         if let Some((text, context, error)) = reopen {
             self.dialog = Some(Dialog::Create { text, pristine: String::new(), context, job: None, error: Some(error) });
         }
-        let now = Instant::now();
-        self.toasts.retain(|t| t.until > now);
+        // (Notifications whose time is up are removed where they are drawn,
+        // once they have faded: `toasts_ui`.)
 
         let mut applied: Option<Vec<String>> = None;
         if let Some(Dialog::Create { job, error, .. }) = &mut self.dialog {
@@ -2099,7 +2129,7 @@ impl SkiffApp {
         if self.blocked_by_edit() {
             return;
         }
-        self.detail = None;
+        self.close_detail();
         self.view = View::Resource(pods.clone());
         let tui = self.tables.entry(pods.id()).or_default();
         tui.selected = None;
@@ -2545,7 +2575,7 @@ impl SkiffApp {
                     d.cancel_edit();
                 }
             } else if self.detail.is_some() {
-                self.detail = None;
+                self.close_detail();
             } else if let View::Resource(key) = &self.view {
                 if let Some(t) = self.tables.get_mut(&key.id()) {
                     t.filter.clear();
@@ -3680,7 +3710,43 @@ impl SkiffApp {
 
     fn detail_panel(&mut self, ui: &mut Ui) {
         let pal = self.pal;
-        let Some(session) = self.session().cloned() else { return };
+        // Leave the table usable in small windows.
+        let max_width = (ui.available_width() - 340.0).clamp(300.0, 1100.0);
+        // The panel slides in from the right and out again. (Only the
+        // sidebar can be dragged open or shut: this one opens for an
+        // object and closes with its button or Esc.)
+        let panel = Panel::right("detail")
+            .resizable(true)
+            .drag_to_open(false)
+            .default_size(520.0f32.min(max_width))
+            .size_range(300.0f32.min(max_width)..=max_width)
+            .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 14, right: 10, top: 10, bottom: 8 }));
+        let session = self.session().cloned();
+        if self.detail.is_some() {
+            // A newly opened object takes the place of one on its way out.
+            self.detail_leaving = None;
+        }
+        let (Some(session), true) = (session.clone(), self.detail.is_some()) else {
+            // Nothing is open. A panel that was just closed is drawn while
+            // it slides out, with what it showed (unless that was another
+            // cluster's) and with nothing in it reacting any more.
+            let leaving = self
+                .detail_leaving
+                .as_mut()
+                .filter(|(_, of)| session.as_ref().is_some_and(|now| Arc::ptr_eq(now, of)));
+            let mut open = false;
+            let sliding = panel.show_collapsible(ui, &mut open, |ui| {
+                if let Some((detail, session)) = leaving {
+                    ui.disable();
+                    detail.ui(ui, &pal, session, true);
+                }
+            });
+            if sliding.is_none() {
+                self.detail_leaving = None;
+            }
+            return;
+        };
+        self.detail_session = Some(session.clone());
         let locked = self.locked_reason();
         let Some(detail) = &mut self.detail else { return };
         // Refresh when the watched row reports a newer version.
@@ -3708,16 +3774,12 @@ impl SkiffApp {
             || self.terminal_focused
             || egui::Popup::is_any_open(ui.ctx());
         let mut actions = Vec::new();
-        // Leave the table usable in small windows.
-        let max_width = (ui.available_width() - 340.0).clamp(300.0, 1100.0);
-        Panel::right("detail")
-            .resizable(true)
-            .default_size(520.0f32.min(max_width))
-            .size_range(300.0f32.min(max_width)..=max_width)
-            .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 14, right: 10, top: 10, bottom: 8 }))
-            .show(ui, |ui| {
-                actions = detail.ui(ui, &pal, &session, overlay);
-            });
+        // (Dragging the edge resizes; it never closes the panel, which
+        // could hold an unsaved edit.)
+        let mut open = true;
+        panel.show_collapsible(ui, &mut open, |ui| {
+            actions = detail.ui(ui, &pal, &session, overlay);
+        });
         let ctx = ui.ctx().clone();
         for a in actions {
             let Some(d) = &self.detail else { break };
@@ -3725,7 +3787,7 @@ impl SkiffApp {
             match a {
                 DetailAction::Close => {
                     if !self.blocked_by_edit() {
-                        self.detail = None;
+                        self.close_detail();
                     }
                 }
                 DetailAction::Row(action) => self.run_row_action(&ctx, action, &key, &ns, &name),
@@ -4236,6 +4298,39 @@ impl SkiffApp {
         if self.toasts.is_empty() {
             return;
         }
+        // A notification fades and rises in, and fades out when its time
+        // is up; only then is it removed. `presence` is how much of each
+        // one is there, from 0 to 1.
+        let now = Instant::now();
+        let animated = crate::motion::on(ctx);
+        let mut next_change = Duration::from_millis(500);
+        let mut presence: Vec<f32> = Vec::with_capacity(self.toasts.len());
+        self.toasts.retain_mut(|t| {
+            let left = t.until.saturating_duration_since(now);
+            let alive = !left.is_zero();
+            if alive {
+                next_change = next_change.min(left);
+            }
+            let p = match (animated, alive) {
+                // (By id: each one keeps its own fade when a neighbour goes.)
+                (true, _) => crate::motion::presence(ctx, egui::Id::unique(("toast", t.id)), alive && t.entered),
+                (false, true) => 1.0,
+                (false, false) => 0.0,
+            };
+            if animated && !t.entered {
+                // Its fade-in starts with the next frame.
+                ctx.request_repaint();
+            }
+            t.entered = true;
+            let keep = alive || p > 0.0;
+            if keep {
+                presence.push(p);
+            }
+            keep
+        });
+        if self.toasts.is_empty() {
+            return;
+        }
         let pal = self.pal;
         // Lay the texts out first: the stack is as wide as its widest
         // notification and each one is centred in it.
@@ -4255,31 +4350,41 @@ impl SkiffApp {
             .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -34.0))
             .order(egui::Order::Foreground)
             .interactable(false)
+            // (Each notification has its own fade.)
+            .fade_in(false)
             .show(ctx, |ui| {
                 ui.set_width(widest);
-                for (t, galley) in self.toasts.iter().zip(galleys) {
+                for ((t, galley), p) in self.toasts.iter().zip(galleys).zip(presence) {
                     let color = if t.tone == Tone::Normal { pal.accent } else { pal.tone(t.tone) };
                     let width = galley.size().x + 8.0 + 6.0 + 24.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.add_space(((widest - width) / 2.0).max(0.0));
-                        Frame::new()
-                            .fill(pal.raised)
-                            .stroke(Stroke::new(1.0, pal.border))
-                            .corner_radius(CornerRadius::same(8))
-                            .inner_margin(Margin::symmetric(12, 8))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    widgets::dot(ui, color);
-                                    ui.add(egui::Label::new(galley));
-                                });
+                    // Drawn where it belongs, then shown a little lower and
+                    // fainter the less of it is there.
+                    let rise = egui::emath::TSTransform::from_translation(Vec2::new(0.0, (1.0 - p) * 10.0));
+                    ui.scope(|ui| {
+                        ui.multiply_opacity(p);
+                        ui.with_visual_transform(rise, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add_space(((widest - width) / 2.0).max(0.0));
+                                Frame::new()
+                                    .fill(pal.raised)
+                                    .stroke(Stroke::new(1.0, pal.border))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(Margin::symmetric(12, 8))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            widgets::dot(ui, color);
+                                            ui.add(egui::Label::new(galley));
+                                        });
+                                    });
                             });
+                        });
                     });
                     ui.add_space(6.0);
                 }
             });
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(next_change);
     }
 }
 

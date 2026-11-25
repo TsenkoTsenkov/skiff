@@ -10,6 +10,7 @@ pub mod help;
 pub mod keymap;
 pub mod log_text;
 pub mod metrics_view;
+pub mod motion;
 pub mod overview;
 pub mod pages;
 pub mod palette;

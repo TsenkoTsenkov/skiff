@@ -629,21 +629,21 @@ impl Dock {
                 TabKind::Forwards => {}
             }
         }
-        if !self.open || self.tabs.is_empty() {
-            self.was_shown = false;
-            return out;
-        }
+        // The dock slides up from the bottom edge and back down. While it
+        // is on its way out (`!shown`) it is only drawn: nothing in it
+        // reacts, and it takes neither keys nor the keyboard.
+        let shown = self.open && !self.tabs.is_empty();
         let mut close: Option<usize> = None;
         let mut hide = false;
         // Choosing a shell's tab, or bringing the dock back with a shell in
         // front, is asking for that shell: it gets the keyboard.
-        let mut focus_shell = !self.was_shown;
-        self.was_shown = true;
+        let mut focus_shell = shown && !self.was_shown;
+        self.was_shown = shown;
         // Find: Cmd/Ctrl+F in logs; in a shell the terminal's own shortcut
         // (Ctrl+F is a key the shell uses). Taken before the tab draws: a
         // focused terminal passes every other key to the remote program.
         let mut find = false;
-        if self.attention {
+        if shown && self.attention {
             let active = self.active.min(self.tabs.len() - 1);
             let shell_shortcut = crate::shell::find_shortcut(ui.ctx());
             let cmd_f = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
@@ -653,12 +653,23 @@ impl Dock {
                 TabKind::Forwards => false,
             });
         }
+        // (Dragging the edge resizes the dock; it does not hide it.)
+        let mut expanded = shown;
         let panel = Panel::bottom("dock")
             .resizable(true)
             .default_size(300.0)
             .size_range(120.0..=1200.0)
+            // (Hidden means hidden: it comes back from the status bar or
+            // with a new tab, not by dragging the window's bottom edge.)
+            .drag_to_open(false)
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin { left: 10, right: 8, top: 6, bottom: 4 }))
-            .show(ui, |ui| {
+            .show_collapsible(ui, &mut expanded, |ui| {
+                if self.tabs.is_empty() {
+                    return;
+                }
+                if !shown {
+                    ui.disable();
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     egui::ScrollArea::horizontal().max_width(ui.available_width() - 40.0).show(ui, |ui| {
@@ -709,6 +720,10 @@ impl Dock {
                     TabKind::Forwards => forwards_ui(ui, pal, sessions, &mut out.toasts),
                 });
             });
+        let Some(panel) = panel.filter(|_| shown) else {
+            out.terminal_focused = false;
+            return out;
+        };
         let dock_rect = panel.response.rect;
         if let Some(pos) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None }) {
             self.attention = dock_rect.contains(pos);

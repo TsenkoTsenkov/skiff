@@ -16,6 +16,14 @@ here.
   the native arm64 build without the Intel half, so about half the size
   of the universal disk image. The universal image stays, and both update
   themselves the same way.
+- **Motion.** The detail panel slides in from the right and out again,
+  the logs and shells panel slides up and down, and notifications fade
+  in and out instead of popping. Dialogs fade in a little faster than
+  before. Nothing waits for an animation: each takes 0.15 s, and what is
+  on its way out no longer reacts to keys or clicks.
+- **Settings, Appearance: Animations** (`animations` in `config.json`)
+  turns all of that off, along with the animated scrolling to the
+  selected row, for anyone whom movement on screen bothers.
 
 ## [0.1.1] - 2026-11-25
 

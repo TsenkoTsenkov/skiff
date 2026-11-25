@@ -1068,6 +1068,168 @@ fn notifications_are_centred_each() {
 }
 
 // ----------------------------------------------------------------------
+// Motion. These run the app at 60 frames a second (the other tests take a
+// quarter of a second per frame, which is longer than any animation).
+// ----------------------------------------------------------------------
+
+/// The app with `json` as its config file, stepping 1/60 s per frame.
+fn harness_60fps(context: &str, view: &str, dir: &std::path::Path, json: &str) -> Harness<'static, SkiffApp> {
+    let path = dir.join("config.json");
+    std::fs::write(&path, json).unwrap();
+    let (config, warnings) = skiff::config::Config::load_from(&path);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let opts = AppOptions { context: Some(context.to_string()), view: Some(view.to_string()), ..Default::default() };
+    let mut h = Harness::builder()
+        .with_size([1440.0, 900.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless_with_config(&cc.egui_ctx, opts, config, warnings));
+    // The test harness turns every animation off; put back what the
+    // config file asks for, as the launched app has it.
+    let animations = h.state().config().animations();
+    skiff::motion::apply(&h.ctx, animations);
+    h.step();
+    h
+}
+
+/// Where the widget called `label` is in each of the next `frames` frames
+/// (`None` while it is not there).
+fn track(h: &mut Harness<'static, SkiffApp>, label: &str, frames: usize) -> Vec<Option<egui::Rect>> {
+    (0..frames)
+        .map(|_| {
+            h.step();
+            h.query_all_by_label(label).next().map(|n| n.rect())
+        })
+        .collect()
+}
+
+/// The values, without the frames in which there was none and without
+/// repeats: the path something took.
+fn path(values: impl IntoIterator<Item = Option<f32>>) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::new();
+    for v in values.into_iter().flatten() {
+        if out.last().is_none_or(|last| (last - v).abs() > 0.5) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Shows the notification "Saved" and returns, for each of the next 20
+/// frames, how far the colour of a point on its background is from the
+/// colour it ends up with (0 = there), without repeats. (A notification's
+/// rise is drawn, not laid out, so its widgets do not report it.)
+fn notification_arriving(h: &mut Harness<'static, SkiffApp>) -> Vec<u32> {
+    h.state_mut().toast("Saved", skiff_core::Tone::Ok);
+    let images: Vec<_> = (0..20)
+        .map(|_| {
+            h.step();
+            h.render().expect("render")
+        })
+        .collect();
+    // Left of its coloured dot, inside the frame.
+    let dot = h.get_by_label("Saved").rect().left_center() - egui::vec2(18.0, 0.0);
+    let at = |i: usize| images[i].get_pixel(dot.x as u32, dot.y as u32).0;
+    let last = at(images.len() - 1);
+    let mut out: Vec<u32> = Vec::new();
+    for i in 0..images.len() {
+        let d = at(i).iter().zip(last).map(|(a, b)| u32::from(a.abs_diff(b))).sum();
+        if out.last() != Some(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+#[test]
+fn the_detail_panel_and_the_dock_slide_and_notifications_fade() {
+    let Some(ctx) = test_context() else { return };
+    let mut h = harness_60fps(&ctx, "pods", &scratch("motion-on"), "{}");
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+
+    // The detail panel comes in from the right edge: its first tab moves
+    // left, frame by frame, and comes to rest inside the window.
+    h.get_by_label("alertmanager-0").click();
+    let frames = track(&mut h, "YAML", 30);
+    let xs = path(frames.iter().map(|r| r.map(|r| r.left())));
+    assert!(xs.len() >= 4, "the panel should take several frames to arrive: {xs:?}");
+    assert!(xs.windows(2).all(|w| w[1] < w[0]), "the panel should only move left while it opens: {xs:?}");
+    assert!(xs[0] - xs.last().unwrap() > 200.0, "it comes from the window's edge, not from next door: {xs:?}");
+    // It is done within a fifth of a second, and then nothing moves.
+    let rest = frames[12].expect("the panel is open after 0.2 s");
+    assert!(frames[12..].iter().all(|r| *r == Some(rest)), "still moving after 0.2 s: {:?}", &frames[12..]);
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+
+    // The dock rises from the bottom edge.
+    h.get_by_label("Logs").click();
+    let frames = track(&mut h, "Hide panel", 30);
+    let ys = path(frames.iter().map(|r| r.map(|r| r.top())));
+    assert!(ys.len() >= 4 && ys.windows(2).all(|w| w[1] < w[0]), "the dock should rise over several frames: {ys:?}");
+    settle(&mut h, "log lines", |h| has_label_containing(h, " lines"));
+    // Half-way pictures, for a look at what a frame in between is like.
+    h.get_by_label("Hide panel").click();
+    steps(&mut h, 2);
+    shot(&mut h, "60_dock_sliding_out");
+    assert!(!h.state().dock.open, "hidden at once, as far as the app is concerned");
+    assert_eq!(is_disabled(&h, "Hide panel"), Some(true), "nothing in a dock on its way out reacts");
+    let frames = track(&mut h, "Hide panel", 30);
+    let ys = path(frames.iter().map(|r| r.map(|r| r.top())));
+    assert!(ys.windows(2).all(|w| w[1] > w[0]), "the dock should only sink while it closes: {ys:?}");
+    assert_eq!(frames.last(), Some(&None), "and then it is gone");
+
+    // Esc closes the detail panel at once (the table has the keyboard
+    // again); what slides out is a picture of it that takes no clicks.
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 2);
+    assert!(h.state().detail.is_none(), "closed at once, as far as the app is concerned");
+    shot(&mut h, "61_detail_sliding_out");
+    assert_eq!(is_disabled(&h, "YAML"), Some(true), "nothing in a panel on its way out reacts");
+    let frames = track(&mut h, "YAML", 30);
+    let xs = path(frames.iter().map(|r| r.map(|r| r.left())));
+    assert!(xs.windows(2).all(|w| w[1] > w[0]), "the panel should only move right while it closes: {xs:?}");
+    assert_eq!(frames.last(), Some(&None), "and then it is gone");
+
+    // A notification fades in over several frames.
+    let fade = notification_arriving(&mut h);
+    assert!(fade.len() >= 5, "the notification should fade in: {fade:?}");
+    assert!(fade.windows(2).all(|w| w[1] < w[0]) && fade.last() == Some(&0), "and only become more solid: {fade:?}");
+}
+
+#[test]
+fn with_animations_off_everything_appears_at_once() {
+    let Some(ctx) = test_context() else { return };
+    let dir = scratch("motion-off");
+    let mut h = harness_60fps(&ctx, "pods", &dir, r#"{ "animations": false }"#);
+    settle(&mut h, "pods to load", |h| has_label(h, "alertmanager-0"));
+
+    h.get_by_label("alertmanager-0").click();
+    let xs = path(track(&mut h, "YAML", 30).iter().map(|r| r.map(|r| r.left())));
+    assert_eq!(xs.len(), 1, "the panel should be in its place from the first frame: {xs:?}");
+    settle(&mut h, "detail panel", |h| has_label(h, "CONTAINERS"));
+    h.get_by_label("Logs").click();
+    settle(&mut h, "log lines", |h| has_label_containing(h, " lines"));
+
+    h.get_by_label("Hide panel").click();
+    steps(&mut h, 2);
+    assert!(!has_label(&h, "Hide panel"), "the dock is gone with the click");
+    h.key_press(egui::Key::Escape);
+    steps(&mut h, 2);
+    assert!(h.state().detail.is_none() && !has_label(&h, "Close (Esc)"), "the panel is gone with the key");
+
+    // (Not there, then there: nothing in between.)
+    let fade = notification_arriving(&mut h);
+    assert!(fade.len() <= 2 && fade.last() == Some(&0), "the notification should appear at once: {fade:?}");
+
+    // The setting is in Settings, Appearance, and takes effect at once.
+    open_settings(&mut h, skiff::settings::Section::Appearance);
+    h.get_all_by_label("Animations").find(|n| n.accesskit_node().role() == Role::CheckBox).expect("check box").click();
+    steps(&mut h, 3);
+    assert!(skiff::motion::on(&h.ctx), "animations are back on");
+    assert_eq!(config_json(&dir)["animations"], serde_json::json!(true));
+}
+
+// ----------------------------------------------------------------------
 // First run, failures and protection. These bring their own kubeconfig and
 // config files (in a temp folder) through `AppOptions.kubeconfigs` and
 // `SkiffApp::headless_with_config`.
