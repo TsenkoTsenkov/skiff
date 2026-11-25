@@ -10,6 +10,18 @@ here.
 
 ## [Unreleased]
 
+### Added
+
+- **What's new**: after an update Skiff lists what changed in the new
+  version, once. It can be opened again from the palette ("What's new")
+  and from Settings, Updates. The Update button's tooltip and the release
+  page on GitHub show the same list before you update.
+
+### Changed
+
+- The cluster's version in the top bar reads "Kubernetes v1.32.3", so it
+  is not taken for Skiff's own version (which is in Settings, About).
+
 ## [0.1.1] - 2026-11-25
 
 ### Added

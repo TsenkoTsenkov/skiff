@@ -735,9 +735,25 @@ jobs:
           else
             attest="Each file also has a build provenance attestation: \`gh attestation verify <file> -R $GH_REPO\` shows that it was built by this repository's release workflow."
           fi
+          # This version's section of CHANGELOG.md, without its heading
+          # (empty when there is none), read at the commit being released:
+          # this job has no checkout. The app's update button shows its
+          # first lines.
+          changes=$(gh api -H "Accept: application/vnd.github.raw" "repos/$GH_REPO/contents/CHANGELOG.md?ref=$GITHUB_SHA" |
+            awk -v v="$VERSION" '
+              index($0, "## [" v "]") == 1 { on = 1; next }
+              on && /^## / { exit }
+              on { print }' | sed -e '/./,$!d')
           {
             if [ "$CHANNEL" = nightly ]; then
               echo "Nightly build $BUILD of Skiff $VERSION, made from commit $GITHUB_SHA. It is the newest code on main and has seen less testing than a release; the stable version is the one marked \"Latest\"."
+              echo
+            elif [ -n "$changes" ]; then
+              echo "## What's new"
+              echo
+              printf '%s\n' "$changes" | sed -e 's/^### /#### /'
+              echo
+              echo "All versions: [CHANGELOG.md](https://github.com/$GH_REPO/blob/main/CHANGELOG.md)."
               echo
             fi
             echo "## Downloads"
