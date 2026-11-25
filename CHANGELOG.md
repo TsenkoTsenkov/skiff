@@ -12,10 +12,19 @@ here.
 
 ### Added
 
+- **What's new**: after an update Skiff lists what changed in the new
+  version, once. It can be opened again from the palette ("What's new")
+  and from Settings, Updates. The Update button's tooltip and the release
+  page on GitHub show the same list before you update.
 - **An Apple Silicon-only download for macOS**, `Skiff-macos-arm64.dmg`:
   the native arm64 build without the Intel half, so about half the size
   of the universal disk image. The universal image stays, and both update
   themselves the same way.
+
+### Changed
+
+- The cluster's version in the top bar reads "Kubernetes v1.32.3", so it
+  is not taken for Skiff's own version (which is in Settings, About).
 
 ## [0.1.1] - 2026-11-25
 

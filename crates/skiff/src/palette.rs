@@ -36,6 +36,8 @@ pub enum Command {
     CreateResource,
     Reconnect,
     CheckForUpdates,
+    /// Shows this version's changelog entries.
+    WhatsNew,
     ReloadKubeconfig,
     AddKubeconfig,
     /// Makes the current cluster read-only in Skiff, or writable again.
@@ -195,6 +197,7 @@ fn collect(query: &str, contexts: &Contexts, active: Option<&str>, session: Opti
     push(icons::ICON_FILE_OPEN, "Add kubeconfig file…".into(), "Action".into(), Command::AddKubeconfig, 0, &["cluster", "open", "import"]);
     push(icons::ICON_SYNC, "Reload kubeconfig".into(), "Action".into(), Command::ReloadKubeconfig, 0, &["refresh", "clusters", "contexts"]);
     push(icons::ICON_SYSTEM_UPDATE_ALT, "Check for updates".into(), "Action".into(), Command::CheckForUpdates, 0, &["upgrade", "version"]);
+    push(icons::ICON_NEW_RELEASES, "What's new".into(), "Skiff".into(), Command::WhatsNew, 0, &["changelog", "release notes", "changes", "version"]);
     push(icons::ICON_SETTINGS, "Settings".into(), "Skiff".into(), Command::Settings(Section::Appearance), 0, &["preferences", "options", "theme"]);
     push(icons::ICON_HUB, "Cluster settings".into(), "Settings".into(), Command::Settings(Section::Clusters), 0, &["kubeconfig files", "protection"]);
     push(icons::ICON_INFO, "About Skiff".into(), "Skiff".into(), Command::Settings(Section::About), 0, &["version", "licence", "license", "build"]);

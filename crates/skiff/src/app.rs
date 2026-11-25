@@ -108,6 +108,9 @@ struct Saved {
     /// Column choices and widths, by resource id (window state, like the
     /// sidebar: not a setting of config.json).
     columns: HashMap<String, SavedColumns>,
+    /// The version whose "What's new" has been shown: a newer one shows
+    /// it again, once.
+    seen_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -407,6 +410,8 @@ pub struct SkiffApp {
     pub settings: Option<settings::State>,
     /// The list of keyboard shortcuts is open.
     pub help_open: bool,
+    /// The "What's new" window, while it is open, with what it shows.
+    pub whats_new: Option<Vec<crate::whats_new::Release>>,
     /// The first-run hint has been dismissed or acted on.
     hint_seen: bool,
     /// Counts kubeconfig loads, for what is derived from one.
@@ -608,12 +613,22 @@ fn cluster_row(
 
 impl SkiffApp {
     pub fn new(cc: &eframe::CreationContext<'_>, opts: AppOptions) -> Self {
-        let saved: Saved = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "skiff"))
-            .unwrap_or_default();
+        let stored: Option<Saved> = cc.storage.and_then(|s| eframe::get_value(s, "skiff"));
+        let existing_user = stored.is_some();
+        let saved = stored.unwrap_or_default();
+        let seen_version = saved.seen_version.clone();
         let (config, warnings) = Config::load();
         let mut app = Self::build(&cc.egui_ctx, opts, saved, config, warnings);
+        // Just updated: say what changed, once.
+        let news = crate::whats_new::after_update(
+            &crate::whats_new::parse(crate::whats_new::CHANGELOG),
+            seen_version.as_deref(),
+            existing_user,
+            crate::update::current_version(),
+        );
+        if !news.is_empty() {
+            app.whats_new = Some(news);
+        }
         app.updater.enable();
         app.native_file_dialog = native_file_dialog_available();
         app.headless = false;
@@ -726,6 +741,7 @@ impl SkiffApp {
             legacy_light: saved.light,
             settings: None,
             help_open: false,
+            whats_new: None,
             hint_seen: saved.hint_seen,
             kube_generation: 0,
             settings_stamps: [None, None],
@@ -771,6 +787,7 @@ impl SkiffApp {
             namespaces: self.saved_ns.clone(),
             sidebar_closed: !self.sidebar_open,
             hint_seen: self.hint_seen,
+            seen_version: Some(crate::update::current_version().to_string()),
             columns: self
                 .tables
                 .iter()
@@ -1058,6 +1075,7 @@ impl SkiffApp {
     pub fn open_settings(&mut self, section: Section) {
         self.palette = None;
         self.help_open = false;
+        self.whats_new = None;
         match &mut self.settings {
             Some(state) => state.section = section,
             None => self.settings = Some(settings::State::new(section)),
@@ -1068,8 +1086,26 @@ impl SkiffApp {
     pub fn open_help(&mut self) {
         self.palette = None;
         self.settings = None;
+        self.whats_new = None;
         self.help_open = true;
         self.hint_seen = true;
+    }
+
+    /// Opens "What's new" on this version's changelog entries (and, on the
+    /// nightly channel, what is not released yet).
+    pub fn open_whats_new(&mut self) {
+        use crate::whats_new::{between, parse, CHANGELOG};
+        self.palette = None;
+        self.settings = None;
+        self.help_open = false;
+        self.hint_seen = true;
+        let all = parse(CHANGELOG);
+        let mut shown = Vec::new();
+        if self.config.updates().channel == crate::config::Channel::Nightly {
+            shown.extend(all.iter().filter(|r| r.name == "Unreleased" && !r.is_empty()).cloned());
+        }
+        shown.extend(between(&all, None, crate::update::current_version()));
+        self.whats_new = Some(shown);
     }
 
     /// Puts a secret on the clipboard, to be cleared again after
@@ -1335,12 +1371,20 @@ impl SkiffApp {
                 A::OpenConfigFile => self.open_settings_file(false),
                 A::OpenKeysFile => self.open_settings_file(true),
                 A::ShowShortcuts => self.open_help(),
+                A::WhatsNew => self.open_whats_new(),
                 A::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
                 A::CopyVersionInfo => {
                     ctx.copy_text(settings::version_info(self.config.updates().channel));
                     self.toast("Copied the version info", Tone::Normal);
                 }
             }
+        }
+    }
+
+    fn whats_new_ui(&mut self, ctx: &egui::Context) {
+        let Some(releases) = &self.whats_new else { return };
+        if crate::whats_new::show(ctx, &self.pal, releases) {
+            self.whats_new = None;
         }
     }
 
@@ -2194,6 +2238,7 @@ impl SkiffApp {
             }
             Command::Settings(section) => self.open_settings(section),
             Command::Shortcuts => self.open_help(),
+            Command::WhatsNew => self.open_whats_new(),
             Command::ZoomIn => self.zoom_by_step(true),
             Command::ZoomOut => self.zoom_by_step(false),
             Command::ZoomReset => {
@@ -2269,6 +2314,7 @@ impl SkiffApp {
         self.palette_ui(&ctx);
         self.settings_ui(&ctx);
         self.help_ui(&ctx);
+        self.whats_new_ui(&ctx);
         self.dialog_ui(&ctx);
         self.confirm_ui(&ctx);
         self.guard_clipboard(&ctx);
@@ -2425,6 +2471,7 @@ impl SkiffApp {
             if self.palette.is_some() {
                 self.settings = None;
                 self.help_open = false;
+                self.whats_new = None;
                 self.hint_seen = true;
             }
         }
@@ -2648,6 +2695,7 @@ impl SkiffApp {
             || self.confirm.is_some()
             || self.settings.is_some()
             || self.help_open
+            || self.whats_new.is_some()
             || egui::Popup::is_any_open(ctx)
     }
 
@@ -2723,7 +2771,7 @@ impl SkiffApp {
                         0 => String::new(),
                         n => format!(", build {n}"),
                     };
-                    self.toast(format!("Skiff is up to date ({}{build})", update::current_version()), Tone::Ok);
+                    self.toast(format!("Skiff is up to date ({}{build})", crate::update::current_version()), Tone::Ok);
                 }
                 State::Failed(e) => {
                     self.update_check_asked = false;
@@ -2767,8 +2815,8 @@ impl SkiffApp {
                     _ => None,
                 };
                 let mut tip = format!("{} is available (you have build {}).", r.title, update::build_number());
-                if !r.notes.trim().is_empty() {
-                    let notes: String = r.notes.lines().take(12).collect::<Vec<_>>().join("\n");
+                let notes = crate::whats_new::notes_summary(&r.notes, 14);
+                if !notes.is_empty() {
                     tip.push_str(&format!("\n\n{notes}"));
                 }
                 if let Some(e) = &failed {
@@ -2818,8 +2866,8 @@ impl SkiffApp {
                 ui.spinner();
             }
             ConnStatus::Connected { version } => {
-                ui.label(RichText::new(version).color(pal.muted).size(12.0))
-                    .on_hover_text("Kubernetes API server version");
+                ui.label(RichText::new(format!("Kubernetes {version}")).color(pal.muted).size(12.0))
+                    .on_hover_text("The cluster's Kubernetes version (its API server). Skiff's own version is in Settings, About.");
                 widgets::dot(ui, pal.ok);
             }
             ConnStatus::Failed(err) => {

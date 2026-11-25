@@ -2437,3 +2437,39 @@ fn grafana_link_opens_explore_for_the_object() {
     assert!(opened[0].contains(&pod) && opened[0].contains("container_cpu_usage_seconds_total"), "{}", opened[0]);
     assert!(opened[0].contains("now-1h"));
 }
+
+/// "What's new" shows this version's changelog entries; it needs no
+/// cluster (an empty kubeconfig keeps the user's own out of it).
+#[test]
+fn whats_new_lists_this_versions_changes() {
+    let dir = std::env::temp_dir().join(format!("skiff-whats-new-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let kubeconfig = dir.join("empty");
+    std::fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\nclusters: []\ncontexts: []\nusers: []\n").unwrap();
+    let opts = AppOptions { kubeconfigs: vec![kubeconfig], ..Default::default() };
+    let mut h = Harness::builder()
+        .with_size([1200.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(move |cc| SkiffApp::headless(&cc.egui_ctx, opts));
+    h.run_steps(2);
+    h.state_mut().open_whats_new();
+    // (A window shown for the first time fades in, and takes no clicks
+    // until it has.)
+    h.run_steps(20);
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(has_label(&h, &format!("What's new in Skiff {version}")));
+    let news = skiff::whats_new::between(
+        &skiff::whats_new::parse(skiff::whats_new::CHANGELOG),
+        None,
+        skiff::update::current_version(),
+    );
+    let first_group = &news[0].groups.iter().find(|g| !g.items.is_empty()).unwrap().title;
+    assert!(has_label(&h, first_group));
+    shot(&mut h, "whats_new");
+    // (The window has two: the x in its title and the button below.)
+    h.query_all_by_label("Close").last().expect("a Close button").click();
+    h.run_steps(2);
+    assert!(h.state().whats_new.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -369,6 +369,7 @@ pub enum Action {
     OpenConfigFile,
     OpenKeysFile,
     ShowShortcuts,
+    WhatsNew,
     OpenUrl(String),
     CopyVersionInfo,
 }
@@ -968,6 +969,9 @@ fn updates(ui: &mut Ui, pal: &Palette, model: &Model, actions: &mut Vec<Action>)
         let busy = matches!(model.update_state, S::Checking | S::Downloading(_));
         if ui.add_enabled(!busy, egui::Button::new("Check now").min_size(Vec2::new(0.0, 28.0))).clicked() {
             actions.push(Action::CheckForUpdates);
+        }
+        if ui.add(egui::Button::new("What's new").min_size(Vec2::new(0.0, 28.0))).clicked() {
+            actions.push(Action::WhatsNew);
         }
         if busy {
             ui.spinner();

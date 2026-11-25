@@ -19,6 +19,7 @@ pub mod shell_env;
 pub mod table_view;
 pub mod theme;
 pub mod update;
+pub mod whats_new;
 pub mod widgets;
 
 pub use app::{AppOptions, NavFocus, Notice, NoticeAction, SkiffApp, View};
