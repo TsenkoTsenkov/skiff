@@ -10,6 +10,8 @@ here.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-25
+
 ### Added
 
 - **What's new**: after an update Skiff lists what changed in the new
@@ -207,6 +209,7 @@ YAML editing, logs, the built-in shell, port forwarding, the command
 palette, vim-style keys with custom bindings, and in-app updates on
 macOS.
 
-[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/TsenkoTsenkov/skiff/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TsenkoTsenkov/skiff/releases/tag/v0.1.0
