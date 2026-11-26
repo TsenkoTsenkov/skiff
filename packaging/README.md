@@ -356,7 +356,7 @@ time.
 
 | Manager | Install command | Kept current by | Needs |
 |---|---|---|---|
-| Homebrew | `brew install --cask tsenkotsenkov/skiff/skiff` | `hack/bump-version.py` | nothing |
+| Homebrew | `brew tap tsenkotsenkov/skiff https://github.com/TsenkoTsenkov/skiff` then `brew install --cask tsenkotsenkov/skiff/skiff` | `hack/bump-version.py` | nothing |
 | Scoop | `scoop bucket add skiff https://github.com/TsenkoTsenkov/skiff` then `scoop install skiff/skiff` | `hack/bump-version.py` | nothing |
 | winget | `winget install TsenkoTsenkov.Skiff` | `.github/workflows/package-managers.yml` | the secret `WINGET_TOKEN` |
 | AUR | `yay -S skiff-bin` (or any AUR helper) | `.github/workflows/package-managers.yml` | the secret `AUR_SSH_PRIVATE_KEY` |
@@ -365,6 +365,9 @@ time.
 
 This repository is its own Homebrew tap (`Casks/skiff.rb`) and Scoop bucket
 (`bucket/skiff.json`), so there is no second repository to keep in step.
+Because the repository is not named `homebrew-skiff`, `brew tap` needs its
+URL; a bare `brew install --cask tsenkotsenkov/skiff/skiff` fails with
+"Repository not found".
 Neither file carries a checksum: the hashes only exist once the release
 workflow has built the files, and a commit to `main` after that would start
 another build. `hack/bump-version.py` sets the version in both, so a version

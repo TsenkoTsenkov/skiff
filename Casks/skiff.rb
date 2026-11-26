@@ -1,9 +1,10 @@
 # Homebrew cask for Skiff. This repository is its own tap:
 #
+#   brew tap tsenkotsenkov/skiff https://github.com/TsenkoTsenkov/skiff
 #   brew install --cask tsenkotsenkov/skiff/skiff
 #
-# (which taps https://github.com/TsenkoTsenkov/skiff first; the explicit form
-# is `brew tap tsenkotsenkov/skiff https://github.com/TsenkoTsenkov/skiff`).
+# The tap needs its URL: without it, brew looks for a repository named
+# TsenkoTsenkov/homebrew-skiff, which does not exist.
 #
 # hack/bump-version.py sets `version` with every stable release. There is no
 # fixed sha256 because the checksum is only known once the release workflow

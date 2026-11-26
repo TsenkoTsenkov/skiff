@@ -26,6 +26,7 @@ follow each stable release.
 **Homebrew (macOS)**
 
 ```bash
+brew tap tsenkotsenkov/skiff https://github.com/TsenkoTsenkov/skiff
 brew install --cask tsenkotsenkov/skiff/skiff
 ```
 
