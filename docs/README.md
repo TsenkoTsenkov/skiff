@@ -36,6 +36,7 @@ program as it is in this repository.
 | [Security](security.md) | What Skiff connects to, what it does with credentials and Secrets, how it treats what a cluster sends, how updates are checked |
 | [Code signing policy](code-signing-policy.md) | Who may release Skiff, where the binaries are built, what is signed today, what the program sends over the network, how to report a problem |
 | [Benchmarks](benchmarks.md) | Start-up time, memory, CPU and size, measured on the launched binary, with the method and the script to repeat it |
+| [Choosing a client](choosing.md) | Electron-based, web, terminal and native clients: what each is good at, and when Skiff is not the right choice |
 
 ## Project
 

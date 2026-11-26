@@ -349,6 +349,9 @@ table.measured { width: 100%; border-collapse: collapse; font-size: 0.97rem; }
 .os .files { margin: 14px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 0.9rem; }
 .os .files li { margin: 4px 0; }
 .os .files a { margin-left: 8px; }
+.os { min-width: 0; }
+.os pre.cmd { max-width: 100%; margin: 8px 0 0; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.os pre.cmd code { font-size: 0.78rem; }
 .notice {
   margin-top: 20px; padding: 16px 20px; border-radius: 12px;
   border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));

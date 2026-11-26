@@ -18,6 +18,31 @@ the current stable release:
 The two `Skiff-macos-…-build-<N>.zip` files on a release are for the
 in-app updater; you do not need them.
 
+## Package managers
+
+This repository is also a Homebrew tap and a Scoop bucket, and both
+follow each stable release.
+
+**Homebrew (macOS)**
+
+```bash
+brew install --cask tsenkotsenkov/skiff/skiff
+```
+
+The app then updates itself as below; `brew upgrade` works too.
+
+**Scoop (Windows)**
+
+```powershell
+scoop bucket add skiff https://github.com/TsenkoTsenkov/skiff
+scoop install skiff/skiff
+```
+
+This installs the portable build with a Start menu shortcut and puts
+`skiff` on the `PATH`. `scoop update skiff` brings the next release.
+For a few minutes after a new version is announced, until its files are
+published, both may fail to download it; try again a little later.
+
 ## macOS
 
 1. Open `Skiff-macos-universal.dmg` (or, on an Apple Silicon Mac,

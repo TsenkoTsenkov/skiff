@@ -1,0 +1,35 @@
+# Maintainer: Tsenko Tsenkov
+#
+# Template for the AUR package skiff-bin. hack/package-manifests.py fills in
+# @VERSION@ and the two checksums from a release's SHA256SUMS, and
+# .github/workflows/package-managers.yml pushes the result to the AUR.
+pkgname=skiff-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Fast, native Kubernetes desktop client: every resource live, with logs, shells, metrics and alerts'
+arch=('x86_64' 'aarch64')
+url='https://tsenkotsenkov.github.io/skiff/'
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'fontconfig')
+optdepends=('vulkan-icd-loader: the default renderer'
+            'libglvnd: the OpenGL renderer'
+            'wayland: running on Wayland'
+            'libx11: running on X11'
+            'libxcursor: running on X11'
+            'libxi: running on X11'
+            'libxkbcommon-x11: running on X11'
+            'kubectl: credential plugins and your own kubeconfig tooling')
+provides=('skiff')
+conflicts=('skiff')
+options=('!strip' '!debug')
+source_x86_64=("skiff-$pkgver-x86_64.tar.gz::https://github.com/TsenkoTsenkov/skiff/releases/download/v$pkgver/skiff-linux-x86_64.tar.gz")
+source_aarch64=("skiff-$pkgver-aarch64.tar.gz::https://github.com/TsenkoTsenkov/skiff/releases/download/v$pkgver/skiff-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  cd "skiff-linux-$CARCH"
+  install -Dm755 bin/skiff "$pkgdir/usr/bin/skiff"
+  cp -r --no-preserve=ownership share "$pkgdir/usr/"
+  install -Dm644 share/doc/skiff/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
