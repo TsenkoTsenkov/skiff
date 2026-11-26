@@ -59,7 +59,21 @@ marked as pre-releases.
 Checksums: [SHA256SUMS](https://github.com/TsenkoTsenkov/skiff/releases/latest/download/SHA256SUMS).
 [docs/install.md](docs/install.md) has the details for each system, how to
 check a download, and how to build from source (`cargo build --release`,
-Rust 1.95 or newer). There is no Homebrew or winget package yet.
+Rust 1.95 or newer).
+
+**With a package manager:**
+
+```bash
+brew install --cask tsenkotsenkov/skiff/skiff
+```
+
+```powershell
+scoop bucket add skiff https://github.com/TsenkoTsenkov/skiff
+scoop install skiff/skiff
+```
+
+This repository is the Homebrew tap and the Scoop bucket; both follow
+each stable release.
 
 **Is it signed?**
 
@@ -247,6 +261,8 @@ there is the physical footprint Activity Monitor shows, a different
 quantity from the PSS in the Linux figures, so the two are not
 comparable. The method and caveats are in
 [docs/benchmarks.md](docs/benchmarks.md#comparison-with-similar-software).
+What each kind of client is good at, and when you would be better off
+with another, is in [docs/choosing.md](docs/choosing.md).
 
 The first figure, measured on Linux, holds only Skiff. Both are drawn
 from results files; we publish only what we measured.
@@ -288,6 +304,7 @@ and it has no plugin system. What it leaves out is listed under
 | [Security](docs/security.md) | What Skiff connects to and what it does with your access |
 | [Code signing policy](docs/code-signing-policy.md) | Who may release Skiff, where the binaries are built, what is signed, what is sent over the network |
 | [Benchmarks](docs/benchmarks.md) | What was measured, how, and how to repeat it |
+| [Choosing a client](docs/choosing.md) | The kinds of Kubernetes client, what each is good at, and when Skiff is not the right one |
 | [Development](docs/development.md) | Code layout, local test clusters, tests |
 
 The same pages, with navigation, are on the site:
@@ -331,7 +348,7 @@ mode, and it bundles neither `kubectl` nor `helm`. The reasons are in
 
 Not there yet:
 
-- A signed Windows build; Homebrew and winget packages
+- A signed Windows build; winget and AUR packages
 - Helm releases
 - Node drain, triggering a cron job, actions on several rows at once
 - Log search across history (Loki, Elasticsearch)

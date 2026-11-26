@@ -9,8 +9,10 @@ repository has to set up for signed builds.
 | `macos/Info.plist.in`, `macos/Skiff.entitlements` | The app bundle's property list (template) and the entitlements of the signed build |
 | `linux/io.github.tsenkotsenkov.skiff.desktop`, `…metainfo.xml` | Desktop entry and AppStream metadata |
 | `windows/skiff.nsi` | The per-user installer (NSIS) |
-| `homebrew/skiff.rb` | Homebrew cask template |
 | `winget/*.yaml` | winget manifest templates |
+| `aur/PKGBUILD.in` | AUR package template (`skiff-bin`) |
+| `../Casks/skiff.rb` | Homebrew cask: this repository is the tap |
+| `../bucket/skiff.json` | Scoop manifest: this repository is the bucket |
 
 The scripts that use them are in `hack/`:
 
@@ -350,56 +352,72 @@ Ubuntu 22.04 and need glibc 2.35 or newer. No GPU, Wayland or X11 library
 is bundled, in the AppImage either: the system's own are loaded at run
 time.
 
-## Homebrew (macOS)
+## Package managers
 
-Homebrew is turning away apps that fail Gatekeeper, so do this once the Mac
-build is signed and notarized.
+| Manager | Install command | Kept current by | Needs |
+|---|---|---|---|
+| Homebrew | `brew install --cask tsenkotsenkov/skiff/skiff` | `hack/bump-version.py` | nothing |
+| Scoop | `scoop bucket add skiff https://github.com/TsenkoTsenkov/skiff` then `scoop install skiff/skiff` | `hack/bump-version.py` | nothing |
+| winget | `winget install TsenkoTsenkov.Skiff` | `.github/workflows/package-managers.yml` | the secret `WINGET_TOKEN` |
+| AUR | `yay -S skiff-bin` (or any AUR helper) | `.github/workflows/package-managers.yml` | the secret `AUR_SSH_PRIVATE_KEY` |
 
-1. Create the public repository `TsenkoTsenkov/homebrew-tap`.
-2. Copy `packaging/homebrew/skiff.rb` to `Casks/skiff.rb` in it.
-3. For each stable release set `version` and `sha256`. The hash is in the
-   release's checksums:
+### Homebrew and Scoop
 
-   ```bash
-   curl -sL https://github.com/TsenkoTsenkov/skiff/releases/download/v1.2.3/SHA256SUMS | grep universal.dmg
-   ```
-
-4. Check and publish:
-
-   ```bash
-   brew tap tsenkotsenkov/tap && brew audit --cask --online skiff
-   brew install --cask tsenkotsenkov/tap/skiff
-   ```
-
-Users then install with `brew install --cask tsenkotsenkov/tap/skiff`. The
-cask declares `auto_updates`, because the app updates itself.
+This repository is its own Homebrew tap (`Casks/skiff.rb`) and Scoop bucket
+(`bucket/skiff.json`), so there is no second repository to keep in step.
+Neither file carries a checksum: the hashes only exist once the release
+workflow has built the files, and a commit to `main` after that would start
+another build. `hack/bump-version.py` sets the version in both, so a version
+bump is all a release needs. For about half an hour after a bump is merged,
+until the release is published, they name a download that does not exist
+yet; `brew` and `scoop` then fail with a 404 and work on the next try.
+The Mac download is signed and notarized and Gatekeeper checks it; every
+file's hash is in the release's `SHA256SUMS`.
 
 Getting into Homebrew's own cask repository (so that `brew install --cask
-skiff` works without the tap) additionally asks for a certain popularity of
-the project; try once it has users.
+skiff` works without the tap) needs a fixed checksum per version and a
+certain popularity of the project, and the name `skiff` may be taken there;
+try once the project has users.
 
-## winget (Windows)
+### winget and the AUR
 
-1. For a stable release, copy the three files in `packaging/winget/` and
-   replace the version (`0.1.0`) everywhere, `ReleaseDate`, and
-   `InstallerSha256` with the installer's hash from `SHA256SUMS` in upper
-   case.
-2. Validate and try them on a Windows machine:
+Both need a copy of each release's manifest, with its hashes, in someone
+else's repository. `.github/workflows/package-managers.yml` makes them with
+`hack/package-manifests.py` once the Release workflow has published a
+stable version, keeps them with the run as the artifact `package-manifests`,
+and submits them if the secret for that manager exists in the `release`
+environment. Without the secret that job says so and does nothing.
+After adding a secret, submit the current release with Actions → Package
+managers → Run workflow.
 
-   ```powershell
-   winget validate --manifest .\manifests
-   winget install --manifest .\manifests     # needs: winget settings --enable LocalManifestFiles
-   ```
+**winget** (`WINGET_TOKEN`)
 
-3. Fork <https://github.com/microsoft/winget-pkgs>, put the files under
-   `manifests/t/TsenkoTsenkov/Skiff/<version>/` and open a pull request.
-   Microsoft's bots install the package in a sandbox; a person approves
-   the first submission. `wingetcreate update TsenkoTsenkov.Skiff --version
-   1.2.3 --urls <installer url> --submit` does all of this for later
-   versions.
+1. On GitHub, Settings → Developer settings → Personal access tokens →
+   Tokens (classic) → Generate new token (classic), scope **public_repo**
+   only. (wingetcreate needs a classic token: it forks
+   `microsoft/winget-pkgs` into your account and opens the pull request
+   from there.) Give it an expiry and renew it.
+2. Store it as the secret `WINGET_TOKEN` of the `release` environment.
 
-winget requires version-numbered releases, which is why only `v*` tags are
-submitted, never nightlies.
+Microsoft's bots install the package in a sandbox; a person at Microsoft
+approves the first version of a new package, later versions are merged
+automatically when the checks pass. Unsigned installers are accepted, and
+`winget install` does not show the browser's SmartScreen warning.
+
+To try the manifests on Windows by hand: download the artifact, then
+`winget validate --manifest .\winget` and
+`winget install --manifest .\winget` (after
+`winget settings --enable LocalManifestFiles`).
+
+**AUR** (`AUR_SSH_PRIVATE_KEY`)
+
+1. Create an account at <https://aur.archlinux.org/register>.
+2. Make a key for it alone: `ssh-keygen -t ed25519 -f aur -C skiff-aur -N ""`.
+   Paste `aur.pub` into "SSH Public Key" of the account (My Account).
+3. Store the content of the file `aur` (the private key) as the secret
+   `AUR_SSH_PRIVATE_KEY` of the `release` environment, and delete the file.
+
+The first push creates the package `skiff-bin`, owned by that account.
 
 ## Updating the pinned tools
 

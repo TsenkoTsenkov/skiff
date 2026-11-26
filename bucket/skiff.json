@@ -1,0 +1,34 @@
+{
+    "##": [
+        "Scoop manifest. This repository is its own bucket:",
+        "  scoop bucket add skiff https://github.com/TsenkoTsenkov/skiff",
+        "  scoop install skiff/skiff",
+        "hack/bump-version.py sets the version with every stable release. There is no",
+        "fixed hash: it is only known once the release workflow has built the files.",
+        "The hash of every file is in the release's SHA256SUMS."
+    ],
+    "version": "0.1.4",
+    "description": "Fast, native Kubernetes desktop client: every resource live, with logs, shells, metrics and alerts. No web view, no account, no telemetry.",
+    "homepage": "https://tsenkotsenkov.github.io/skiff/",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/TsenkoTsenkov/skiff/releases/download/v0.1.4/Skiff-windows-x64.zip"
+        }
+    },
+    "bin": "skiff.exe",
+    "shortcuts": [
+        [
+            "skiff.exe",
+            "Skiff"
+        ]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/TsenkoTsenkov/skiff/releases/download/v$version/Skiff-windows-x64.zip"
+            }
+        }
+    }
+}

@@ -50,6 +50,7 @@ SIDEBAR = [
     ("How it behaves", [
         ("security", "Security"),
         ("benchmarks", "Benchmarks"),
+        ("choosing", "Choosing a client"),
     ]),
     ("Project", [
         ("development", "Development"),

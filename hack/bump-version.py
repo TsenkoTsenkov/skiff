@@ -6,10 +6,12 @@
     hack/bump-version.py major      # 0.1.2 -> 1.0.0
     hack/bump-version.py 0.4.0      # exactly that
 
-It changes three files and nothing else:
+It changes five files and nothing else:
 
 - Cargo.toml: `[workspace.package] version`;
 - Cargo.lock: the version of every crate in crates/;
+- Casks/skiff.rb (Homebrew) and bucket/skiff.json (Scoop): the version
+  they install, so that `brew upgrade` and `scoop update` find it;
 - CHANGELOG.md: the "Unreleased" entries become the new version's
   section, dated today, under a new empty "Unreleased", and the compare
   links at the bottom follow.
@@ -68,6 +70,19 @@ def main() -> None:
             die(f"Cargo.lock: no single entry {name} {old}")
         ltext = ltext.replace(pattern, f'name = "{name}"\nversion = "{new}"\n')
     lock.write_text(ltext)
+
+    # The Homebrew cask and the Scoop manifest (this repository is their tap
+    # and bucket). They carry no checksum, so the version is all that changes.
+    for rel, pattern, repl in (
+        ("Casks/skiff.rb", f'  version "{old}"\n', f'  version "{new}"\n'),
+        ("bucket/skiff.json", f'"version": "{old}"', f'"version": "{new}"'),
+        ("bucket/skiff.json", f"/download/v{old}/", f"/download/v{new}/"),
+    ):
+        path = ROOT / rel
+        ptext = path.read_text()
+        if ptext.count(pattern) != 1:
+            die(f"{rel}: no single {pattern.strip()!r}")
+        path.write_text(ptext.replace(pattern, repl))
 
     # CHANGELOG.md
     log = ROOT / "CHANGELOG.md"
