@@ -64,6 +64,7 @@ Rust 1.95 or newer).
 **With a package manager:**
 
 ```bash
+brew tap tsenkotsenkov/skiff https://github.com/TsenkoTsenkov/skiff
 brew install --cask tsenkotsenkov/skiff/skiff
 ```
 
